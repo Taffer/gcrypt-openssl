@@ -431,7 +431,13 @@ TEST(curve25519_context)
     gcry_mpi_point_get(x, NULL, NULL, G);
     ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 9));
 
-    /* k * G is the public key, k * Bob is the shared secret. */
+    /* k * G is the public key, k * Bob is the shared secret, for the
+     * clamped scalar: gcry_mpi_ec_mul itself does not clamp. */
+    gcry_mpi_clear_bit(k, 0);
+    gcry_mpi_clear_bit(k, 1);
+    gcry_mpi_clear_bit(k, 2);
+    gcry_mpi_clear_bit(k, 255);
+    gcry_mpi_set_bit(k, 254);
     gcry_mpi_ec_mul(W, k, G, ctx);
     ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, W, ctx));
     ASSERT_EQ(0, gcry_mpi_cmp(x, pub));
@@ -476,7 +482,7 @@ TEST(curve_table_access)
     }
 
     ASSERT_TRUE(found);
-    ASSERT_TRUE(i >= 28);
+    ASSERT_EQ(27, i); /* The reference library's table. */
     ASSERT_NULL(gcry_pk_get_curve(NULL, -1, NULL));
 }
 
@@ -885,6 +891,113 @@ TEST(edwards_context_and_explicit_params)
     gcry_mpi_release(y);
 }
 
+/* Arithmetic corner cases as the reference library computes them. */
+TEST(montgomery_and_degenerate_arithmetic)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t P = gcry_mpi_point_new(0);
+    gcry_mpi_point_t R = gcry_mpi_point_new(0);
+    gcry_mpi_t k = gcry_mpi_new(0);
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+    gcry_mpi_t z = gcry_mpi_new(0);
+    gcry_mpi_t p;
+
+    /* Curve25519: scalar multiplication does not clamp the scalar. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    gcry_mpi_set_ui(k, 2);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "20D342D51873F1B7D9750C687D1571148F3F5CED1E350B"
+                           "5C5CAE469CDD684EFB"));
+    gcry_mpi_set_ui(k, 3);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "1C12BC1A6D57ABE645534D91C21BBA64F8824E67621C08"
+                           "59C00A03AFFB713C12"));
+    gcry_mpi_set_ui(k, 7);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "0DAF32E7ED8099122B2DFA4C1D8C4A20C0972A1538BF05"
+                           "75338AAE0FE0841828"));
+    /* The RFC 7748 vector with the scalar taken literally (unclamped). */
+    gcry_mpi_release(k);
+    k = hex_mpi("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    gcry_mpi_release(x);
+    x = hex_mpi("4c1cabd0a603a9103b35b326ec2466727c5fb124a4c19435db3030586768dbe6");
+    gcry_mpi_point_set(P, x, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "500384E4C0426C961DF7EE4850C412A9746A56E9721876"
+                           "2A52200FB00F6F285C"));
+    /* Montgomery points are not normalised by get_affine. */
+    gcry_mpi_set_ui(x, 18);
+    gcry_mpi_set_ui(y, 0);
+    gcry_mpi_set_ui(z, 2);
+    gcry_mpi_point_set(P, x, y, z);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, P, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 18));
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, P, ctx));
+    gcry_mpi_point_release(G);
+    gcry_ctx_release(ctx);
+
+    /* Weierstrass corner cases: the point at infinity is no curve point,
+     * a zero scalar gives (0, 0, 0), a multiple of infinity is (0, p, 1). */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "NIST P-256"));
+    p = gcry_mpi_ec_get_mpi("p", ctx, 1);
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    gcry_mpi_set_ui(x, 0);
+    gcry_mpi_set_ui(y, 1);
+    gcry_mpi_set_ui(z, 0);
+    gcry_mpi_point_set(P, x, y, z);
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(P, ctx));
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(G, ctx));
+    gcry_mpi_set_ui(k, 0);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    gcry_mpi_point_get(x, y, z, R);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(y, 0));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(z, 0));
+    gcry_mpi_set_ui(k, 3);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    gcry_mpi_point_get(x, y, z, R);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    ASSERT_EQ(0, gcry_mpi_cmp(y, p));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(z, 1));
+    gcry_mpi_point_release(G);
+    gcry_mpi_release(p);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* Nothing to build a context from. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_new(&ctx, NULL, NULL));
+    ASSERT_NULL(ctx);
+
+    /* Ed25519: the prefixed encoding may also arrive as a number. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Ed25519"));
+    gcry_mpi_release(k);
+    k = hex_mpi("405866666666666666666666666666666666666666666666666666666666666666");
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", k, ctx));
+    gcry_mpi_point_release(P);
+    P = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(P);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, P, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7"
+                           "B2C9562D608F25D51A"));
+    ASSERT_TRUE(mpi_eq_hex(y, "66666666666666666666666666666666666666666666666"
+                           "66666666666666658"));
+    gcry_ctx_release(ctx);
+
+    gcry_mpi_point_release(P);
+    gcry_mpi_point_release(R);
+    gcry_mpi_release(k);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+    gcry_mpi_release(z);
+}
+
 int
 main(void)
 {
@@ -900,5 +1013,6 @@ main(void)
     RUN_TEST(montgomery_context_queries);
     RUN_TEST(context_from_odd_keys);
     RUN_TEST(edwards_context_and_explicit_params);
+    RUN_TEST(montgomery_and_degenerate_arithmetic);
     return TEST_RESULT();
 }

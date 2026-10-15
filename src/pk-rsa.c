@@ -174,173 +174,85 @@ leave:
     return rc;
 }
 
-/* The digest to sign: either given directly or computed from the message
- * (prehash flag).  The buffer is allocated. */
+/* ------------------------------------------------------------------ */
+/* The RSA primitive                                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * All operations run OpenSSL's RSA primitive without padding on frames
+ * of exactly K bytes; the PKCS#1 encodings are applied by pk-util.c so
+ * that the gcrypt specific details (random-override, every digest, the
+ * reference library's length rules and error codes) are honoured.
+ */
+
+/* OUT = IN^e mod n (public) or IN^d mod n (private, blinded by OpenSSL).
+ * IN must be K bytes and smaller than n. */
 static gcry_err_code_t
-signing_digest(struct pk_data *pd, unsigned char **r_buf, size_t *r_len)
+rsa_raw_op(EVP_PKEY *key, int private, const unsigned char *in,
+           unsigned char *out, size_t k)
 {
-    if (!pd->value) {
-        return GPG_ERR_INV_DATA;
-    }
-
-    if (pd->value_is_hash) {
-        *r_buf = _gcry_malloc(pd->valuelen);
-
-        if (!*r_buf) {
-            return _gcry_err_code_from_syserror();
-        }
-
-        memcpy(*r_buf, pd->value, pd->valuelen);
-        *r_len = pd->valuelen;
-        return 0;
-    }
-
-    *r_len = _gcry_pk_md_dlen(pd->hash_algo);
-
-    if (!*r_len) {
-        return GPG_ERR_DIGEST_ALGO;
-    }
-
-    *r_buf = _gcry_malloc(*r_len);
-
-    if (!*r_buf) {
-        return _gcry_err_code_from_syserror();
-    }
-
-    return _gcry_pk_md_hash(pd->hash_algo, pd->value, pd->valuelen, *r_buf,
-                            *r_len);
-}
-
-static EVP_MD *
-fetch_md(int algo)
-{
-    const char *name = _gcry_pk_md_openssl_name(algo);
-    EVP_MD *md;
-
-    if (!name) {
-        return NULL;
-    }
-
-    md = EVP_MD_fetch(_gcry_libctx(), name, _gcry_propq());
-
-    if (!md) {
-        ERR_clear_error();
-    }
-
-    return md;
-}
-
-/* Configure padding and digests of CTX according to PD.  SIGNING selects
- * the signature variants of the encodings. */
-static gcry_err_code_t
-apply_encoding(EVP_PKEY_CTX *ctx, struct pk_data *pd, int signing,
-               EVP_MD **r_md)
-{
-    EVP_MD *md = NULL;
+    EVP_PKEY_CTX *ctx;
+    size_t outlen = k;
     int ok;
 
-    *r_md = NULL;
+    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
 
-    switch (pd->encoding) {
-    case PUBKEY_ENC_RAW:
-        ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) > 0;
-        break;
-
-    case PUBKEY_ENC_PKCS1:
-        ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0;
-
-        if (ok && signing) {
-            md = fetch_md(pd->hash_algo);
-            ok = md && EVP_PKEY_CTX_set_signature_md(ctx, md) > 0;
-
-            if (!md) {
-                return GPG_ERR_DIGEST_ALGO;
-            }
-        }
-
-        break;
-
-    case PUBKEY_ENC_PKCS1_RAW:
-        ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0;
-        break;
-
-    case PUBKEY_ENC_PSS:
-        md = fetch_md(pd->hash_algo);
-
-        if (!md) {
-            return GPG_ERR_DIGEST_ALGO;
-        }
-
-        ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PSS_PADDING) > 0
-             && EVP_PKEY_CTX_set_signature_md(ctx, md) > 0
-             && EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) > 0
-             && EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx, (int)pd->saltlen) > 0;
-        break;
-
-    case PUBKEY_ENC_OAEP:
-        md = fetch_md(pd->hash_algo);
-
-        if (!md) {
-            return GPG_ERR_DIGEST_ALGO;
-        }
-
-        ok = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0
-             && EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md) > 0
-             && EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) > 0;
-
-        if (ok && pd->labellen) {
-            void *label = OPENSSL_malloc(pd->labellen);
-
-            if (!label) {
-                ok = 0;
-            } else {
-                memcpy(label, pd->label, pd->labellen);
-                ok = EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, label,
-                                                      (int)pd->labellen) > 0;
-
-                if (!ok) {
-                    OPENSSL_free(label);
-                }
-            }
-        }
-
-        break;
-
-    default:
-        return GPG_ERR_INV_FLAG;
+    if (!ctx) {
+        return GPG_ERR_ENOMEM;
     }
+
+    if (private) {
+        ok = EVP_PKEY_decrypt_init(ctx) > 0
+             && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) > 0
+             && EVP_PKEY_decrypt(ctx, out, &outlen, in, k) > 0;
+    } else {
+        ok = EVP_PKEY_encrypt_init(ctx) > 0
+             && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) > 0
+             && EVP_PKEY_encrypt(ctx, out, &outlen, in, k) > 0;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
 
     if (!ok) {
-        EVP_MD_free(md);
-        return _gcry_err_from_openssl(GPG_ERR_INV_FLAG);
+        return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
     }
 
-    *r_md = md;
+    if (outlen < k) {
+        /* Right align a short result; the primitive is a number. */
+        memmove(out + (k - outlen), out, outlen);
+        memset(out, 0, k - outlen);
+    }
+
     return 0;
 }
 
-/* The input bytes for a raw (textbook) RSA operation: the numeric value
- * left padded to the modulus size. */
+/* The K byte frame for the number A reduced modulo N, as the reference
+ * library's modular exponentiation would see it. */
 static gcry_err_code_t
-raw_input(struct pk_data *pd, size_t k, unsigned char **r_buf)
+reduced_frame(gcry_mpi_t a, gcry_mpi_t n, unsigned char *out, size_t k)
 {
-    if (!pd->mpi || mpi_is_opaque(pd->mpi)) {
-        return GPG_ERR_INV_DATA;
+    BN_CTX *bctx = BN_CTX_new_ex(_gcry_libctx());
+    BIGNUM *r = BN_new();
+    gcry_err_code_t rc = 0;
+
+    if (!bctx || !r || !BN_nnmod(r, _gcry_mpi_bn(a), _gcry_mpi_bn(n), bctx)
+        || BN_bn2binpad(r, out, (int)k) < 0) {
+        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
     }
 
-    *r_buf = _gcry_malloc(k);
+    BN_free(r);
+    BN_CTX_free(bctx);
+    return rc;
+}
 
-    if (!*r_buf) {
-        return _gcry_err_code_from_syserror();
-    }
+/* Is the K byte big endian FRAME smaller than N? */
+static int
+frame_below_n(const unsigned char *frame, size_t k, gcry_mpi_t n)
+{
+    BIGNUM *f = BN_bin2bn(frame, (int)k, NULL);
+    int res = f && BN_ucmp(f, _gcry_mpi_bn(n)) < 0;
 
-    if (_gcry_pk_mpi_to_fixed(pd->mpi, *r_buf, k)) {
-        _gcry_free(*r_buf);
-        *r_buf = NULL;
-        return GPG_ERR_INV_DATA;
-    }
-
-    return 0;
+    BN_free(f);
+    return res;
 }
 
 static gcry_err_code_t
@@ -351,12 +263,10 @@ rsa_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     unsigned int nbits = rsa_get_nbits(keyparms);
     size_t k = (nbits + 7) / 8;
     EVP_PKEY *key = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_MD *md = NULL;
-    unsigned char *in = NULL;
-    size_t inlen = 0;
+    gcry_mpi_t n = NULL;
+    unsigned char *frame = NULL;
+    size_t framelen = 0;
     unsigned char *out = NULL;
-    size_t outlen = k;
 
     if (!nbits) {
         return GPG_ERR_INV_OBJ;
@@ -369,63 +279,67 @@ rsa_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (pd.encoding == PUBKEY_ENC_RAW) {
-        rc = raw_input(&pd, k, &in);
-        inlen = k;
-    } else if (pd.encoding == PUBKEY_ENC_PKCS1
-               || pd.encoding == PUBKEY_ENC_OAEP) {
-        if (!pd.value || !pd.valuelen) {
-            rc = GPG_ERR_INV_DATA;
-        } else {
-            in = pd.value;
-            inlen = pd.valuelen;
-            pd.value = NULL;
-        }
-    } else {
+    if (pd.encoding != PUBKEY_ENC_RAW && pd.encoding != PUBKEY_ENC_PKCS1
+        && pd.encoding != PUBKEY_ENC_OAEP) {
         rc = GPG_ERR_CONFLICT;
+        goto leave;
     }
+
+    if (pd.encoding == PUBKEY_ENC_RAW
+        && (!pd.mpi || mpi_is_opaque(pd.mpi))) {
+        rc = GPG_ERR_INV_DATA;
+        goto leave;
+    }
+
+    if (pd.encoding != PUBKEY_ENC_RAW) {
+        rc = _gcry_pk_data_to_frame(&pd, nbits, &frame, &framelen);
+
+        if (rc) {
+            goto leave;
+        }
+    }
+
+    rc = rsa_evp_key(keyparms, 0, &key, &n);
 
     if (rc) {
         goto leave;
     }
 
-    rc = rsa_evp_key(keyparms, 0, &key, NULL);
-
-    if (rc) {
-        goto leave;
-    }
-
-    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
     out = _gcry_malloc(k);
 
-    if (!ctx || !out) {
+    if (!out) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
     }
 
-    if (EVP_PKEY_encrypt_init(ctx) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
-        goto leave;
+    if (pd.encoding == PUBKEY_ENC_RAW) {
+        frame = _gcry_malloc(k);
+
+        if (!frame) {
+            rc = GPG_ERR_ENOMEM;
+            goto leave;
+        }
+
+        rc = reduced_frame(pd.mpi, n, frame, k);
+
+        if (rc) {
+            goto leave;
+        }
     }
 
-    rc = apply_encoding(ctx, &pd, 0, &md);
+    rc = rsa_raw_op(key, 0, frame, out, k);
 
     if (rc) {
         goto leave;
     }
 
-    if (EVP_PKEY_encrypt(ctx, out, &outlen, in, inlen) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
-        goto leave;
-    }
-
     if (pd.flags & PUBKEY_FLAG_FIXEDLEN) {
-        rc = _gcry_sexp_build(r_ciph, NULL, "(enc-val(rsa(a%b)))",
-                              (int)outlen, out);
+        rc = _gcry_sexp_build(r_ciph, NULL, "(enc-val(rsa(a%b)))", (int)k,
+                              out);
     } else {
         gcry_mpi_t ciph = NULL;
 
-        rc = _gcry_mpi_scan(&ciph, GCRYMPI_FMT_USG, out, outlen, NULL);
+        rc = _gcry_mpi_scan(&ciph, GCRYMPI_FMT_USG, out, k, NULL);
 
         if (!rc) {
             rc = _gcry_sexp_build(r_ciph, NULL, "(enc-val(rsa(a%m)))", ciph);
@@ -435,13 +349,48 @@ rsa_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     }
 
 leave:
-    EVP_MD_free(md);
-    EVP_PKEY_CTX_free(ctx);
     EVP_PKEY_free(key);
-    _gcry_free(in);
+    gcry_mpi_release(n);
+    _gcry_free(frame);
     _gcry_free(out);
     _gcry_pk_data_free(&pd);
     return rc;
+}
+
+/* PKCS#1 v1.5 decryption of the K byte ciphertext IN. */
+static gcry_err_code_t
+rsa_pkcs1_decrypt(EVP_PKEY *key, const unsigned char *in, size_t k,
+                  unsigned char **r_value, size_t *r_valuelen)
+{
+    EVP_PKEY_CTX *ctx;
+    unsigned char *out;
+    size_t outlen = k;
+    int ok;
+
+    *r_value = NULL;
+    *r_valuelen = 0;
+    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
+    out = _gcry_malloc_secure(k);
+
+    if (!ctx || !out) {
+        EVP_PKEY_CTX_free(ctx);
+        _gcry_free(out);
+        return GPG_ERR_ENOMEM;
+    }
+
+    ok = EVP_PKEY_decrypt_init(ctx) > 0
+         && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0
+         && EVP_PKEY_decrypt(ctx, out, &outlen, in, k) > 0;
+    EVP_PKEY_CTX_free(ctx);
+
+    if (!ok) {
+        _gcry_free(out);
+        return _gcry_err_from_openssl(GPG_ERR_ENCODING_PROBLEM);
+    }
+
+    *r_value = out;
+    *r_valuelen = outlen;
+    return 0;
 }
 
 static gcry_err_code_t
@@ -455,11 +404,10 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     unsigned int nbits = rsa_get_nbits(keyparms);
     size_t k = (nbits + 7) / 8;
     EVP_PKEY *key = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_MD *md = NULL;
     unsigned char *in = NULL;
     unsigned char *out = NULL;
-    size_t outlen = k;
+    unsigned char *value = NULL;
+    size_t valuelen = 0;
 
     if (!nbits) {
         return GPG_ERR_INV_OBJ;
@@ -469,6 +417,13 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     rc = _gcry_pk_util_preparse_encval(s_data, rsa_names, &l1, &pd);
 
     if (rc) {
+        goto leave;
+    }
+
+    if (pd.encoding != PUBKEY_ENC_UNKNOWN && pd.encoding != PUBKEY_ENC_RAW
+        && pd.encoding != PUBKEY_ENC_PKCS1
+        && pd.encoding != PUBKEY_ENC_OAEP) {
+        rc = GPG_ERR_CONFLICT;
         goto leave;
     }
 
@@ -489,106 +444,88 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    /* Reduce the input first so that oversized values are handled like
-     * the reference implementation does. */
-    gcry_mpi_mod(data, data, n);
     in = _gcry_malloc(k);
     out = _gcry_malloc_secure(k);
-    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
 
-    if (!in || !out || !ctx) {
+    if (!in || !out) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
     }
 
-    if (_gcry_pk_mpi_to_fixed(data, in, k)) {
-        rc = GPG_ERR_INV_DATA;
-        goto leave;
-    }
-
-    if (pd.encoding == PUBKEY_ENC_UNKNOWN) {
-        pd.encoding = PUBKEY_ENC_RAW;
-    }
-
-    if (EVP_PKEY_decrypt_init(ctx) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
-        goto leave;
-    }
-
-    rc = apply_encoding(ctx, &pd, 0, &md);
+    rc = reduced_frame(data, n, in, k);
 
     if (rc) {
         goto leave;
     }
 
-    if (EVP_PKEY_decrypt(ctx, out, &outlen, in, k) <= 0) {
-        ERR_clear_error();
-        rc = pd.encoding == PUBKEY_ENC_RAW ? GPG_ERR_INV_DATA
-             : GPG_ERR_ENCODING_PROBLEM;
+    if (pd.encoding == PUBKEY_ENC_PKCS1) {
+        /* OpenSSL's PKCS#1 v1.5 check with implicit rejection: a bad
+         * padding yields a deterministic synthetic plaintext instead of an
+         * error, which is also what the reference library does. */
+        rc = rsa_pkcs1_decrypt(key, in, k, &value, &valuelen);
+
+        if (!rc) {
+            rc = _gcry_sexp_build(r_plain, NULL, "(value %b)", (int)valuelen,
+                                  value);
+        }
+
         goto leave;
     }
 
-    if (pd.encoding == PUBKEY_ENC_RAW) {
+    rc = rsa_raw_op(key, 1, in, out, k);
+
+    if (rc) {
+        goto leave;
+    }
+
+    switch (pd.encoding) {
+
+    case PUBKEY_ENC_OAEP:
+        rc = _gcry_pk_oaep_decode(out, k, pd.hash_algo, pd.label, pd.labellen,
+                                  &value, &valuelen);
+
+        if (!rc) {
+            rc = _gcry_sexp_build(r_plain, NULL, "(value %b)", (int)valuelen,
+                                  value);
+        }
+
+        break;
+
+    default: {
         gcry_mpi_t plain = NULL;
 
-        rc = _gcry_mpi_scan(&plain, GCRYMPI_FMT_USG, out, outlen, NULL);
+        rc = _gcry_mpi_scan(&plain, GCRYMPI_FMT_USG, out, k, NULL);
 
         if (!rc) {
             rc = _gcry_sexp_build(r_plain, NULL,
-                                  (pd.flags & PUBKEY_FLAG_LEGACYRESULT)
-                                  ? "%m" : "(value %m)", plain);
+                                  (pd.flags & PUBKEY_FLAG_LEGACYRESULT) ? "%m"
+                                  : "(value %m)", plain);
         }
 
         gcry_mpi_release(plain);
-    } else {
-        rc = _gcry_sexp_build(r_plain, NULL, "(value %b)", (int)outlen, out);
+        break;
+    }
     }
 
 leave:
-    EVP_MD_free(md);
-    EVP_PKEY_CTX_free(ctx);
-    EVP_PKEY_free(key);
+
+    if (value) {
+        _gcry_wipememory(value, valuelen);
+    }
 
     if (out) {
         _gcry_wipememory(out, k);
     }
 
+    _gcry_free(value);
     _gcry_free(in);
     _gcry_free(out);
+    EVP_PKEY_free(key);
     gcry_mpi_release(data);
     gcry_mpi_release(n);
     gcry_sexp_release(l1);
     _gcry_pk_data_free(&pd);
     return rc;
-}
-
-/* The bytes handed to EVP_PKEY_sign/verify for the configured encoding. */
-static gcry_err_code_t
-signature_input(struct pk_data *pd, size_t k, unsigned char **r_buf,
-                size_t *r_len)
-{
-    switch (pd->encoding) {
-    case PUBKEY_ENC_RAW:
-        *r_len = k;
-        return raw_input(pd, k, r_buf);
-
-    case PUBKEY_ENC_PKCS1:
-    case PUBKEY_ENC_PSS:
-        return signing_digest(pd, r_buf, r_len);
-
-    case PUBKEY_ENC_PKCS1_RAW:
-        if (!pd->value || !pd->valuelen) {
-            return GPG_ERR_INV_DATA;
-        }
-
-        *r_buf = pd->value;
-        *r_len = pd->valuelen;
-        pd->value = NULL;
-        return 0;
-
-    default:
-        return GPG_ERR_CONFLICT;
-    }
 }
 
 static gcry_err_code_t
@@ -599,12 +536,11 @@ rsa_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     unsigned int nbits = rsa_get_nbits(keyparms);
     size_t k = (nbits + 7) / 8;
     EVP_PKEY *key = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_MD *md = NULL;
-    unsigned char *in = NULL;
-    size_t inlen = 0;
+    gcry_mpi_t n = NULL;
+    unsigned char *frame = NULL;
+    size_t framelen = 0;
     unsigned char *sig = NULL;
-    size_t siglen = k;
+    unsigned char *check = NULL;
 
     if (!nbits) {
         return GPG_ERR_INV_OBJ;
@@ -617,49 +553,64 @@ rsa_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    rc = signature_input(&pd, k, &in, &inlen);
+    if (pd.encoding == PUBKEY_ENC_OAEP) {
+        rc = GPG_ERR_CONFLICT;
+        goto leave;
+    }
+
+    rc = _gcry_pk_data_to_frame(&pd, nbits, &frame, &framelen);
+
+    if (rc == GPG_ERR_TOO_LARGE) {
+        rc = GPG_ERR_BAD_SIGNATURE; /* Raw data not below the modulus. */
+    }
 
     if (rc) {
         goto leave;
     }
 
-    rc = rsa_evp_key(keyparms, 1, &key, NULL);
+    rc = rsa_evp_key(keyparms, 1, &key, &n);
 
     if (rc) {
         goto leave;
     }
 
-    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
+    if (!frame_below_n(frame, k, n)) {
+        rc = GPG_ERR_BAD_SIGNATURE;
+        goto leave;
+    }
+
     sig = _gcry_malloc(k);
+    check = _gcry_malloc(k);
 
-    if (!ctx || !sig) {
+    if (!sig || !check) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
     }
 
-    if (EVP_PKEY_sign_init(ctx) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
-        goto leave;
-    }
-
-    rc = apply_encoding(ctx, &pd, 1, &md);
+    rc = rsa_raw_op(key, 1, frame, sig, k);
 
     if (rc) {
         goto leave;
     }
 
-    if (EVP_PKEY_sign(ctx, sig, &siglen, in, inlen) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
+    /* Verify the fresh signature, as the reference library does, which
+     * also catches a faulty CRT computation. */
+    rc = rsa_raw_op(key, 0, sig, check, k);
+
+    if (!rc && memcmp(check, frame, k)) {
+        rc = GPG_ERR_BAD_SIGNATURE;
+    }
+
+    if (rc) {
         goto leave;
     }
 
     if (pd.flags & PUBKEY_FLAG_FIXEDLEN) {
-        rc = _gcry_sexp_build(r_sig, NULL, "(sig-val(rsa(s%b)))",
-                              (int)siglen, sig);
+        rc = _gcry_sexp_build(r_sig, NULL, "(sig-val(rsa(s%b)))", (int)k, sig);
     } else {
         gcry_mpi_t s = NULL;
 
-        rc = _gcry_mpi_scan(&s, GCRYMPI_FMT_USG, sig, siglen, NULL);
+        rc = _gcry_mpi_scan(&s, GCRYMPI_FMT_USG, sig, k, NULL);
 
         if (!rc) {
             rc = _gcry_sexp_build(r_sig, NULL, "(sig-val(rsa(s%M)))", s);
@@ -669,11 +620,11 @@ rsa_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     }
 
 leave:
-    EVP_MD_free(md);
-    EVP_PKEY_CTX_free(ctx);
     EVP_PKEY_free(key);
-    _gcry_free(in);
+    gcry_mpi_release(n);
+    _gcry_free(frame);
     _gcry_free(sig);
+    _gcry_free(check);
     _gcry_pk_data_free(&pd);
     return rc;
 }
@@ -689,11 +640,10 @@ rsa_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     unsigned int nbits = rsa_get_nbits(keyparms);
     size_t k = (nbits + 7) / 8;
     EVP_PKEY *key = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_MD *md = NULL;
-    unsigned char *in = NULL;
-    size_t inlen = 0;
+    unsigned char *frame = NULL;
+    size_t framelen = 0;
     unsigned char *sigbuf = NULL;
+    unsigned char *em = NULL;
 
     if (!nbits) {
         return GPG_ERR_INV_OBJ;
@@ -703,6 +653,11 @@ rsa_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     rc = _gcry_pk_data_parse(s_data, &pd);
 
     if (rc) {
+        goto leave;
+    }
+
+    if (pd.encoding == PUBKEY_ENC_OAEP) {
+        rc = GPG_ERR_CONFLICT;
         goto leave;
     }
 
@@ -718,27 +673,35 @@ rsa_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
+    if (pd.encoding != PUBKEY_ENC_PSS) {
+        /* The expected frame; its encoding errors come before the key. */
+        rc = _gcry_pk_data_to_frame(&pd, nbits, &frame, &framelen);
+
+        if (rc == GPG_ERR_TOO_LARGE) {
+            rc = GPG_ERR_BAD_SIGNATURE;
+        }
+
+        if (rc) {
+            goto leave;
+        }
+    }
+
     rc = rsa_evp_key(keyparms, 0, &key, &n);
 
     if (rc) {
         goto leave;
     }
 
-    if (mpi_is_opaque(sig) || gcry_mpi_is_neg(sig) || gcry_mpi_cmp(sig, n) >= 0) {
+    if (mpi_is_opaque(sig) || gcry_mpi_is_neg(sig)
+        || gcry_mpi_cmp(sig, n) >= 0) {
         rc = GPG_ERR_BAD_SIGNATURE;
         goto leave;
     }
 
-    rc = signature_input(&pd, k, &in, &inlen);
-
-    if (rc) {
-        goto leave;
-    }
-
     sigbuf = _gcry_malloc(k);
-    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
+    em = _gcry_malloc(k);
 
-    if (!sigbuf || !ctx) {
+    if (!sigbuf || !em) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
     }
@@ -748,28 +711,28 @@ rsa_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (EVP_PKEY_verify_init(ctx) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
-        goto leave;
-    }
-
-    rc = apply_encoding(ctx, &pd, 1, &md);
+    rc = rsa_raw_op(key, 0, sigbuf, em, k);
 
     if (rc) {
         goto leave;
     }
 
-    if (EVP_PKEY_verify(ctx, sigbuf, k, in, inlen) != 1) {
-        ERR_clear_error();
+    if (pd.encoding == PUBKEY_ENC_PSS) {
+        if (!pd.value) {
+            rc = GPG_ERR_INV_DATA;
+        } else {
+            rc = _gcry_pk_pss_verify(nbits, pd.hash_algo, pd.saltlen, pd.value,
+                                     pd.valuelen, pd.value_is_hash, em, k);
+        }
+    } else if (memcmp(em, frame, k)) {
         rc = GPG_ERR_BAD_SIGNATURE;
     }
 
 leave:
-    EVP_MD_free(md);
-    EVP_PKEY_CTX_free(ctx);
     EVP_PKEY_free(key);
-    _gcry_free(in);
+    _gcry_free(frame);
     _gcry_free(sigbuf);
+    _gcry_free(em);
     gcry_mpi_release(sig);
     gcry_mpi_release(n);
     gcry_sexp_release(l1);
@@ -777,6 +740,7 @@ leave:
     return rc;
 }
 
+/* The reference library only checks that n is the product of p and q. */
 static gcry_err_code_t
 rsa_check_secret_key(gcry_sexp_t keyparms)
 {
@@ -787,9 +751,7 @@ rsa_check_secret_key(gcry_sexp_t keyparms)
     gcry_mpi_t p = NULL;
     gcry_mpi_t q = NULL;
     gcry_mpi_t u = NULL;
-    gcry_mpi_t t1;
-    gcry_mpi_t t2;
-    gcry_mpi_t phi;
+    gcry_mpi_t t;
 
     rc = _gcry_sexp_extract_param(keyparms, NULL, "nedpqu", &n, &e, &d, &p,
                                   &q, &u, NULL);
@@ -798,43 +760,14 @@ rsa_check_secret_key(gcry_sexp_t keyparms)
         return rc;
     }
 
-    t1 = gcry_mpi_new(0);
-    t2 = gcry_mpi_new(0);
-    phi = gcry_mpi_new(0);
+    t = gcry_mpi_new(0);
+    gcry_mpi_mul(t, p, q);
 
-    /* n == p*q */
-    gcry_mpi_mul(t1, p, q);
-
-    if (gcry_mpi_cmp(t1, n)) {
+    if (gcry_mpi_cmp(t, n)) {
         rc = GPG_ERR_BAD_SECKEY;
     }
 
-    /* u*p == 1 mod q */
-    if (!rc) {
-        gcry_mpi_mulm(t1, u, p, q);
-
-        if (gcry_mpi_cmp_ui(t1, 1)) {
-            rc = GPG_ERR_BAD_SECKEY;
-        }
-    }
-
-    /* e*d == 1 mod lcm(p-1, q-1) */
-    if (!rc) {
-        gcry_mpi_sub_ui(t1, p, 1);
-        gcry_mpi_sub_ui(t2, q, 1);
-        gcry_mpi_mul(phi, t1, t2);
-        gcry_mpi_gcd(t1, t1, t2);
-        gcry_mpi_div(phi, NULL, phi, t1, 0);
-        gcry_mpi_mulm(t1, e, d, phi);
-
-        if (gcry_mpi_cmp_ui(t1, 1)) {
-            rc = GPG_ERR_BAD_SECKEY;
-        }
-    }
-
-    gcry_mpi_release(t1);
-    gcry_mpi_release(t2);
-    gcry_mpi_release(phi);
+    gcry_mpi_release(t);
     gcry_mpi_release(n);
     gcry_mpi_release(e);
     gcry_mpi_release(d);
@@ -892,12 +825,28 @@ rsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         }
     }
 
-    if (nbits < 1024 || (nbits % 2)) {
+    /* The reference library rounds an odd size up and has no lower limit
+     * outside FIPS mode; OpenSSL refuses to generate below 512 bits. */
+    if (nbits & 1) {
+        nbits++;
+    }
+
+    if (nbits < 512) {
         return GPG_ERR_INV_VALUE;
     }
 
-    if (evalue == 0 || evalue == 1) {
-        evalue = 65537; /* Upstream picks the default for these too. */
+    if (_gcry_fips_mode() && (nbits <= 1024 || (nbits & 0x1ff))) {
+        return GPG_ERR_INV_VALUE;
+    }
+
+    /* The public exponent rules of the reference library: 0 selects 41,
+     * 1 selects 65537, an even value is made odd. */
+    if (evalue == 0) {
+        evalue = 41;
+    } else if (evalue == 1) {
+        evalue = 65537;
+    } else {
+        evalue |= 1;
     }
 
     e = BN_new();

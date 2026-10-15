@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include <openssl/crypto.h>
 #include <openssl/dsa.h>
 #include <openssl/ec.h>
 
@@ -111,22 +112,37 @@ int
 _gcry_pk_util_hash_algo_from_name(const char *s, size_t n)
 {
     size_t i;
+    int algo = 0;
 
-    for (i = 0; i < DIM(digests); i++) {
+    for (i = 0; i < DIM(digests) && !algo; i++) {
         if (strieq_n(digests[i].name, s, n)
             || strieq_n(digests[i].ossl, s, n)
             || (digests[i].alias1 && strieq_n(digests[i].alias1, s, n))
             || (digests[i].alias2 && strieq_n(digests[i].alias2, s, n))) {
-            return digests[i].algo;
+            algo = digests[i].algo;
         }
     }
 
     /* Historic lower case spellings. */
-    if (strieq_n("rmd160", s, n) || strieq_n("ripemd160", s, n)) {
-        return GCRY_MD_RMD160;
+    if (!algo && (strieq_n("rmd160", s, n) || strieq_n("ripemd160", s, n))) {
+        algo = GCRY_MD_RMD160;
     }
 
-    return 0;
+    /* Anything else the digest module knows, e.g. CRC32 for PKCS#1. */
+    if (!algo && n < 64) {
+        char name[64];
+
+        memcpy(name, s, n);
+        name[n] = 0;
+        algo = gcry_md_map_name(name);
+    }
+
+    /* A listed but unavailable digest is as good as an unknown one. */
+    if (algo && gcry_md_test_algo(algo)) {
+        algo = 0;
+    }
+
+    return algo;
 }
 
 const char *
@@ -814,7 +830,8 @@ _gcry_pk_util_preparse_encval(gcry_sexp_t sexp, const char *const *algo_names,
             s = gcry_sexp_nth_data(l2, 0, &n);
 
             if (!s) {
-                continue;
+                rc = GPG_ERR_INV_OBJ; /* A list where a name belongs. */
+                goto leave;
             }
 
             if (!(n == 9 && !memcmp(s, "hash-algo", 9))
@@ -1113,9 +1130,13 @@ _gcry_pk_data_parse(gcry_sexp_t input, struct pk_data *pd)
         if (!rc) {
             rc = get_uint_param(ldata, "salt-length", &v, &found);
 
+            if (rc == GPG_ERR_INV_OBJ) {
+                rc = GPG_ERR_NO_OBJ; /* "(salt-length)" without a value. */
+            }
+
             if (!rc && found) {
-                if (v > 16384) {
-                    rc = GPG_ERR_TOO_LARGE;
+                if (v > 65536) {
+                    rc = GPG_ERR_TOO_SHORT;
                 } else {
                     pd->saltlen = (unsigned int)v;
                 }
@@ -1140,4 +1161,892 @@ leave:
     gcry_sexp_release(lvalue);
     gcry_sexp_release(ldata);
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* PKCS#1 encodings (RFC 8017)                                         */
+/* ------------------------------------------------------------------ */
+/*
+ * These are the padding and encoding methods of RFC 8017 expressed on
+ * byte strings: EME-PKCS1-v1_5, EMSA-PKCS1-v1_5, EME-OAEP and EMSA-PSS.
+ * They are implemented here instead of through OpenSSL's padding modes
+ * because the gcrypt API exposes details OpenSSL does not: a caller may
+ * supply the random padding, the seed or the salt ("random-override"),
+ * any digest known to gcrypt may be used (CRC-32 has a PKCS#1 prefix
+ * here, OpenSSL has no CRC-32 digest at all), the length rules and error
+ * codes follow the reference library, and ElGamal uses the same frames.
+ * The hashes come from the md module, the random bytes from the random
+ * module; this is formatting, not cryptography.
+ */
+
+/* Digest length as the encodings see it: the XOFs have fixed sizes. */
+static unsigned int
+enc_hash_len(int algo)
+{
+    if (algo == GCRY_MD_SHAKE128) {
+        return 32;
+    }
+
+    if (algo == GCRY_MD_SHAKE256) {
+        return 64;
+    }
+
+    return gcry_md_get_algo_dlen(algo);
+}
+
+/* Read HLEN digest bytes out of HD, using the XOF interface if needed. */
+static gcry_err_code_t
+enc_hash_final(gcry_md_hd_t hd, int algo, unsigned char *out,
+               unsigned int hlen)
+{
+    if (gcry_md_get_algo_dlen(algo) == hlen) {
+        unsigned char *d = gcry_md_read(hd, algo);
+
+        if (!d) {
+            return GPG_ERR_DIGEST_ALGO;
+        }
+
+        memcpy(out, d, hlen);
+        return 0;
+    }
+
+    return gcry_err_code(gcry_md_extract(hd, algo, out, hlen));
+}
+
+/* Hash DATA with ALGO into OUT (HLEN bytes). */
+static gcry_err_code_t
+enc_hash(int algo, const void *data, size_t len, unsigned char *out,
+         unsigned int hlen)
+{
+    gcry_md_hd_t hd;
+    gcry_error_t err = gcry_md_open(&hd, algo, 0);
+    gcry_err_code_t rc;
+
+    if (err) {
+        return gcry_err_code(err);
+    }
+
+    gcry_md_write(hd, data, len);
+    rc = enc_hash_final(hd, algo, out, hlen);
+    gcry_md_close(hd);
+    return rc;
+}
+
+/* MGF1: OUT (OUTLEN bytes) = Hash(SEED || 0) || Hash(SEED || 1) || ... */
+static gcry_err_code_t
+mgf1(unsigned char *out, size_t outlen, const unsigned char *seed,
+     size_t seedlen, int algo)
+{
+    gcry_md_hd_t hd;
+    unsigned int dlen = enc_hash_len(algo);
+    unsigned char block[64];
+    gcry_error_t err;
+    gcry_err_code_t rc = 0;
+    size_t done = 0;
+    unsigned int idx = 0;
+
+    if (!dlen || dlen > sizeof block) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    err = gcry_md_open(&hd, algo, 0);
+
+    if (err) {
+        return gcry_err_code(err);
+    }
+
+    if (algo == GCRY_MD_SHAKE128 || algo == GCRY_MD_SHAKE256) {
+        /* With an XOF the mask is simply the XOF output (RFC 8702). */
+        gcry_md_write(hd, seed, seedlen);
+        rc = gcry_err_code(gcry_md_extract(hd, algo, out, outlen));
+        gcry_md_close(hd);
+        return rc;
+    }
+
+    while (done < outlen && !rc) {
+        unsigned char c[4];
+        size_t n = outlen - done < dlen ? outlen - done : dlen;
+
+        if (idx) {
+            gcry_md_reset(hd);
+        }
+
+        c[0] = (unsigned char)(idx >> 24);
+        c[1] = (unsigned char)(idx >> 16);
+        c[2] = (unsigned char)(idx >> 8);
+        c[3] = (unsigned char)idx;
+        gcry_md_write(hd, seed, seedlen);
+        gcry_md_write(hd, c, 4);
+        rc = enc_hash_final(hd, algo, block, dlen);
+        memcpy(out + done, block, n);
+        done += n;
+        idx++;
+    }
+
+    gcry_md_close(hd);
+    return rc;
+}
+
+gcry_err_code_t
+_gcry_pk_pkcs1_encode_for_enc(unsigned int nbits, const unsigned char *value,
+                              size_t valuelen, const unsigned char *rnd,
+                              size_t rndlen, unsigned char **r_frame,
+                              size_t *r_framelen)
+{
+    size_t nframe = (nbits + 7) / 8;
+    unsigned char *frame;
+    size_t pslen;
+    size_t i;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    /* The reference library only insists on the three fixed bytes and a
+     * few bytes of padding, not on PKCS#1's eight. */
+    if (!nframe || valuelen + 7 > nframe) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    pslen = nframe - 3 - valuelen;
+
+    if (rnd) {
+        if (rndlen != pslen) {
+            return GPG_ERR_INV_ARG;
+        }
+
+        for (i = 0; i < rndlen; i++) {
+            if (!rnd[i]) {
+                return GPG_ERR_INV_ARG;
+            }
+        }
+    }
+
+    frame = _gcry_malloc(nframe);
+
+    if (!frame) {
+        return _gcry_err_code_from_syserror();
+    }
+
+    frame[0] = 0;
+    frame[1] = 2;
+
+    if (rnd) {
+        memcpy(frame + 2, rnd, pslen);
+    } else {
+        unsigned char *p = frame + 2;
+        size_t need = pslen;
+
+        /* Random non-zero padding: draw a little extra and skip zeros. */
+        while (need) {
+            unsigned char buf[64];
+            size_t n = need + need / 8 + 1;
+            size_t j;
+
+            if (n > sizeof buf) {
+                n = sizeof buf;
+            }
+
+            gcry_randomize(buf, n, GCRY_STRONG_RANDOM);
+
+            for (j = 0; j < n && need; j++) {
+                if (buf[j]) {
+                    *p++ = buf[j];
+                    need--;
+                }
+            }
+        }
+    }
+
+    frame[2 + pslen] = 0;
+    memcpy(frame + 3 + pslen, value, valuelen);
+    *r_frame = frame;
+    *r_framelen = nframe;
+    return 0;
+}
+
+gcry_err_code_t
+_gcry_pk_pkcs1_decode_for_enc(const unsigned char *frame, size_t nframe,
+                              unsigned char **r_value, size_t *r_valuelen)
+{
+    size_t n = 0;
+    size_t sep;
+    unsigned char *value;
+
+    *r_value = NULL;
+    *r_valuelen = 0;
+
+    if (nframe < 4) {
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    /* The leading zero may already have been stripped by the conversion
+     * from a number. */
+    if (frame[n] == 0) {
+        n++;
+    }
+
+    if (frame[n++] != 2) {
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    for (sep = n; sep < nframe && frame[sep]; sep++) {
+        ;
+    }
+
+    if (sep >= nframe || sep - n < 8) {
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    sep++;
+    value = _gcry_malloc(nframe - sep + 1);
+
+    if (!value) {
+        return _gcry_err_code_from_syserror();
+    }
+
+    memcpy(value, frame + sep, nframe - sep);
+    *r_value = value;
+    *r_valuelen = nframe - sep;
+    return 0;
+}
+
+gcry_err_code_t
+_gcry_pk_pkcs1_encode_for_sig(unsigned int nbits, int algo,
+                              const unsigned char *digest, size_t digestlen,
+                              unsigned char **r_frame, size_t *r_framelen)
+{
+    size_t nframe = (nbits + 7) / 8;
+    unsigned char asn[100];
+    size_t asnlen = sizeof asn;
+    unsigned int dlen;
+    unsigned char *frame;
+    size_t pslen;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    if (gcry_md_algo_info(algo, GCRYCTL_GET_ASNOID, asn, &asnlen)) {
+        return GPG_ERR_NOT_IMPLEMENTED;
+    }
+
+    dlen = gcry_md_get_algo_dlen(algo);
+
+    if (digestlen != dlen) {
+        return GPG_ERR_CONFLICT;
+    }
+
+    if (!dlen || dlen + asnlen + 4 > nframe) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    frame = _gcry_malloc(nframe);
+
+    if (!frame) {
+        return _gcry_err_code_from_syserror();
+    }
+
+    pslen = nframe - dlen - asnlen - 3;
+    frame[0] = 0;
+    frame[1] = 1;
+    memset(frame + 2, 0xff, pslen);
+    frame[2 + pslen] = 0;
+    memcpy(frame + 3 + pslen, asn, asnlen);
+    memcpy(frame + 3 + pslen + asnlen, digest, dlen);
+    *r_frame = frame;
+    *r_framelen = nframe;
+    return 0;
+}
+
+gcry_err_code_t
+_gcry_pk_pkcs1_encode_raw_for_sig(unsigned int nbits,
+                                  const unsigned char *value, size_t valuelen,
+                                  unsigned char **r_frame, size_t *r_framelen)
+{
+    size_t nframe = (nbits + 7) / 8;
+    unsigned char *frame;
+    size_t pslen;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    if (_gcry_fips_mode()
+        && (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_PK_MD)) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (!valuelen || valuelen + 4 > nframe) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    frame = _gcry_malloc(nframe);
+
+    if (!frame) {
+        return _gcry_err_code_from_syserror();
+    }
+
+    pslen = nframe - valuelen - 3;
+    frame[0] = 0;
+    frame[1] = 1;
+    memset(frame + 2, 0xff, pslen);
+    frame[2 + pslen] = 0;
+    memcpy(frame + 3 + pslen, value, valuelen);
+    *r_frame = frame;
+    *r_framelen = nframe;
+    return 0;
+}
+
+gcry_err_code_t
+_gcry_pk_oaep_encode(unsigned int nbits, int algo, const unsigned char *value,
+                     size_t valuelen, const unsigned char *label,
+                     size_t labellen, const unsigned char *rnd, size_t rndlen,
+                     unsigned char **r_frame, size_t *r_framelen)
+{
+    size_t nframe = (nbits + 7) / 8;
+    unsigned int hlen = enc_hash_len(algo);
+    unsigned char *frame = NULL;
+    unsigned char *mask = NULL;
+    unsigned char *db;
+    size_t dblen;
+    size_t i;
+    gcry_err_code_t rc;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    if (!hlen || nframe < 2 * (size_t)hlen + 2) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (valuelen > nframe - 2 * hlen - 2) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    if (rnd && rndlen != hlen) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    frame = _gcry_calloc(1, nframe);
+    dblen = nframe - 1 - hlen;
+    mask = _gcry_malloc(dblen);
+
+    if (!frame || !mask) {
+        rc = _gcry_err_code_from_syserror();
+        goto leave;
+    }
+
+    /* frame = 00 || seed || DB, DB = lHash || PS || 01 || M */
+    db = frame + 1 + hlen;
+    rc = enc_hash(algo, label ? label : (const unsigned char *)"",
+                  label ? labellen : 0, db, hlen);
+
+    if (rc) {
+        goto leave;
+    }
+
+    db[dblen - valuelen - 1] = 1;
+    memcpy(db + dblen - valuelen, value, valuelen);
+
+    if (rnd) {
+        memcpy(frame + 1, rnd, hlen);
+    } else {
+        gcry_randomize(frame + 1, hlen, GCRY_STRONG_RANDOM);
+    }
+
+    rc = mgf1(mask, dblen, frame + 1, hlen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < dblen; i++) {
+        db[i] ^= mask[i];
+    }
+
+    rc = mgf1(mask, hlen, db, dblen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < hlen; i++) {
+        frame[1 + i] ^= mask[i];
+    }
+
+    *r_frame = frame;
+    *r_framelen = nframe;
+    frame = NULL;
+
+leave:
+    _gcry_free(frame);
+    _gcry_free(mask);
+    return rc;
+}
+
+gcry_err_code_t
+_gcry_pk_oaep_decode(const unsigned char *frame, size_t nframe, int algo,
+                     const unsigned char *label, size_t labellen,
+                     unsigned char **r_value, size_t *r_valuelen)
+{
+    unsigned int hlen = enc_hash_len(algo);
+    unsigned char *buf = NULL;
+    unsigned char *mask = NULL;
+    unsigned char lhash[64];
+    unsigned char *db;
+    size_t dblen;
+    size_t i;
+    size_t one = 0;
+    int bad;
+    gcry_err_code_t rc;
+
+    *r_value = NULL;
+    *r_valuelen = 0;
+
+    if (!hlen || hlen > sizeof lhash) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (nframe < 2 * (size_t)hlen + 2) {
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    buf = _gcry_malloc(nframe);
+    dblen = nframe - 1 - hlen;
+    mask = _gcry_malloc(dblen);
+
+    if (!buf || !mask) {
+        rc = _gcry_err_code_from_syserror();
+        goto leave;
+    }
+
+    memcpy(buf, frame, nframe);
+    rc = enc_hash(algo, label ? label : (const unsigned char *)"",
+                  label ? labellen : 0, lhash, hlen);
+
+    if (rc) {
+        goto leave;
+    }
+
+    db = buf + 1 + hlen;
+    rc = mgf1(mask, hlen, db, dblen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < hlen; i++) {
+        buf[1 + i] ^= mask[i];
+    }
+
+    rc = mgf1(mask, dblen, buf + 1, hlen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < dblen; i++) {
+        db[i] ^= mask[i];
+    }
+
+    /* Run every check regardless of earlier failures. */
+    bad = buf[0] != 0;
+    bad |= CRYPTO_memcmp(db, lhash, hlen) != 0;
+
+    for (i = hlen; i < dblen && !db[i]; i++) {
+        ;
+    }
+
+    if (i >= dblen || db[i] != 1) {
+        bad |= 1;
+    } else {
+        one = i;
+    }
+
+    if (bad) {
+        rc = GPG_ERR_ENCODING_PROBLEM;
+        goto leave;
+    }
+
+    *r_valuelen = dblen - one - 1;
+    *r_value = _gcry_malloc(*r_valuelen + 1);
+
+    if (!*r_value) {
+        *r_valuelen = 0;
+        rc = _gcry_err_code_from_syserror();
+        goto leave;
+    }
+
+    memcpy(*r_value, db + one + 1, *r_valuelen);
+
+leave:
+
+    if (buf) {
+        _gcry_wipememory(buf, nframe);
+    }
+
+    _gcry_free(buf);
+    _gcry_free(mask);
+    return rc;
+}
+
+/* H = Hash(eight zero bytes || MHASH || SALT) into OUT. */
+static gcry_err_code_t
+pss_hash(int algo, const unsigned char *mhash, unsigned int hlen,
+         const unsigned char *salt, size_t saltlen, unsigned char *out)
+{
+    static const unsigned char zeros[8];
+    gcry_md_hd_t hd;
+    gcry_error_t err = gcry_md_open(&hd, algo, 0);
+    gcry_err_code_t rc;
+
+    if (err) {
+        return gcry_err_code(err);
+    }
+
+    gcry_md_write(hd, zeros, sizeof zeros);
+    gcry_md_write(hd, mhash, hlen);
+    gcry_md_write(hd, salt, saltlen);
+    rc = enc_hash_final(hd, algo, out, hlen);
+    gcry_md_close(hd);
+    return rc;
+}
+
+gcry_err_code_t
+_gcry_pk_pss_encode(unsigned int nbits, int algo, unsigned int saltlen,
+                    const unsigned char *rnd, size_t rndlen,
+                    const unsigned char *value, size_t valuelen,
+                    int hashed_already, unsigned char **r_frame,
+                    size_t *r_framelen)
+{
+    unsigned int hlen = enc_hash_len(algo);
+    size_t embits = nbits - 1;
+    size_t emlen = (embits + 7) / 8;
+    unsigned char mhash[64];
+    unsigned char h[64];
+    unsigned char *salt = NULL;
+    unsigned char *em = NULL;
+    unsigned char *mask = NULL;
+    size_t dblen;
+    size_t i;
+    gcry_err_code_t rc;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    if (!hlen || hlen > sizeof mhash) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (_gcry_fips_mode() && saltlen > hlen
+        && (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_PK_FLAGS)) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    if (emlen < (size_t)hlen + saltlen + 2) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    if (hashed_already) {
+        if (valuelen != hlen) {
+            return GPG_ERR_INV_LENGTH;
+        }
+
+        memcpy(mhash, value, hlen);
+    } else {
+        rc = enc_hash(algo, value, valuelen, mhash, hlen);
+
+        if (rc) {
+            return rc;
+        }
+    }
+
+    if (rnd && rndlen != saltlen) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    salt = _gcry_malloc(saltlen ? saltlen : 1);
+    em = _gcry_calloc(1, emlen);
+    dblen = emlen - hlen - 1;
+    mask = _gcry_malloc(dblen);
+
+    if (!salt || !em || !mask) {
+        rc = _gcry_err_code_from_syserror();
+        goto leave;
+    }
+
+    if (rnd) {
+        memcpy(salt, rnd, saltlen);
+    } else if (saltlen) {
+        gcry_randomize(salt, saltlen, GCRY_STRONG_RANDOM);
+    }
+
+    rc = pss_hash(algo, mhash, hlen, salt, saltlen, h);
+
+    if (rc) {
+        goto leave;
+    }
+
+    /* DB = PS || 01 || salt, masked; then H and the trailer. */
+    em[dblen - saltlen - 1] = 1;
+    memcpy(em + dblen - saltlen, salt, saltlen);
+    rc = mgf1(mask, dblen, h, hlen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < dblen; i++) {
+        em[i] ^= mask[i];
+    }
+
+    em[0] &= (unsigned char)(0xff >> (8 * emlen - embits));
+    memcpy(em + dblen, h, hlen);
+    em[emlen - 1] = 0xbc;
+    *r_frame = em;
+    *r_framelen = emlen;
+    em = NULL;
+
+leave:
+    _gcry_free(em);
+    _gcry_free(mask);
+    _gcry_free(salt);
+    return rc;
+}
+
+gcry_err_code_t
+_gcry_pk_pss_verify(unsigned int nbits, int algo, unsigned int saltlen,
+                    const unsigned char *value, size_t valuelen,
+                    int hashed_already, const unsigned char *em_in,
+                    size_t em_inlen)
+{
+    unsigned int hlen = enc_hash_len(algo);
+    size_t embits = nbits - 1;
+    size_t emlen = (embits + 7) / 8;
+    unsigned char mhash[64];
+    unsigned char h[64];
+    unsigned char *em = NULL;
+    unsigned char *mask = NULL;
+    size_t dblen;
+    size_t i;
+    gcry_err_code_t rc;
+
+    if (!hlen || hlen > sizeof mhash) {
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (_gcry_fips_mode() && saltlen > hlen
+        && (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_PK_FLAGS)) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    if (emlen < (size_t)hlen + saltlen + 2) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    if (hashed_already) {
+        if (valuelen != hlen) {
+            return GPG_ERR_INV_ARG;
+        }
+
+        memcpy(mhash, value, hlen);
+    } else {
+        rc = enc_hash(algo, value, valuelen, mhash, hlen);
+
+        if (rc) {
+            return rc;
+        }
+    }
+
+    /* Leading zero bytes of the value may have been stripped. */
+    while (em_inlen > emlen && !*em_in) {
+        em_in++;
+        em_inlen--;
+    }
+
+    if (em_inlen > emlen) {
+        return GPG_ERR_BAD_SIGNATURE;
+    }
+
+    em = _gcry_calloc(1, emlen);
+    dblen = emlen - hlen - 1;
+    mask = _gcry_malloc(dblen);
+
+    if (!em || !mask) {
+        rc = _gcry_err_code_from_syserror();
+        goto leave;
+    }
+
+    memcpy(em + emlen - em_inlen, em_in, em_inlen);
+
+    if (em[emlen - 1] != 0xbc
+        || (em[0] & ~(unsigned char)(0xff >> (8 * emlen - embits)))) {
+        rc = GPG_ERR_BAD_SIGNATURE;
+        goto leave;
+    }
+
+    rc = mgf1(mask, dblen, em + dblen, hlen, algo);
+
+    if (rc) {
+        goto leave;
+    }
+
+    for (i = 0; i < dblen; i++) {
+        em[i] ^= mask[i];
+    }
+
+    em[0] &= (unsigned char)(0xff >> (8 * emlen - embits));
+
+    for (i = 0; i < dblen - saltlen - 1; i++) {
+        if (em[i]) {
+            rc = GPG_ERR_BAD_SIGNATURE;
+            goto leave;
+        }
+    }
+
+    if (em[dblen - saltlen - 1] != 1) {
+        rc = GPG_ERR_BAD_SIGNATURE;
+        goto leave;
+    }
+
+    rc = pss_hash(algo, mhash, hlen, em + dblen - saltlen, saltlen, h);
+
+    if (!rc && CRYPTO_memcmp(h, em + dblen, hlen)) {
+        rc = GPG_ERR_BAD_SIGNATURE;
+    }
+
+leave:
+    _gcry_free(em);
+    _gcry_free(mask);
+    return rc;
+}
+
+/*
+ * The frame a (data ...) S-expression stands for, as (NBITS+7)/8 bytes
+ * (PSS frames are one bit shorter and come back right aligned in that
+ * many bytes).  This is the common part of the RSA and ElGamal paths:
+ * raw data is the number itself, everything else is one of the encodings
+ * above.  For PKCS#1 signatures a message given with (value ...) and the
+ * prehash flag is hashed first.
+ */
+gcry_err_code_t
+_gcry_pk_data_to_frame(struct pk_data *pd, unsigned int nbits,
+                       unsigned char **r_frame, size_t *r_framelen)
+{
+    size_t nframe = (nbits + 7) / 8;
+    gcry_err_code_t rc;
+
+    *r_frame = NULL;
+    *r_framelen = 0;
+
+    switch (pd->encoding) {
+    case PUBKEY_ENC_RAW:
+        if (!pd->mpi || mpi_is_opaque(pd->mpi)) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        *r_frame = _gcry_malloc(nframe);
+
+        if (!*r_frame) {
+            return _gcry_err_code_from_syserror();
+        }
+
+        if (_gcry_pk_mpi_to_fixed(pd->mpi, *r_frame, nframe)) {
+            _gcry_free(*r_frame);
+            *r_frame = NULL;
+            return GPG_ERR_TOO_LARGE;
+        }
+
+        *r_framelen = nframe;
+        return 0;
+
+    case PUBKEY_ENC_PKCS1:
+        if (!pd->value) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        if (pd->op == PUBKEY_OP_ENCRYPT || pd->op == PUBKEY_OP_DECRYPT) {
+            return _gcry_pk_pkcs1_encode_for_enc(nbits, pd->value,
+                                                 pd->valuelen, pd->rnd,
+                                                 pd->rndlen, r_frame,
+                                                 r_framelen);
+        }
+
+        if (pd->value_is_hash) {
+            return _gcry_pk_pkcs1_encode_for_sig(nbits, pd->hash_algo,
+                                                 pd->value, pd->valuelen,
+                                                 r_frame, r_framelen);
+        } else {
+            unsigned int dlen = gcry_md_get_algo_dlen(pd->hash_algo);
+            unsigned char digest[64];
+
+            if (!dlen || dlen > sizeof digest) {
+                return GPG_ERR_DIGEST_ALGO;
+            }
+
+            rc = enc_hash(pd->hash_algo, pd->value, pd->valuelen, digest,
+                          dlen);
+
+            if (rc) {
+                return rc;
+            }
+
+            return _gcry_pk_pkcs1_encode_for_sig(nbits, pd->hash_algo,
+                                                 digest, dlen, r_frame,
+                                                 r_framelen);
+        }
+
+    case PUBKEY_ENC_PKCS1_RAW:
+        if (!pd->value) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        return _gcry_pk_pkcs1_encode_raw_for_sig(nbits, pd->value,
+                                                 pd->valuelen, r_frame,
+                                                 r_framelen);
+
+    case PUBKEY_ENC_OAEP:
+        if (!pd->value) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        return _gcry_pk_oaep_encode(nbits, pd->hash_algo, pd->value,
+                                    pd->valuelen, pd->label, pd->labellen,
+                                    pd->rnd, pd->rndlen, r_frame, r_framelen);
+
+    case PUBKEY_ENC_PSS: {
+        unsigned char *em = NULL;
+        size_t emlen = 0;
+
+        if (!pd->value) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        rc = _gcry_pk_pss_encode(nbits, pd->hash_algo, pd->saltlen, pd->rnd,
+                                 pd->rndlen, pd->value, pd->valuelen,
+                                 pd->value_is_hash, &em, &emlen);
+
+        if (rc) {
+            return rc;
+        }
+
+        if (emlen == nframe) {
+            *r_frame = em;
+        } else {
+            *r_frame = _gcry_calloc(1, nframe);
+
+            if (!*r_frame) {
+                _gcry_free(em);
+                return _gcry_err_code_from_syserror();
+            }
+
+            memcpy(*r_frame + nframe - emlen, em, emlen);
+            _gcry_free(em);
+        }
+
+        *r_framelen = nframe;
+        return 0;
+    }
+
+    default:
+        return GPG_ERR_CONFLICT;
+    }
 }

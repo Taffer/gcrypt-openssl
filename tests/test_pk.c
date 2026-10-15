@@ -432,7 +432,8 @@ TEST(rsa_known_signature)
     /* Tampered data and tampered signature. */
     ASSERT_OK(gcry_sexp_build(&bad, NULL,
                               "(data (flags pkcs1) (hash sha256 #00" RSA_DIGEST "#))"));
-    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, bad, pkey));
+    /* A 33 byte "SHA-256" digest conflicts with the algorithm. */
+    ASSERT_ERR(GPG_ERR_CONFLICT, gcry_pk_verify(sig, bad, pkey));
     gcry_sexp_release(bad);
     ASSERT_OK(gcry_sexp_build(&bad, NULL,
                               "(data (flags pkcs1) (hash sha1 #" RSA_DIGEST "#))"));
@@ -743,6 +744,14 @@ TEST(rsa_testkey_detects_corruption)
         gcry_mpi_swap(p, q);
     }
 
+    /* Only n = p * q is checked, as in the reference library: a wrong u
+     * passes, a wrong modulus does not. */
+    ASSERT_OK(gcry_sexp_build(&bad, NULL,
+                              "(private-key (rsa (n %m)(e %m)(d %m)(p %m)(q %m)(u %m)))",
+                              n, e, d, p, q, u));
+    ASSERT_OK(gcry_pk_testkey(bad));
+    gcry_sexp_release(bad);
+    gcry_mpi_add_ui(n, n, 2);
     ASSERT_OK(gcry_sexp_build(&bad, NULL,
                               "(private-key (rsa (n %m)(e %m)(d %m)(p %m)(q %m)(u %m)))",
                               n, e, d, p, q, u));
@@ -1337,6 +1346,9 @@ TEST(ed25519_keygen_and_ed448)
 #define X25519_ALICE_SK "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
 #define X25519_ALICE_PK "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
 #define X25519_BOB_SK "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
+/* The same secret clamped as X25519 does it: this is what a key stores. */
+#define X25519_BOB_SK_CLAMPED \
+    "58ab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e06b"
 #define X25519_BOB_PK "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
 #define X25519_SHARED "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
 #define X25519_V1_SCALAR "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"
@@ -1389,7 +1401,7 @@ TEST(curve25519)
     pkey = sexp("(public-key (ecc (curve Curve25519) (flags djb-tweak)"
                 " (q #40" X25519_BOB_PK "#)))");
     skey = sexp("(private-key (ecc (curve Curve25519) (flags djb-tweak)"
-                " (q #40" X25519_BOB_PK "#) (d #" X25519_BOB_SK "#)))");
+                " (q #40" X25519_BOB_PK "#) (d #" X25519_BOB_SK_CLAMPED "#)))");
     ASSERT_NOT_NULL(pkey);
     ASSERT_NOT_NULL(skey);
     ASSERT_STR_EQ("Curve25519", gcry_pk_get_curve(pkey, 0, NULL));
@@ -1414,7 +1426,7 @@ TEST(curve25519)
     /* Bob's secret key is a big endian number in Libgcrypt's convention,
      * so build the key with the reversed bytes for decryption. */
     gcry_sexp_release(skey);
-    hex_to_bytes(X25519_BOB_SK, scalar);
+    hex_to_bytes(X25519_BOB_SK_CLAMPED, scalar);
 
     for (i = 0; i < 32; i++) {
         be[i] = scalar[31 - i];
@@ -1797,12 +1809,12 @@ TEST(rsa_genkey_flags)
     gcry_sexp_t key;
     gcry_mpi_t e;
 
-    /* Generation flags are accepted; rsa-use-e 0 and 1 mean 65537. */
+    /* Generation flags are accepted; rsa-use-e 0 means 41, 1 means 65537. */
     key = genkey("(genkey (rsa (nbits 4:1024) (flags transient-key no-keytest"
                  " no-blinding use-x931) (rsa-use-e 1:0)))");
     ASSERT_NOT_NULL(key);
     e = param_mpi(key, "e");
-    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 65537));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 41));
     gcry_mpi_release(e);
     ASSERT_OK(gcry_pk_testkey(key));
     gcry_sexp_release(key);
@@ -2807,6 +2819,654 @@ TEST(disable_algorithm)
     gcry_sexp_release(key);
 }
 
+/* ------------------------------------------------------------------ */
+/* Behaviour matched against the reference library                     */
+/* ------------------------------------------------------------------ */
+
+/* Deterministic outputs of libgcrypt 1.12 for the vector key: encodings
+ * with a caller supplied random part ("random-override") and the PKCS#1
+ * v1.5 decryption of an unpadded ciphertext (implicit rejection). */
+#define RSA_PKCS1_CT \
+    "4939D5D8467211A670B7F826FBA213C9E8D2627BE1A010E01042FEEC73AB9775F85DF3" \
+    "9158D8F04D16AE1FCEC94259BB201EEDF62079B50EC12C840C2ADF4744A510258A2693" \
+    "1A62961F62E65ED064FA64D4543E2B11B3F170810A9E62B819E27B92F97C109E1EBD45" \
+    "0A1466A39FAA052438985FC208D4E2D33D6B15C87BD942BF365D9DAEAC8CB38F43649D" \
+    "EDA02CC961B2DB180FEE9090015FE45B784BF88C3EF074C93F724AD82AA5552401000A" \
+    "16AAD36F4A4FB0C56FFFBFF4D2CB6252AA98A93879864F7A4E73BD1C0ECA9BA3514A07" \
+    "F07C0213620D674B16109562556F141A3AB5D9E3DD5D7786F115211B3FBB6909407B80" \
+    "BA8FB427ABF4E507FD4F42"
+#define RSA_OAEP1_CT \
+    "201D52EED17C78C04001D608E80FA7EEE9EAE5A8941A31FA7677F08B66A93DF39B3A97" \
+    "9978E6A00ED1CE53D0CF9CB4E776484F8FDB94C4CD29AD3BB2CF4D3760C810E41542F6" \
+    "CE05CBC7885A32A6AA6A1600C5C017A0CFB219BD5DB30B644AA15B4E1E2FFAD03CEB19" \
+    "68CC1DC34B1D88470A84B40625A96E1548A1BD0666E8D9B2A58F4D5E9E755BA2683193" \
+    "FF77FE2B1261490B0F489E385155D8E1DF3394DF2C3C7121991896662136067512B3E2" \
+    "36DC37196B327E80C55C37A14B43E1F3E035E450BC2612532D01013174416F2326EB0E" \
+    "8D2FA976CE575137EF689738B4403D95D725F122D34F18A49544B293EB84572234F52F" \
+    "78452DB4804B992D0F0504"
+#define RSA_OAEP256_CT \
+    "5AE5E122A2CD5A7148EAAF3CD88EE9CB69B21AA0CA4F7C8C95E556047A039F8B8C04AD" \
+    "D4396C0A0DC01BCBDB684971F59E9A476CF013002007C1FB496A633F1D2B716A4434A0" \
+    "FE4D7D14E6A3AD6678F4BB36465A703DA5711915D06F7B396F969F398DEC295FB919AC" \
+    "68CE574FAE416699916910106A1E3AB073F00D7E5ED22F6FA54837F22C7714621D8781" \
+    "1EDAB1FE847CCE18C046510EBBB2A4A745C8DA8B156EA5963AAE5A5B46CFB2E00F8CCC" \
+    "D3B6D5AF77448D1F54AB37BE025421D82CBEB234FA5EBCB07DBA73E247C0838B258907" \
+    "A82200D3C5CAA22F826675FE302635DF28B9D9F74673D3E98889030D294F3C2D5E9F91" \
+    "D4D2178932114B7BB6A45F"
+#define RSA_PSS256_SIG \
+    "8AA5531ED78FB9EE717B7E5B2E5BCA7C9EB5C8DEEDA2D6CBF22996F2AC34F6096A3920" \
+    "0B8D34ECC22DC57A285031DC0FDA6131362D2F508993D173689C9FD35AC5BEFF29CE6F" \
+    "1C4183FF57DF4730F67552EC3FF3A98E7249843FA1D5E5D4017B30B6C3C74EA658FA54" \
+    "DEB19B8800F770023EB23DC8026622F20973833E9D7D5938BFF9289F943DD05B332A7E" \
+    "003A82320AA1E317623FC5E4469733ACA937233ECE1BF5BD13B2CC2640A46B8D699AF9" \
+    "4CA7D4B25AB60CCF21FAA9661D23DDF3E00457595254A842AB2DA6E400694603D55A77" \
+    "E22AC2108ABAD6515FC399814BCBD7A94E7FA1DEEF4D33C4E3576989E82A917E957776" \
+    "DECF769B87FC384846FC99"
+#define RSA_PSSSHAKE_SIG \
+    "9284BB06E93952A6E625585D6AE499426079A315835DB98246CADF9559F797563825" \
+    "539A3452F2E480C1830982D6F45889E58E065093A996A2A3D2D59D41B7945F918A1FBE" \
+    "F0F6D154D9C29E9C8515EFE82180C65A3602EA6AB30CB7693984C53BA9EA74B118822C" \
+    "0065F76683730040905195BFE87E01ADC00C6DCCBF211C8998C70D1653B2040473FB3F" \
+    "0A6149F5B7BFC3A8E6E21CFA8A4965DD9A3EA34976349E5DE26240481823A19602F2DA" \
+    "43D3C17FE2F67848AE1D64FCFAE3D5339280A2EDEF01CAAE088ED63BEED569E13B18BB" \
+    "F096A9EE58584A37D4B40B84C8A43BB3B7A6374150D1E63BAED7E23202FB2A3D2A266D" \
+    "DAE30DDE20A26ACA1B0E4835"
+#define RSA_CRC32_SIG \
+    "4B37E1EC24799584BE779E253814E58C99714D223794150EF229E0A5D8C7E8EB64FBA4" \
+    "A83D81D128DA021FCFAEF33A7A6961DDB73A29896EDBD3F64A2F8B69AA140AB5603664" \
+    "14B8E1A851AC837B7EA5B1404B28FF878912495768966C4DA5E3AF11BFBCF77C0FBC47" \
+    "D076DB326583807929388C3D661A564E79602BA9E0B08BD3759EE732B1EC25ECC0C9F4" \
+    "4C6866F82F1112F83D74A992A1D58BEC9D60849B89B6EE8B9CCB700DC2EF76E4D8F3B2" \
+    "38C8D6164D4F41F15B9F831D54C3A5C3C624894BBFBA7EF0E593CE9ADEC9B60A1FD828" \
+    "5CF4108B4D42603143A3E218E2EA0031A26B3A3F8EEFA0B5C4027F01321811CCD5EBA8" \
+    "447D5AC19485A1F2EB7D52"
+#define RSA_SHA3_SIG \
+    "611A65B59E4A7F702714C46C4DDB4F8A4A5FB7E3A6F04B7DE5F45E68B7EAB3257BCBE0" \
+    "92323059A93EF90E8590E555A3732ACBAF1C3D21710D3840F12AD725EAEDDEF913B49D" \
+    "515723DB9EDED26C498E8875A2F268FE94A29907D34A2E4FB82AB8484FB8875AB91689" \
+    "50ACAAC672BE850B51E0ACDAE0E5A94F714F02D20EE11EDB80379ECE5804BF07BA63E6" \
+    "8F7003D0B7B26814E03B49DC8AD8AB60616F5A475516BDD6FEFCBBAA06A2D603CAE10A" \
+    "9F28FF8459A1367FEB916D008BA871CEA094174E0D8C99F577C4EFCA43675C738FA6B2" \
+    "2064A8AD518553972EC2F470337B2EBFCEAC98FC7813C650CF1DE4C14A688B8A494D3C" \
+    "E20D88DF1A81A7E02B5399"
+#define RSA_RAW1_SIG \
+    "1A5A8D5524175EBEF8F5620B97DC96E08A2C6BF82BB350B938D04E9A8A6BA04E00640A" \
+    "ECBFB74D0C51244DBC3177BA55234A07D0021055E8BA002C27FA635406968EE052E110" \
+    "36CB31357E949ABEDA692C80A978F3CCB8DA5D0D1F52B0FE8695EEC25AE00EB2B0D852" \
+    "F8F382CC4CC6FC202DC72B7FE069B15F899AF28B9D3677DD14D1AA988F9D7629D634F6" \
+    "1A0A5345415C92262582E69A9DD465B399DA8A50239BC1A65EA92FE2571F94CBC2B02A" \
+    "6C323A21BEE59E10B5DCA9EEF091B3A99BDCD0F46024D074A338971AD039184CF5DA74" \
+    "C144042F75990B78B1DA77C10B7C55A5D4220BDC77BF592A008838F53870BB31127834" \
+    "18CA61ED6EB5BA44CE3038"
+#define RSA_IMPLICIT \
+    "DAB0FDFB466C042B8E79AA6237200524F2BBA931039F1B9AD41E30B1400D616FF1F152" \
+    "034F459C676CDD4F720052E8EC2F1543AD934D7ABC4ADF99666BE671604417F87F42C1" \
+    "C27423F7433A"
+#define RSA_RAW_CT5 \
+    "38937EF3A1727FCA2F8BB000A77E39F5B589BF05B48B972F46D2AF8F1CD6EBE986EF69" \
+    "5D1517119F0F81374FE2EE1F2A650330F334E7223C3C7E7E1F1CB664CE3CD26DF3541C" \
+    "F23B879047D50E3FAE4FE531A173B6F31FB0D0FD072ABAB1EBE12A18DB684BCD11D094" \
+    "F7BC68B0DE4FC19211C8FAA27D8965532C49AD05DB7390599A36B09D5DB18694EBC442" \
+    "3E828CE5602CE0EE4F58155BEAC439BA9E8170B1F0E5DFB4420C9EEB71173958E1877E" \
+    "C122161E465460B25C8F59C9A93324A6E349731ADEDA66878DFAC79034FAE27D5CE9C9" \
+    "2F89E05EE69B9C6A09FA90139A9812C414E9B6262AF88C6CA50C317DD885BC72AF6DB2" \
+    "31DBC02CEE50B9108A0429"
+
+/* The full private key of the vector, with u computed. */
+static gcry_sexp_t
+rsa_full_vector_key(void)
+{
+    gcry_sexp_t key = NULL;
+    gcry_mpi_t n = hex_mpi(RSA_N);
+    gcry_mpi_t e = gcry_mpi_set_ui(NULL, RSA_E_DEC);
+    gcry_mpi_t d = hex_mpi(RSA_D);
+    gcry_mpi_t p = hex_mpi(RSA_P);
+    gcry_mpi_t q = hex_mpi(RSA_Q);
+    gcry_mpi_t u = gcry_mpi_new(0);
+
+    if (gcry_mpi_cmp(p, q) > 0) {
+        gcry_mpi_swap(p, q);
+    }
+
+    gcry_mpi_invm(u, p, q);
+    gcry_sexp_build(&key, NULL,
+                    "(private-key (rsa (n %m)(e %m)(d %m)(p %m)(q %m)(u %m)))",
+                    n, e, d, p, q, u);
+    gcry_mpi_release(n);
+    gcry_mpi_release(e);
+    gcry_mpi_release(d);
+    gcry_mpi_release(p);
+    gcry_mpi_release(q);
+    gcry_mpi_release(u);
+    return key;
+}
+
+/* Does the first element named NAME hold the bytes HEX? */
+static int
+param_is_hex(gcry_sexp_t s, const char *name, const char *hex)
+{
+    size_t len;
+    void *buf = param_bytes(s, name, &len);
+    int eq = buf && bytes_eq_hex(buf, len, hex);
+
+    gcry_free(buf);
+    return eq;
+}
+
+TEST(rsa_encoding_vectors)
+{
+    gcry_sexp_t skey = rsa_full_vector_key();
+    gcry_sexp_t pkey = rsa_vector_key(0);
+    gcry_sexp_t data;
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t plain = NULL;
+    unsigned char ov[256];
+    unsigned char digest[32];
+    gcry_mpi_t a;
+    int i;
+
+    ASSERT_NOT_NULL(skey);
+    ASSERT_OK(gcry_pk_testkey(skey));
+
+    for (i = 0; i < 256; i++) {
+        ov[i] = (unsigned char)(i + 1);
+    }
+
+    for (i = 0; i < 32; i++) {
+        unsigned int v;
+
+        sscanf(RSA_DIGEST + 2 * i, "%2x", &v);
+        digest[i] = (unsigned char)v;
+    }
+
+    /* PKCS#1 v1.5 encryption with the padding supplied by the caller. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1) (value 3:abc)"
+                              " (random-override %b))", 250, ov));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_TRUE(param_is_hex(ciph, "a", RSA_PKCS1_CT));
+    gcry_sexp_release(data);
+    /* Unpadded only when the enc-val says so. */
+    a = param_mpi(ciph, "a");
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(enc-val (flags pkcs1) (rsa (a %m)))",
+                              a));
+    gcry_mpi_release(a);
+    ASSERT_OK(gcry_pk_decrypt(&plain, data, skey));
+    ASSERT_TRUE(param_is_hex(plain, "value", "616263"));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(data);
+    gcry_sexp_release(ciph);
+
+    /* The padding must fit exactly and contain no zero byte. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1) (value 3:abc)"
+                              " (random-override %b))", 249, ov));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_encrypt(&ciph, data, pkey));
+    gcry_sexp_release(data);
+    ov[7] = 0;
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1) (value 3:abc)"
+                              " (random-override %b))", 250, ov));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_encrypt(&ciph, data, pkey));
+    gcry_sexp_release(data);
+    ov[7] = 8;
+
+    /* OAEP with the seed supplied by the caller. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags oaep) (value 3:abc)"
+                              " (random-override %b))", 20, ov));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_TRUE(param_is_hex(ciph, "a", RSA_OAEP1_CT));
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags oaep) (hash-algo sha256)"
+                              " (label 3:lbl) (value 3:abc)"
+                              " (random-override %b))", 32, ov));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_TRUE(param_is_hex(ciph, "a", RSA_OAEP256_CT));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(enc-val (flags oaep) (hash-algo sha256)"
+                              " (label 3:lbl) (rsa (a %m)))",
+                              a = param_mpi(ciph, "a")));
+    gcry_mpi_release(a);
+    ASSERT_OK(gcry_pk_decrypt(&plain, data, skey));
+    ASSERT_TRUE(param_is_hex(plain, "value", "616263"));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(data);
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags oaep) (value 3:abc)"
+                              " (random-override %b))", 19, ov));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_encrypt(&ciph, data, pkey));
+    gcry_sexp_release(data);
+
+    /* PSS with a given salt, with SHA-256 and with SHAKE256 (RFC 8702). */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (random-override %b)"
+                              " (hash sha256 %b))", 20, ov, 32, digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_PSS256_SIG));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (salt-length 2:32)"
+                              " (random-override %b) (hash shake256 %b))",
+                              32, ov, 64, ov));
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_PSSSHAKE_SIG));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    /* Signatures with digests OpenSSL does not offer for PKCS#1. */
+    data = sexp("(data (flags pkcs1) (hash crc32 #01020304#))");
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_CRC32_SIG));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1) (hash sha3-256 %b))", 32,
+                              digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_SHA3_SIG));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    data = sexp("(data (flags pkcs1-raw) (value 5:hello))");
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_RAW1_SIG));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    /* A digest of the wrong size for its algorithm is a conflict. */
+    data = sexp("(data (flags pkcs1) (hash sha256 #0102#))");
+    ASSERT_ERR(GPG_ERR_CONFLICT, gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+
+    /* Textbook RSA: encryption reduces the value, a signature of a value
+     * not below the modulus cannot be made. */
+    a = gcry_mpi_set_ui(NULL, 5);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))",
+                              a));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_TRUE(param_is_hex(ciph, "a", RSA_RAW_CT5));
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    gcry_mpi_release(a);
+    a = hex_mpi(RSA_N);
+    gcry_mpi_add_ui(a, a, 1);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))",
+                              a));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_TRUE(param_is_hex(ciph, "a", "01"));
+    gcry_sexp_release(ciph);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+    gcry_mpi_release(a);
+
+    /* PKCS#1 v1.5 decryption never reports bad padding: it yields the
+     * same synthetic plaintext the reference library computes. */
+    a = gcry_mpi_set_ui(NULL, 12345);
+    ASSERT_OK(gcry_sexp_build(&ciph, NULL, "(enc-val (flags pkcs1) (rsa (a %m)))",
+                              a));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, skey));
+    ASSERT_TRUE(param_is_hex(plain, "value", RSA_IMPLICIT));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_sexp_build(&ciph, NULL, "(enc-val (flags oaep) (rsa (a %m)))",
+                              a));
+    ASSERT_ERR(GPG_ERR_ENCODING_PROBLEM, gcry_pk_decrypt(&plain, ciph, skey));
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_sexp_build(&ciph, NULL,
+                              "(enc-val (flags) ((x)) (rsa (a %m)))", a));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_decrypt(&plain, ciph, skey));
+    gcry_sexp_release(ciph);
+    gcry_mpi_release(a);
+
+    /* Length rules and odd parameters. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags pkcs1) (value %b))",
+                              250, ov));
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_encrypt(&ciph, data, pkey));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags pkcs1) (value %b))",
+                              249, ov));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (salt-length 3:223)"
+                              " (hash sha256 %b))", 32, digest));
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (salt-length)"
+                              " (hash sha256 %b))", 32, digest));
+    ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (hash shake256 %b))", 32,
+                              digest));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+    data = sexp("(data (flags pss prehash) (hash-algo shake128) (value 3:msg))");
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    gcry_sexp_release(skey);
+    gcry_sexp_release(pkey);
+}
+
+TEST(rsa_genkey_rules)
+{
+    gcry_sexp_t key;
+    gcry_mpi_t e;
+
+    /* Odd sizes are rounded up; OpenSSL cannot go below 512 bits. */
+    key = genkey("(genkey (rsa (nbits 3:512)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_EQ(512, gcry_pk_get_nbits(key));
+    gcry_sexp_release(key);
+    key = genkey("(genkey (rsa (nbits 3:767)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_EQ(768, gcry_pk_get_nbits(key));
+    gcry_sexp_release(key);
+    {
+        gcry_sexp_t parms = sexp("(genkey (rsa (nbits 3:256)))");
+
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+    }
+
+    /* Even exponents are made odd, 0 selects 41. */
+    key = genkey("(genkey (rsa (nbits 3:512) (rsa-use-e 1:4)))");
+    ASSERT_NOT_NULL(key);
+    e = param_mpi(key, "e");
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 5));
+    gcry_mpi_release(e);
+    gcry_sexp_release(key);
+    key = genkey("(genkey (rsa (nbits 3:512) (rsa-use-e 3:256)))");
+    ASSERT_NOT_NULL(key);
+    e = param_mpi(key, "e");
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 257));
+    gcry_mpi_release(e);
+    gcry_sexp_release(key);
+}
+
+TEST(elgamal_encodings)
+{
+    gcry_sexp_t key = genkey("(genkey (elg (nbits 4:1024)))");
+    gcry_sexp_t pub;
+    gcry_sexp_t sec;
+    gcry_sexp_t data;
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_sexp_t sig = NULL;
+    gcry_mpi_t a;
+    gcry_mpi_t b;
+    gcry_mpi_t m;
+    unsigned char digest[32];
+
+    ASSERT_NOT_NULL(key);
+    pub = gcry_sexp_find_token(key, "public-key", 0);
+    sec = gcry_sexp_find_token(key, "private-key", 0);
+    memset(digest, 0x11, sizeof digest);
+
+    /* PKCS#1 v1.5 encryption; the result is unpadded only when the
+     * enc-val carries the flag, else the frame comes back as a number. */
+    data = sexp("(data (flags pkcs1) (value 3:abc))");
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, sec));
+    m = gcry_sexp_nth_mpi(plain, 0, GCRYMPI_FMT_USG);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(1015, gcry_mpi_get_nbits(m) / 8 * 8 + 7);
+    gcry_mpi_release(m);
+    gcry_sexp_release(plain);
+    a = param_mpi(ciph, "a");
+    b = param_mpi(ciph, "b");
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_sexp_build(&ciph, NULL,
+                              "(enc-val (flags pkcs1) (elg (a %m)(b %m)))", a,
+                              b));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, sec));
+    ASSERT_TRUE(param_is_hex(plain, "value", "616263"));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(ciph);
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    gcry_sexp_release(data);
+
+    /* OAEP with a label. */
+    data = sexp("(data (flags oaep) (hash-algo sha256) (label 3:lbl)"
+                " (value 5:hello))");
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
+    a = param_mpi(ciph, "a");
+    b = param_mpi(ciph, "b");
+    gcry_sexp_release(ciph);
+    ASSERT_OK(gcry_sexp_build(&ciph, NULL,
+                              "(enc-val (flags oaep) (hash-algo sha256)"
+                              " (label 3:lbl) (elg (a %m)(b %m)))", a, b));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, sec));
+    ASSERT_TRUE(param_is_hex(plain, "value", "68656c6c6f"));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(ciph);
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    gcry_sexp_release(data);
+    data = sexp("(data (flags pkcs1-raw) (value 5:hello))");
+    ASSERT_ERR(GPG_ERR_CONFLICT, gcry_pk_encrypt(&ciph, data, pub));
+    gcry_sexp_release(data);
+
+    /* Signatures over PKCS#1 frames. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1) (hash sha256 %b))", 32,
+                              digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    data = sexp("(data (flags pkcs1) (value 5:hello))");
+    ASSERT_ERR(GPG_ERR_CONFLICT, gcry_pk_sign(&sig, data, sec));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pkcs1-raw) (value %b))", 32,
+                              digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (hash sha256 %b))", 32,
+                              digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+    ASSERT_ERR(GPG_ERR_INV_DATA, gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    gcry_sexp_release(pub);
+    gcry_sexp_release(sec);
+    gcry_sexp_release(key);
+
+    /* Small groups are allowed; a given secret needs 64 bits. */
+    key = genkey("(genkey (elg (nbits 3:300)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_EQ(300, gcry_pk_get_nbits(key));
+    gcry_sexp_release(key);
+    {
+        gcry_sexp_t parms = sexp("(genkey (elg (nbits 3:512)"
+                                 " (xvalue #7FFFFFFFFFFFFFFF#)))");
+
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+    }
+    key = genkey("(genkey (elg (nbits 3:512) (xvalue #8000000000000000#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_pk_testkey(gcry_sexp_find_token(key, "private-key", 0)));
+    gcry_sexp_release(key);
+}
+
+TEST(dsa_sizes)
+{
+    gcry_sexp_t key;
+    gcry_sexp_t parms;
+
+    /* OpenSSL only knows the FIPS 186 sizes of q; the reference library
+     * would accept 168 here. */
+    parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:168)))");
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+
+    /* FIPS 186-3 only allows its three size pairs, 186-2 just one. */
+    parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
+                 " (flags use-fips186)))");
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+    parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:224) (use-fips186)))");
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+    parms = sexp("(genkey (dsa (nbits 4:2048) (qbits 3:224)"
+                 " (flags use-fips186-2)))");
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+    key = genkey("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
+                 " (flags use-fips186-2)))");
+    ASSERT_NOT_NULL(key);
+    gcry_sexp_release(key);
+}
+
+TEST(ecc_sm2_and_curve_rules)
+{
+    gcry_sexp_t key;
+    gcry_sexp_t pub;
+    gcry_sexp_t sec;
+    gcry_sexp_t data;
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t parms;
+    unsigned char digest[32];
+    size_t len;
+    void *q;
+    int i;
+    const char *name;
+
+    memset(digest, 0x33, sizeof digest);
+
+    /* SM2 signatures on the SM2 curve, tagged "sm2". */
+    key = genkey("(genkey (ecc (curve sm2p256v1)))");
+    ASSERT_NOT_NULL(key);
+    pub = gcry_sexp_find_token(key, "public-key", 0);
+    sec = gcry_sexp_find_token(key, "private-key", 0);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags sm2) (hash sha256 %b))", 32,
+                              digest));
+    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+    ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "sm2", 0));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(data);
+    digest[0] ^= 1;
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags sm2) (hash sha256 %b))", 32,
+                              digest));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(data);
+    gcry_sexp_release(sig);
+    digest[0] ^= 1;
+    gcry_sexp_release(pub);
+    gcry_sexp_release(sec);
+    gcry_sexp_release(key);
+
+    /* The sm2 and eddsa flags need their curves. */
+    sec = sexp("(private-key (ecc (curve \"NIST P-256\")"
+               " (q #04" P256_QX P256_QY "#) (d #" P256_D "#)))");
+    pub = sexp("(public-key (ecc (curve \"NIST P-256\")"
+               " (q #04" P256_QX P256_QY "#)))");
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags sm2) (hash sha256 %b))", 32,
+                              digest));
+    ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_sign(&sig, data, sec));
+    gcry_sexp_release(data);
+    data = sexp("(data (flags eddsa) (value 3:msg))");
+    ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_sign(&sig, data, sec));
+    gcry_sexp_release(data);
+    parms = sexp("(genkey (ecc (curve \"NIST P-256\") (flags eddsa)))");
+    ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+    parms = sexp("(genkey (ecc (curve secp256k1) (flags eddsa)))");
+    ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_genkey(&key, parms));
+    gcry_sexp_release(parms);
+
+    /* Signatures of other schemes: certainly bad when out of range. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags raw) (hash sha256 %b))", 32,
+                              digest));
+    sig = sexp("(sig-val (gost (r #00#)(s #02#)))");
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    sig = sexp("(sig-val (sm2 (r #00#)(s #02#)))");
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+
+    /* A public point off the curve is a broken key. */
+    gcry_sexp_release(pub);
+    pub = sexp("(public-key (ecc (curve \"NIST P-256\")"
+               " (q #046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A1"
+               "3945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECE"
+               "CBB6406837BF51F6#)))");
+    sig = sexp("(sig-val (ecdsa (r #01#)(s #02#)))");
+    ASSERT_ERR(GPG_ERR_BROKEN_PUBKEY, gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    gcry_sexp_release(pub);
+    gcry_sexp_release(sec);
+
+    /* Ed25519 without the eddsa flag: a plain key with a 32 byte point,
+     * or the uncompressed point with nocomp. */
+    key = genkey("(genkey (ecc (curve Ed25519)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_NULL(gcry_sexp_find_token(key, "flags", 0));
+    q = param_bytes(key, "q", &len);
+    ASSERT_EQ(32, len);
+    gcry_free(q);
+    gcry_sexp_release(key);
+    key = genkey("(genkey (ecc (curve Ed25519) (flags nocomp)))");
+    ASSERT_NOT_NULL(key);
+    q = param_bytes(key, "q", &len);
+    ASSERT_EQ(65, len);
+    ASSERT_EQ(4, ((unsigned char *)q)[0]);
+    gcry_free(q);
+    gcry_sexp_release(key);
+
+    /* X25519 of a low order point is all zero rather than an error. */
+    {
+        unsigned char scalar[32];
+        unsigned char point[32];
+        unsigned char result[32];
+        unsigned char zero[32];
+
+        memset(scalar, 9, sizeof scalar);
+        memset(point, 0, sizeof point);
+        memset(zero, 0, sizeof zero);
+        memset(result, 1, sizeof result);
+        ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result, scalar,
+                                     point));
+        ASSERT_MEM_EQ(zero, result, 32);
+    }
+
+    /* The curve table matches the reference library's list. */
+    for (i = 0; (name = gcry_pk_get_curve(NULL, i, NULL)); i++) {
+        ASSERT_TRUE(strcmp(name, "ietf25") != 0);
+    }
+
+    ASSERT_EQ(27, i);
+}
+
 int
 main(void)
 {
@@ -2841,6 +3501,11 @@ main(void)
     RUN_TEST(dsa_more_data_handling);
     RUN_TEST(rsa_more_data_handling);
     RUN_TEST(ecc_more_data_handling);
+    RUN_TEST(rsa_encoding_vectors);
+    RUN_TEST(rsa_genkey_rules);
+    RUN_TEST(elgamal_encodings);
+    RUN_TEST(dsa_sizes);
+    RUN_TEST(ecc_sm2_and_curve_rules);
     RUN_TEST(disable_algorithm);
     return TEST_RESULT();
 }

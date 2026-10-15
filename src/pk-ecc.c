@@ -57,6 +57,13 @@ ecc_get_nbits(gcry_sexp_t parms)
     return 0;
 }
 
+/* OpenSSL implements SM2 only on its own curve, as a separate key type. */
+static int
+is_sm2_curve(mpi_ec_t ec)
+{
+    return ec->curve && !strcmp(ec->curve->name, "sm2p256v1");
+}
+
 static int
 is_eddsa(mpi_ec_t ec, int flags)
 {
@@ -412,6 +419,203 @@ leave:
 }
 
 /* ------------------------------------------------------------------ */
+/* SM2                                                                 */
+/* ------------------------------------------------------------------ */
+
+/* An OpenSSL "SM2" key object for EC (which must be on the SM2 curve). */
+static EVP_PKEY *
+sm2_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
+{
+    EVP_PKEY *key = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+    OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+    OSSL_PARAM *params = NULL;
+    gcry_mpi_t pub = NULL;
+    const unsigned char *pubbuf = NULL;
+    unsigned int publen = 0;
+    gcry_err_code_t rc = 0;
+
+    if (!bld) {
+        rc = GPG_ERR_ENOMEM;
+        goto leave;
+    }
+
+    if (!ec->Q && ec->d) {
+        rc = _gcry_ecc_compute_public(ec);
+
+        if (rc) {
+            goto leave;
+        }
+    }
+
+    if (!ec->Q) {
+        rc = GPG_ERR_NO_PUBKEY;
+        goto leave;
+    }
+
+    pub = _gcry_mpi_ec_ec2os(ec->Q, ec);
+    pubbuf = pub ? gcry_mpi_get_opaque(pub, &publen) : NULL;
+
+    if (!pubbuf
+        || !OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                                            "SM2", 0)
+        || !OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY,
+                                             pubbuf, (publen + 7) / 8)
+        || (want_private
+            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY,
+                                       _gcry_mpi_bn(ec->d)))) {
+        rc = GPG_ERR_INTERNAL;
+        goto leave;
+    }
+
+    params = OSSL_PARAM_BLD_to_param(bld);
+    pctx = EVP_PKEY_CTX_new_from_name(_gcry_libctx(), "SM2", _gcry_propq());
+
+    if (!params || !pctx || EVP_PKEY_fromdata_init(pctx) <= 0
+        || EVP_PKEY_fromdata(pctx, &key,
+                             want_private ? EVP_PKEY_KEYPAIR
+                             : EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+        rc = _gcry_err_from_openssl(want_private ? GPG_ERR_BAD_SECKEY
+                                    : GPG_ERR_BAD_PUBKEY);
+        key = NULL;
+    }
+
+leave:
+    ERR_clear_error();
+    EVP_PKEY_CTX_free(pctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    gcry_mpi_release(pub);
+    *r_rc = key ? 0 : (rc ? rc : GPG_ERR_INTERNAL);
+    return key;
+}
+
+/* SM2 signatures over a caller supplied hash value, as the gcrypt API
+ * defines them (no Z value is computed here). */
+static gcry_err_code_t
+sm2_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
+{
+    gcry_err_code_t rc;
+    EVP_PKEY *key = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    unsigned char *digest = NULL;
+    size_t digestlen = 0;
+    unsigned char *sig = NULL;
+    size_t siglen = 0;
+
+    rc = ecdsa_digest(pd, &digest, &digestlen);
+
+    if (rc) {
+        return rc;
+    }
+
+    key = sm2_evp_key(ec, 1, &rc);
+
+    if (!key) {
+        goto leave;
+    }
+
+    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
+
+    if (!ctx || EVP_PKEY_sign_init(ctx) <= 0
+        || EVP_PKEY_sign(ctx, NULL, &siglen, digest, digestlen) <= 0) {
+        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        goto leave;
+    }
+
+    sig = _gcry_malloc(siglen);
+
+    if (!sig) {
+        rc = GPG_ERR_ENOMEM;
+        goto leave;
+    }
+
+    if (EVP_PKEY_sign(ctx, sig, &siglen, digest, digestlen) <= 0) {
+        rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
+        goto leave;
+    }
+
+    rc = _gcry_pk_rs_from_der(sig, siglen, 1, r_r, r_s);
+
+leave:
+    _gcry_free(sig);
+    _gcry_free(digest);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+static gcry_err_code_t
+sm2_verify(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t sig_r,
+           gcry_mpi_t sig_s)
+{
+    gcry_err_code_t rc;
+    EVP_PKEY *key = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    unsigned char *digest = NULL;
+    size_t digestlen = 0;
+    unsigned char *der = NULL;
+    size_t derlen = 0;
+
+    if (mpi_is_opaque(sig_r) || mpi_is_opaque(sig_s)
+        || gcry_mpi_cmp_ui(sig_r, 0) <= 0 || gcry_mpi_cmp(sig_r, ec->n) >= 0
+        || gcry_mpi_cmp_ui(sig_s, 0) <= 0 || gcry_mpi_cmp(sig_s, ec->n) >= 0) {
+        return GPG_ERR_BAD_SIGNATURE;
+    }
+
+    rc = ecdsa_digest(pd, &digest, &digestlen);
+
+    if (rc) {
+        return rc;
+    }
+
+    rc = _gcry_pk_rs_to_der(sig_r, sig_s, 1, &der, &derlen);
+
+    if (rc) {
+        goto leave;
+    }
+
+    key = sm2_evp_key(ec, 0, &rc);
+
+    if (!key) {
+        goto leave;
+    }
+
+    ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
+
+    if (!ctx || EVP_PKEY_verify_init(ctx) <= 0) {
+        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        goto leave;
+    }
+
+    if (EVP_PKEY_verify(ctx, der, derlen, digest, digestlen) != 1) {
+        ERR_clear_error();
+        rc = GPG_ERR_BAD_SIGNATURE;
+    }
+
+leave:
+    _gcry_free(der);
+    _gcry_free(digest);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+/* For GOST (and SM2 away from its curve) nothing can be verified here;
+ * a signature with values outside the group is still certainly bad. */
+static gcry_err_code_t
+unverifiable_sig(mpi_ec_t ec, gcry_mpi_t sig_r, gcry_mpi_t sig_s)
+{
+    if (mpi_is_opaque(sig_r) || mpi_is_opaque(sig_s)
+        || gcry_mpi_cmp_ui(sig_r, 0) <= 0 || gcry_mpi_cmp(sig_r, ec->n) >= 0
+        || gcry_mpi_cmp_ui(sig_s, 0) <= 0 || gcry_mpi_cmp(sig_s, ec->n) >= 0) {
+        return GPG_ERR_BAD_SIGNATURE;
+    }
+
+    return GPG_ERR_NOT_IMPLEMENTED;
+}
+
+/* ------------------------------------------------------------------ */
 /* Sign / verify dispatch                                              */
 /* ------------------------------------------------------------------ */
 
@@ -450,8 +654,29 @@ ecc_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (pd.flags & (PUBKEY_FLAG_GOST | PUBKEY_FLAG_SM2)) {
+    if ((pd.flags & PUBKEY_FLAG_EDDSA) && ec->model != GCRY_ECC_MODEL_EDWARDS) {
         rc = GPG_ERR_NOT_IMPLEMENTED;
+        goto leave;
+    }
+
+    if (pd.flags & PUBKEY_FLAG_GOST) {
+        rc = GPG_ERR_NOT_IMPLEMENTED;
+        goto leave;
+    }
+
+    if (pd.flags & PUBKEY_FLAG_SM2) {
+        if (!is_sm2_curve(ec)) {
+            rc = GPG_ERR_NOT_IMPLEMENTED;
+            goto leave;
+        }
+
+        rc = sm2_sign(ec, &pd, &sig_r, &sig_s);
+
+        if (!rc) {
+            rc = _gcry_sexp_build(r_sig, NULL, "(sig-val(sm2(r%M)(s%M)))",
+                                  sig_r, sig_s);
+        }
+
         goto leave;
     }
 
@@ -525,7 +750,17 @@ ecc_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (pd.flags & (PUBKEY_FLAG_GOST | PUBKEY_FLAG_SM2)) {
+    if ((pd.flags & PUBKEY_FLAG_EDDSA) && ec->model != GCRY_ECC_MODEL_EDWARDS) {
+        rc = GPG_ERR_NOT_IMPLEMENTED;
+        goto leave;
+    }
+
+    if (pd.flags & PUBKEY_FLAG_GOST) {
+        rc = GPG_ERR_NOT_IMPLEMENTED;
+        goto leave;
+    }
+
+    if ((pd.flags & PUBKEY_FLAG_SM2) && !is_sm2_curve(ec)) {
         rc = GPG_ERR_NOT_IMPLEMENTED;
         goto leave;
     }
@@ -549,10 +784,15 @@ ecc_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (sigflags & (PUBKEY_FLAG_GOST | PUBKEY_FLAG_SM2)) {
-        rc = GPG_ERR_NOT_IMPLEMENTED;
-    } else if (sigflags & PUBKEY_FLAG_EDDSA) {
+    if (sigflags & PUBKEY_FLAG_EDDSA) {
         rc = eddsa_verify(ec, &pd, sig_r, sig_s);
+    } else if (!_gcry_mpi_ec_on_curve(ec->Q, ec)) {
+        rc = GPG_ERR_BROKEN_PUBKEY;
+    } else if ((sigflags & PUBKEY_FLAG_SM2) || (pd.flags & PUBKEY_FLAG_SM2)) {
+        rc = is_sm2_curve(ec) ? sm2_verify(ec, &pd, sig_r, sig_s)
+             : unverifiable_sig(ec, sig_r, sig_s);
+    } else if (sigflags & PUBKEY_FLAG_GOST) {
+        rc = unverifiable_sig(ec, sig_r, sig_s);
     } else {
         rc = ecdsa_verify(ec, &pd, sig_r, sig_s);
     }
@@ -931,6 +1171,19 @@ raw_keygen(mpi_ec_t ec, const char *keytype)
     EVP_PKEY_free(key);
     gcry_mpi_release(ec->d);
 
+    if (ec->model == GCRY_ECC_MODEL_MONTGOMERY) {
+        /* Store the scalar clamped the way X25519/X448 define it, so that
+         * d * G computed exactly is the public key. */
+        if (privlen == 32) {
+            priv[0] &= 248;
+            priv[31] &= 127;
+            priv[31] |= 64;
+        } else if (privlen == 56) {
+            priv[0] &= 252;
+            priv[55] |= 128;
+        }
+    }
+
     if (ec->model == GCRY_ECC_MODEL_MONTGOMERY
         && ec->dialect != GCRY_ECC_DIALECT_SAFECURVE) {
         /* Curve25519 keeps the scalar as a number. */
@@ -994,15 +1247,23 @@ ecc_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         goto leave;
     }
 
+    if ((flags & PUBKEY_FLAG_EDDSA) && ec->model != GCRY_ECC_MODEL_EDWARDS) {
+        rc = GPG_ERR_NOT_IMPLEMENTED;
+        goto leave;
+    }
+
     if (is_eddsa(ec, flags)) {
         ec->flags |= PUBKEY_FLAG_EDDSA;
         rc = raw_keygen(ec, ec->nbits == 448 ? "ED448" : "ED25519");
+    } else if (ec->model == GCRY_ECC_MODEL_EDWARDS) {
+        /* An Edwards curve without the eddsa flag: the reference library
+         * generates a plain key pair here; this one is an EdDSA pair whose
+         * secret is the seed, encoded without the eddsa marker. */
+        rc = raw_keygen(ec, ec->nbits == 448 ? "ED448" : "ED25519");
     } else if (ec->model == GCRY_ECC_MODEL_MONTGOMERY) {
         rc = raw_keygen(ec, ec->nbits == 448 ? "X448" : "X25519");
-    } else if (ec->model == GCRY_ECC_MODEL_WEIERSTRASS) {
-        rc = weierstrass_keygen(ec);
     } else {
-        rc = GPG_ERR_NOT_IMPLEMENTED; /* Edwards curve without EdDSA. */
+        rc = weierstrass_keygen(ec);
     }
 
     if (rc) {
@@ -1770,9 +2031,13 @@ gcry_ecc_mul_point(int curveid, unsigned char *result,
     ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), priv, _gcry_propq());
 
     if (!peer || !ctx || EVP_PKEY_derive_init(ctx) <= 0
-        || EVP_PKEY_derive_set_peer_ex(ctx, peer, 0) <= 0
-        || EVP_PKEY_derive(ctx, result, &outlen) <= 0) {
+        || EVP_PKEY_derive_set_peer_ex(ctx, peer, 0) <= 0) {
         rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
+    } else if (EVP_PKEY_derive(ctx, result, &outlen) <= 0) {
+        /* OpenSSL refuses the all zero shared secret of a low order
+         * point; the function itself is defined to return it. */
+        ERR_clear_error();
+        memset(result, 0, len);
     }
 
 leave:

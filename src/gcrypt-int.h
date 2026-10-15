@@ -334,6 +334,55 @@ gcry_err_code_t _gcry_pk_rs_from_der(const unsigned char *der, size_t derlen,
 gcry_err_code_t _gcry_pk_rs_to_der(gcry_mpi_t r, gcry_mpi_t s, int is_ecdsa,
                                    unsigned char **r_der, size_t *r_derlen);
 
+/* PKCS#1 encodings on byte strings (frames of (nbits+7)/8 bytes). */
+gcry_err_code_t _gcry_pk_pkcs1_encode_for_enc(unsigned int nbits,
+                                              const unsigned char *value,
+                                              size_t valuelen,
+                                              const unsigned char *rnd,
+                                              size_t rndlen,
+                                              unsigned char **r_frame,
+                                              size_t *r_framelen);
+gcry_err_code_t _gcry_pk_pkcs1_decode_for_enc(const unsigned char *frame,
+                                              size_t nframe,
+                                              unsigned char **r_value,
+                                              size_t *r_valuelen);
+gcry_err_code_t _gcry_pk_pkcs1_encode_for_sig(unsigned int nbits, int algo,
+                                              const unsigned char *digest,
+                                              size_t digestlen,
+                                              unsigned char **r_frame,
+                                              size_t *r_framelen);
+gcry_err_code_t _gcry_pk_pkcs1_encode_raw_for_sig(unsigned int nbits,
+                                                  const unsigned char *value,
+                                                  size_t valuelen,
+                                                  unsigned char **r_frame,
+                                                  size_t *r_framelen);
+gcry_err_code_t _gcry_pk_oaep_encode(unsigned int nbits, int algo,
+                                     const unsigned char *value,
+                                     size_t valuelen,
+                                     const unsigned char *label,
+                                     size_t labellen, const unsigned char *rnd,
+                                     size_t rndlen, unsigned char **r_frame,
+                                     size_t *r_framelen);
+gcry_err_code_t _gcry_pk_oaep_decode(const unsigned char *frame, size_t nframe,
+                                     int algo, const unsigned char *label,
+                                     size_t labellen, unsigned char **r_value,
+                                     size_t *r_valuelen);
+gcry_err_code_t _gcry_pk_pss_encode(unsigned int nbits, int algo,
+                                    unsigned int saltlen,
+                                    const unsigned char *rnd, size_t rndlen,
+                                    const unsigned char *value,
+                                    size_t valuelen, int hashed_already,
+                                    unsigned char **r_frame,
+                                    size_t *r_framelen);
+gcry_err_code_t _gcry_pk_pss_verify(unsigned int nbits, int algo,
+                                    unsigned int saltlen,
+                                    const unsigned char *value,
+                                    size_t valuelen, int hashed_already,
+                                    const unsigned char *em, size_t emlen);
+gcry_err_code_t _gcry_pk_data_to_frame(struct pk_data *pd, unsigned int nbits,
+                                       unsigned char **r_frame,
+                                       size_t *r_framelen);
+
 /* ---- pk.c -------------------------------------------------------- */
 
 struct gcry_pk_spec {
@@ -381,6 +430,8 @@ struct gcry_mpi_ec_ctx {
     const struct gcry_ecc_curve *curve; /* NULL for unknown curves. */
     const char *name;          /* Curve name or NULL. */
     EC_GROUP *group;           /* Weierstrass curves only. */
+    EC_GROUP *mont_group;      /* Montgomery curves: the isomorphic
+                                * Weierstrass group used for arithmetic. */
     gcry_mpi_t p;
     gcry_mpi_t a;
     gcry_mpi_t b;

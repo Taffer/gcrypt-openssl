@@ -705,6 +705,13 @@ eddsa_decodepoint(gcry_mpi_t pk, mpi_ec_t ec, gcry_mpi_point_t result)
         if (!raw) {
             return _gcry_err_code_from_syserror();
         }
+
+        /* The buffer is little endian here.  A number carrying the
+         * prefixed native encoding has the 0x40 marker in its top byte,
+         * which is the last one: drop it. */
+        if (rawlen == len + 1 && raw[len] == 0x40) {
+            rawlen = len;
+        }
     }
 
     if (rawlen) {
@@ -859,6 +866,7 @@ _gcry_mpi_ec_free(mpi_ec_t ec)
     }
 
     EC_GROUP_free(ec->group);
+    EC_GROUP_free(ec->mont_group);
     gcry_mpi_release(ec->p);
     gcry_mpi_release(ec->a);
     gcry_mpi_release(ec->b);
@@ -1137,6 +1145,9 @@ _gcry_mpi_ec_internal_new(mpi_ec_t *r_ec, int *r_flags, gcry_sexp_t keyparam,
         fill_in_curve(ec, curve);
     } else if (ec->p) {
         ec->nbits = gcry_mpi_get_nbits(ec->p);
+    } else {
+        rc = GPG_ERR_INV_ARG; /* Neither a curve name nor parameters. */
+        goto leave;
     }
 
     ec->flags = flags;
@@ -1226,6 +1237,22 @@ _gcry_mpi_ec_affine(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_point_t point,
         return -1;
     }
 
+    if (ec->model == GCRY_ECC_MODEL_MONTGOMERY) {
+        /* The reference library hands out X without dividing by Z and
+         * has no Y coordinate for these curves. */
+        if (y) {
+            log_error("getting the Y coordinate of a Montgomery point "
+                      "is not supported\n");
+            return -1;
+        }
+
+        if (x) {
+            gcry_mpi_set(x, point->x);
+        }
+
+        return 0;
+    }
+
     z = _gcry_mpi_bn(point->z);
 
     if (BN_is_one(z)) {
@@ -1309,79 +1336,258 @@ _gcry_mpi_ec_affine(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_point_t point,
     return 0;
 }
 
-/* X25519/X448 scalar multiplication through EVP_PKEY_derive. */
+/*
+ * Scalar multiplication on a Montgomery curve.
+ *
+ * OpenSSL has no point arithmetic for Montgomery curves (its X25519 and
+ * X448 functions clamp the scalar, which gcry_mpi_ec_mul must not do).
+ * The curve v^2 = u^3 + A u^2 + u is isomorphic to the short Weierstrass
+ * curve y^2 = x^3 + a x + b with x = u + A/3, y = v, a = (3 - A^2)/3 and
+ * b = (2A^3 - 9A)/27, so points are moved there, multiplied with
+ * EC_POINT_mul and moved back.  Only u is kept for Montgomery points;
+ * v is recovered as a square root, which fails for points on the
+ * quadratic twist (those are not handled).
+ */
+
+/* A as a BIGNUM: the curve table stores (A - 2) / 4. */
+static BIGNUM *
+mont_A(mpi_ec_t ec, BN_CTX *bctx)
+{
+    BIGNUM *A = BN_CTX_get(bctx);
+
+    if (!A || !BN_copy(A, _gcry_mpi_bn(ec->a)) || !BN_mul_word(A, 4)
+        || !BN_add_word(A, 2)) {
+        return NULL;
+    }
+
+    return A;
+}
+
+/* A/3 mod p, the x shift of the isomorphism. */
+static BIGNUM *
+mont_shift(mpi_ec_t ec, const BIGNUM *A, BN_CTX *bctx)
+{
+    const BIGNUM *p = _gcry_mpi_bn(ec->p);
+    BIGNUM *three = BN_CTX_get(bctx);
+    BIGNUM *inv3 = BN_CTX_get(bctx);
+    BIGNUM *shift = BN_CTX_get(bctx);
+
+    if (!shift || !BN_set_word(three, 3) || !BN_mod_inverse(inv3, three, p, bctx)
+        || !BN_mod_mul(shift, A, inv3, p, bctx)) {
+        return NULL;
+    }
+
+    return shift;
+}
+
+/* v for the u coordinate U: a square root of u^3 + A u^2 + u. */
+static BIGNUM *
+mont_v(mpi_ec_t ec, const BIGNUM *A, const BIGNUM *u, BN_CTX *bctx)
+{
+    const BIGNUM *p = _gcry_mpi_bn(ec->p);
+    BIGNUM *t = BN_CTX_get(bctx);
+    BIGNUM *r = BN_CTX_get(bctx);
+    BIGNUM *v = BN_CTX_get(bctx);
+
+    if (!v || !BN_mod_sqr(t, u, p, bctx)                 /* u^2 */
+        || !BN_mod_mul(r, t, u, p, bctx)                 /* u^3 */
+        || !BN_mod_mul(t, t, A, p, bctx)                 /* A u^2 */
+        || !BN_mod_add(r, r, t, p, bctx) || !BN_mod_add(r, r, u, p, bctx)) {
+        return NULL;
+    }
+
+    return BN_mod_sqrt(v, r, p, bctx) ? v : NULL;
+}
+
+static gcry_err_code_t
+mont_setup(mpi_ec_t ec, BN_CTX *bctx)
+{
+    const BIGNUM *p;
+    BIGNUM *A;
+    BIGNUM *shift;
+    BIGNUM *t;
+    BIGNUM *a;
+    BIGNUM *b;
+    BIGNUM *w;
+    BIGNUM *inv27;
+    BIGNUM *h;
+    BIGNUM *gx;
+    BIGNUM *gv;
+    EC_POINT *G = NULL;
+    gcry_err_code_t rc = GPG_ERR_INTERNAL;
+
+    if (ec->mont_group) {
+        return 0;
+    }
+
+    if (!ec->p || !ec->a || !ec->b || !ec->n || !ec->G
+        || !BN_is_one(_gcry_mpi_bn(ec->b))) {
+        return GPG_ERR_NOT_IMPLEMENTED;
+    }
+
+    p = _gcry_mpi_bn(ec->p);
+    BN_CTX_start(bctx);
+    A = mont_A(ec, bctx);
+    shift = A ? mont_shift(ec, A, bctx) : NULL;
+    t = BN_CTX_get(bctx);
+    a = BN_CTX_get(bctx);
+    b = BN_CTX_get(bctx);
+    w = BN_CTX_get(bctx);
+    inv27 = BN_CTX_get(bctx);
+    h = BN_CTX_get(bctx);
+    gx = BN_CTX_get(bctx);
+
+    if (!shift || !gx) {
+        goto leave;
+    }
+
+    /* a = (3 - A^2) / 3 = 1 - A * shift;  b = A (2 A^2 - 9) / 27 */
+    if (!BN_mod_mul(t, A, shift, p, bctx) || !BN_set_word(a, 1)
+        || !BN_mod_sub(a, a, t, p, bctx) || !BN_mod_sqr(t, A, p, bctx)
+        || !BN_mod_add(t, t, t, p, bctx) || !BN_set_word(w, 9)
+        || !BN_mod_sub(t, t, w, p, bctx) || !BN_mod_mul(t, t, A, p, bctx)
+        || !BN_set_word(w, 27) || !BN_mod_inverse(inv27, w, p, bctx)
+        || !BN_mod_mul(b, t, inv27, p, bctx)) {
+        goto leave;
+    }
+
+    ec->mont_group = EC_GROUP_new_curve_GFp(p, a, b, bctx);
+
+    if (!ec->mont_group) {
+        goto leave;
+    }
+
+    /* The generator, with the group order and cofactor. */
+    gv = mont_v(ec, A, _gcry_mpi_bn(ec->G->x), bctx);
+    G = EC_POINT_new(ec->mont_group);
+
+    if (!gv || !G || !BN_mod_add(gx, _gcry_mpi_bn(ec->G->x), shift, p, bctx)
+        || !EC_POINT_set_affine_coordinates(ec->mont_group, G, gx, gv, bctx)
+        || !BN_set_word(h, ec->h)
+        || !EC_GROUP_set_generator(ec->mont_group, G, _gcry_mpi_bn(ec->n),
+                                   h)) {
+        EC_GROUP_free(ec->mont_group);
+        ec->mont_group = NULL;
+        goto leave;
+    }
+
+    rc = 0;
+
+leave:
+    ERR_clear_error();
+    EC_POINT_free(G);
+    BN_CTX_end(bctx);
+    return rc;
+}
+
 static gcry_err_code_t
 mont_mul(gcry_mpi_point_t w, gcry_mpi_t n, gcry_mpi_point_t u, mpi_ec_t ec)
 {
-    unsigned int nbytes = (ec->nbits + 7) / 8;
-    unsigned char *scalar = NULL;
-    size_t scalarlen;
-    unsigned char *ubuf = _gcry_malloc(nbytes);
-    unsigned char *shared = _gcry_malloc(nbytes);
-    EVP_PKEY *priv = NULL;
-    EVP_PKEY *peer = NULL;
-    EVP_PKEY_CTX *pctx = NULL;
-    size_t sharedlen = nbytes;
-    gcry_mpi_t ux = NULL;
+    BN_CTX *bctx = new_bnctx();
+    const BIGNUM *p;
+    BIGNUM *A;
+    BIGNUM *shift;
+    BIGNUM *ux;
+    BIGNUM *v;
+    BIGNUM *x;
+    EC_POINT *P = NULL;
+    EC_POINT *R = NULL;
+    gcry_mpi_t nnum = NULL;
     gcry_err_code_t rc;
 
-    if (!ubuf || !shared) {
-        rc = GPG_ERR_ENOMEM;
-        goto leave;
+    if (!bctx) {
+        return GPG_ERR_ENOMEM;
     }
 
-    rc = _gcry_ecc_mont_scalar(n, ec->nbits, &scalar, &scalarlen);
+    /* An opaque scalar is the little endian byte string of X25519/X448
+     * secret keys; read it as a number. */
+    if (mpi_is_opaque(n)) {
+        unsigned char *scalar;
+        size_t scalarlen;
+
+        rc = _gcry_ecc_mont_scalar(n, ec->nbits, &scalar, &scalarlen);
+
+        if (rc) {
+            BN_CTX_free(bctx);
+            return rc;
+        }
+
+        reverse_buffer(scalar, scalarlen);
+        nnum = gcry_mpi_snew(0);
+        _gcry_mpi_set_buffer(nnum, scalar, (unsigned int)scalarlen, 0);
+        _gcry_wipememory(scalar, scalarlen);
+        _gcry_free(scalar);
+        n = nnum;
+    }
+
+    rc = mont_setup(ec, bctx);
 
     if (rc) {
+        gcry_mpi_release(nnum);
+        BN_CTX_free(bctx);
+        return rc;
+    }
+
+    p = _gcry_mpi_bn(ec->p);
+    BN_CTX_start(bctx);
+    A = mont_A(ec, bctx);
+    shift = A ? mont_shift(ec, A, bctx) : NULL;
+    ux = BN_CTX_get(bctx);
+    x = BN_CTX_get(bctx);
+    rc = GPG_ERR_INTERNAL;
+
+    if (!shift || !x || !BN_nnmod(ux, _gcry_mpi_bn(u->x), p, bctx)) {
         goto leave;
     }
 
-    ux = gcry_mpi_new(0);
+    v = mont_v(ec, A, ux, bctx);
 
-    if (_gcry_mpi_ec_affine(ux, NULL, u, ec)) {
-        rc = GPG_ERR_INV_OBJ;
+    if (!v) {
+        rc = GPG_ERR_INV_DATA; /* Not a point of the curve (twist). */
         goto leave;
     }
 
-    rc = _gcry_ecc_mont_decode_u(ux, ec->nbits, ubuf);
+    P = EC_POINT_new(ec->mont_group);
+    R = EC_POINT_new(ec->mont_group);
 
-    if (rc) {
+    if (!P || !R || !BN_mod_add(x, ux, shift, p, bctx)
+        || !EC_POINT_set_affine_coordinates(ec->mont_group, P, x, v, bctx)
+        || !EC_POINT_mul(ec->mont_group, R, NULL, P, _gcry_mpi_bn(n), bctx)) {
         goto leave;
     }
 
-    priv = EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(), mont_keytype(ec),
-                                           _gcry_propq(), scalar, scalarlen);
-    peer = EVP_PKEY_new_raw_public_key_ex(_gcry_libctx(), mont_keytype(ec),
-                                          _gcry_propq(), ubuf, nbytes);
-    pctx = priv ? EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), priv,
-                                             _gcry_propq()) : NULL;
-
-    if (!priv || !peer || !pctx || EVP_PKEY_derive_init(pctx) <= 0
-        || EVP_PKEY_derive_set_peer_ex(pctx, peer, 0) <= 0
-        || EVP_PKEY_derive(pctx, shared, &sharedlen) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
+    if (EC_POINT_is_at_infinity(ec->mont_group, R)) {
+        rc = GPG_ERR_INV_DATA;
         goto leave;
     }
 
-    reverse_buffer(shared, sharedlen);
-    _gcry_mpi_set_buffer(w->x, shared, (unsigned int)sharedlen, 0);
+    if (!EC_POINT_get_affine_coordinates(ec->mont_group, R, x, NULL, bctx)
+        || !BN_mod_sub(x, x, shift, p, bctx)) {
+        goto leave;
+    }
+
+    {
+        unsigned char buf[80];
+        unsigned int nbytes = (ec->nbits + 7) / 8;
+
+        if (nbytes > sizeof buf || BN_bn2binpad(x, buf, (int)nbytes) < 0) {
+            goto leave;
+        }
+
+        _gcry_mpi_set_buffer(w->x, buf, nbytes, 0);
+    }
+
     gcry_mpi_set_ui(w->y, 0);
     gcry_mpi_set_ui(w->z, 1);
     rc = 0;
 
 leave:
-    EVP_PKEY_CTX_free(pctx);
-    EVP_PKEY_free(priv);
-    EVP_PKEY_free(peer);
-    gcry_mpi_release(ux);
-
-    if (scalar) {
-        _gcry_wipememory(scalar, scalarlen);
-        _gcry_free(scalar);
-    }
-
-    _gcry_free(ubuf);
-    _gcry_free(shared);
+    ERR_clear_error();
+    EC_POINT_free(P);
+    EC_POINT_free(R);
+    BN_CTX_end(bctx);
+    BN_CTX_free(bctx);
+    gcry_mpi_release(nnum);
     return rc;
 }
 
@@ -1400,6 +1606,30 @@ _gcry_mpi_ec_mul(gcry_mpi_point_t w, gcry_mpi_t n, gcry_mpi_point_t u,
 
     if (ec->model != GCRY_ECC_MODEL_WEIERSTRASS || !ec->group) {
         return GPG_ERR_NOT_IMPLEMENTED;
+    }
+
+    /* What the reference library's double-and-add yields for the corner
+     * cases: a zero scalar gives (0, 0, 0), the point at infinity stays
+     * itself for the scalar one and becomes (0, p, 1) otherwise. */
+    if (BN_is_zero(_gcry_mpi_bn(n))) {
+        gcry_mpi_set_ui(w->x, 0);
+        gcry_mpi_set_ui(w->y, 0);
+        gcry_mpi_set_ui(w->z, 0);
+        return 0;
+    }
+
+    if (BN_is_zero(_gcry_mpi_bn(u->z))) {
+        if (BN_is_one(_gcry_mpi_bn(n))) {
+            gcry_mpi_set(w->x, u->x);
+            gcry_mpi_set(w->y, u->y);
+            gcry_mpi_set(w->z, u->z);
+        } else {
+            gcry_mpi_set_ui(w->x, 0);
+            gcry_mpi_set(w->y, ec->p);
+            gcry_mpi_set_ui(w->z, 1);
+        }
+
+        return 0;
     }
 
     bctx = new_bnctx();
@@ -1513,7 +1743,8 @@ _gcry_mpi_ec_on_curve(gcry_mpi_point_t point, mpi_ec_t ec)
 
     if (BN_ucmp(_gcry_mpi_bn(point->x), p) >= 0
         || BN_ucmp(_gcry_mpi_bn(point->y), p) >= 0
-        || BN_ucmp(_gcry_mpi_bn(point->z), p) >= 0) {
+        || BN_ucmp(_gcry_mpi_bn(point->z), p) >= 0
+        || BN_is_zero(_gcry_mpi_bn(point->z))) {
         return 0;
     }
 
@@ -1638,7 +1869,25 @@ _gcry_ecc_compute_public(mpi_ec_t ec)
         return 0;
     }
 
-    if (ec->model == GCRY_ECC_MODEL_MONTGOMERY || is_eddsa_ctx(ec)) {
+    if (ec->model == GCRY_ECC_MODEL_MONTGOMERY) {
+        /* Exact scalar multiplication: the secret is used as stored, the
+         * caller (or the key generator) is responsible for clamping.  An
+         * opaque secret holds the little endian byte string. */
+        gcry_mpi_point_t Q = gcry_mpi_point_new(0);
+
+        rc = _gcry_mpi_ec_mul(Q, ec->d, ec->G, ec);
+
+        if (rc) {
+            gcry_mpi_point_release(Q);
+            return rc;
+        }
+
+        gcry_mpi_point_release(ec->Q);
+        ec->Q = Q;
+        return 0;
+    }
+
+    if (is_eddsa_ctx(ec)) {
         EVP_PKEY *key = _gcry_ecc_evp_key(ec, 1, &rc);
         unsigned char pub[64];
         size_t publen = sizeof pub;

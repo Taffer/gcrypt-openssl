@@ -430,6 +430,21 @@ dsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         }
     }
 
+    /* The FIPS 186 selectors are also accepted as plain elements. */
+    l1 = gcry_sexp_find_token(genparms, "use-fips186", 0);
+
+    if (l1) {
+        flags |= PUBKEY_FLAG_USE_FIPS186;
+        gcry_sexp_release(l1);
+    }
+
+    l1 = gcry_sexp_find_token(genparms, "use-fips186-2", 0);
+
+    if (l1) {
+        flags |= PUBKEY_FLAG_USE_FIPS186_2;
+        gcry_sexp_release(l1);
+    }
+
     l1 = gcry_sexp_find_token(genparms, "qbits", 0);
 
     if (l1) {
@@ -522,8 +537,23 @@ dsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
             return GPG_ERR_INV_VALUE;
         }
 
+        /* FIPS 186-3 allows three sizes, FIPS 186-2 just one. */
+        if ((flags & PUBKEY_FLAG_USE_FIPS186)
+            && !((nbits == 2048 && (qbits == 224 || qbits == 256))
+                 || (nbits == 3072 && qbits == 256))) {
+            return GPG_ERR_INV_VALUE;
+        }
+
+        if ((flags & PUBKEY_FLAG_USE_FIPS186_2)
+            && !(nbits == 1024 && qbits == 160)) {
+            return GPG_ERR_INV_VALUE;
+        }
+
         pctx = EVP_PKEY_CTX_new_from_name(_gcry_libctx(), "DSA", _gcry_propq());
 
+        /* OpenSSL generates, signs and verifies only with the FIPS 186
+         * sizes of q (160, 224 and 256 bits); the reference library
+         * accepts other multiples of 8 here. */
         if (!pctx || EVP_PKEY_paramgen_init(pctx) <= 0
             || EVP_PKEY_CTX_set_dsa_paramgen_bits(pctx, (int)nbits) <= 0
             || EVP_PKEY_CTX_set_dsa_paramgen_q_bits(pctx, (int)qbits) <= 0

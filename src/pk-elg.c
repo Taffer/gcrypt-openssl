@@ -5,7 +5,8 @@
  * composition of modular exponentiations, so it is expressed here directly
  * on BIGNUMs (via the MPI layer): this file is the one place in the
  * library that does more than hand data to an OpenSSL primitive.  Prime
- * generation and the random numbers still come from OpenSSL.
+ * generation and the random numbers still come from OpenSSL, and the
+ * PKCS#1 encodings are the shared ones from pk-util.c.
  */
 #include "gcrypt-int.h"
 
@@ -75,6 +76,37 @@ gen_k(gcry_mpi_t p, int coprime, gcry_mpi_t *r_k)
     return rc;
 }
 
+/* The number ElGamal operates on: the value itself for raw data, else
+ * the PKCS#1 frame for the key size read as a big endian number. */
+static gcry_err_code_t
+data_to_mpi(struct pk_data *pd, gcry_mpi_t *r_m)
+{
+    unsigned char *frame = NULL;
+    size_t framelen = 0;
+    gcry_err_code_t rc;
+
+    *r_m = NULL;
+
+    if (pd->encoding == PUBKEY_ENC_RAW) {
+        if (!pd->mpi || mpi_is_opaque(pd->mpi)) {
+            return GPG_ERR_INV_DATA;
+        }
+
+        *r_m = gcry_mpi_copy(pd->mpi);
+        return *r_m ? 0 : GPG_ERR_ENOMEM;
+    }
+
+    rc = _gcry_pk_data_to_frame(pd, pd->nbits, &frame, &framelen);
+
+    if (rc) {
+        return rc;
+    }
+
+    rc = _gcry_mpi_scan(r_m, GCRYMPI_FMT_USG, frame, framelen, NULL);
+    _gcry_free(frame);
+    return rc;
+}
+
 static gcry_err_code_t
 elg_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 {
@@ -86,6 +118,7 @@ elg_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     gcry_mpi_t k = NULL;
     gcry_mpi_t a = NULL;
     gcry_mpi_t b = NULL;
+    gcry_mpi_t m = NULL;
 
     _gcry_pk_data_init(&pd, PUBKEY_OP_ENCRYPT, elg_get_nbits(keyparms));
     rc = _gcry_pk_data_parse(s_data, &pd);
@@ -94,13 +127,15 @@ elg_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (pd.encoding != PUBKEY_ENC_RAW) {
-        rc = GPG_ERR_NOT_IMPLEMENTED; /* No PKCS#1/OAEP for ElGamal here. */
+    if (pd.encoding != PUBKEY_ENC_RAW && pd.encoding != PUBKEY_ENC_PKCS1
+        && pd.encoding != PUBKEY_ENC_OAEP) {
+        rc = GPG_ERR_CONFLICT;
         goto leave;
     }
 
-    if (!pd.mpi || mpi_is_opaque(pd.mpi)) {
-        rc = GPG_ERR_INV_DATA;
+    rc = data_to_mpi(&pd, &m);
+
+    if (rc) {
         goto leave;
     }
 
@@ -120,13 +155,14 @@ elg_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     b = gcry_mpi_new(0);
     gcry_mpi_powm(a, g, k, p);
     gcry_mpi_powm(b, y, k, p);
-    gcry_mpi_mulm(b, b, pd.mpi, p);
+    gcry_mpi_mulm(b, b, m, p);
     rc = _gcry_sexp_build(r_ciph, NULL, "(enc-val(elg(a%m)(b%m)))", a, b);
 
 leave:
     gcry_mpi_release(a);
     gcry_mpi_release(b);
     gcry_mpi_release(k);
+    gcry_mpi_release(m);
     gcry_mpi_release(p);
     gcry_mpi_release(g);
     gcry_mpi_release(y);
@@ -156,8 +192,10 @@ elg_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (pd.encoding != PUBKEY_ENC_UNKNOWN && pd.encoding != PUBKEY_ENC_RAW) {
-        rc = GPG_ERR_NOT_IMPLEMENTED;
+    if (pd.encoding != PUBKEY_ENC_UNKNOWN && pd.encoding != PUBKEY_ENC_RAW
+        && pd.encoding != PUBKEY_ENC_PKCS1
+        && pd.encoding != PUBKEY_ENC_OAEP) {
+        rc = GPG_ERR_CONFLICT;
         goto leave;
     }
 
@@ -189,9 +227,45 @@ elg_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     }
 
     gcry_mpi_mulm(plain, data_b, t, p);
-    rc = _gcry_sexp_build(r_plain, NULL,
-                          (pd.flags & PUBKEY_FLAG_LEGACYRESULT) ? "%m"
-                          : "(value %m)", plain);
+
+    if (pd.encoding == PUBKEY_ENC_PKCS1 || pd.encoding == PUBKEY_ENC_OAEP) {
+        /* The PKCS#1 frame for the key size, decoded like RSA does it. */
+        size_t k = (pd.nbits + 7) / 8;
+        unsigned char *frame = _gcry_malloc_secure(k);
+        unsigned char *value = NULL;
+        size_t valuelen = 0;
+
+        if (!frame) {
+            rc = GPG_ERR_ENOMEM;
+            goto leave;
+        }
+
+        if (_gcry_pk_mpi_to_fixed(plain, frame, k)) {
+            rc = GPG_ERR_ENCODING_PROBLEM;
+        } else if (pd.encoding == PUBKEY_ENC_PKCS1) {
+            rc = _gcry_pk_pkcs1_decode_for_enc(frame, k, &value, &valuelen);
+        } else {
+            rc = _gcry_pk_oaep_decode(frame, k, pd.hash_algo, pd.label,
+                                      pd.labellen, &value, &valuelen);
+        }
+
+        if (!rc) {
+            rc = _gcry_sexp_build(r_plain, NULL, "(value %b)", (int)valuelen,
+                                  value);
+        }
+
+        if (value) {
+            _gcry_wipememory(value, valuelen);
+        }
+
+        _gcry_wipememory(frame, k);
+        _gcry_free(value);
+        _gcry_free(frame);
+    } else {
+        rc = _gcry_sexp_build(r_plain, NULL,
+                              (pd.flags & PUBKEY_FLAG_LEGACYRESULT) ? "%m"
+                              : "(value %m)", plain);
+    }
 
 leave:
     gcry_mpi_release(plain);
@@ -222,6 +296,7 @@ elg_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     gcry_mpi_t t = NULL;
     gcry_mpi_t inv = NULL;
     gcry_mpi_t p_1 = NULL;
+    gcry_mpi_t m = NULL;
 
     _gcry_pk_data_init(&pd, PUBKEY_OP_SIGN, elg_get_nbits(keyparms));
     rc = _gcry_pk_data_parse(s_data, &pd);
@@ -230,8 +305,9 @@ elg_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (!pd.mpi || mpi_is_opaque(pd.mpi)) {
-        rc = GPG_ERR_INV_DATA;
+    rc = data_to_mpi(&pd, &m);
+
+    if (rc) {
         goto leave;
     }
 
@@ -256,7 +332,7 @@ elg_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     gcry_mpi_sub_ui(p_1, p, 1);
     gcry_mpi_powm(a, g, k, p);          /* a = g^k mod p */
     gcry_mpi_mul(t, x, a);
-    gcry_mpi_subm(t, pd.mpi, t, p_1);   /* t = m - x*a mod (p-1) */
+    gcry_mpi_subm(t, m, t, p_1);        /* t = m - x*a mod (p-1) */
     gcry_mpi_invm(inv, k, p_1);
     gcry_mpi_mulm(b, t, inv, p_1);      /* b = t * k^-1 mod (p-1) */
     rc = _gcry_sexp_build(r_sig, NULL, "(sig-val(elg(r%M)(s%M)))", a, b);
@@ -268,6 +344,7 @@ leave:
     gcry_mpi_release(inv);
     gcry_mpi_release(p_1);
     gcry_mpi_release(k);
+    gcry_mpi_release(m);
     gcry_mpi_release(p);
     gcry_mpi_release(g);
     gcry_mpi_release(y);
@@ -289,6 +366,7 @@ elg_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     gcry_mpi_t y = NULL;
     gcry_mpi_t t1 = NULL;
     gcry_mpi_t t2 = NULL;
+    gcry_mpi_t m = NULL;
 
     _gcry_pk_data_init(&pd, PUBKEY_OP_VERIFY, elg_get_nbits(keyparms));
     rc = _gcry_pk_data_parse(s_data, &pd);
@@ -297,8 +375,14 @@ elg_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (!pd.mpi || mpi_is_opaque(pd.mpi)) {
-        rc = GPG_ERR_INV_DATA;
+    if (pd.encoding == PUBKEY_ENC_PSS) {
+        rc = GPG_ERR_INV_DATA; /* PSS needs a recoverable frame. */
+        goto leave;
+    }
+
+    rc = data_to_mpi(&pd, &m);
+
+    if (rc) {
         goto leave;
     }
 
@@ -331,13 +415,14 @@ elg_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
     gcry_mpi_powm(t1, y, sig_a, p);
     gcry_mpi_powm(t2, sig_a, sig_b, p);
     gcry_mpi_mulm(t1, t1, t2, p);
-    gcry_mpi_powm(t2, g, pd.mpi, p);
+    gcry_mpi_powm(t2, g, m, p);
 
     if (gcry_mpi_cmp(t1, t2)) {
         rc = GPG_ERR_BAD_SIGNATURE;
     }
 
 leave:
+    gcry_mpi_release(m);
     gcry_mpi_release(t1);
     gcry_mpi_release(t2);
     gcry_mpi_release(p);
@@ -445,14 +530,16 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         return rc;
     }
 
-    if (nbits < 512 || nbits > 16384) {
+    /* The reference library accepts any size; the Wiener table (and the
+     * prime generator) needs the exponent group to fit into the modulus. */
+    if (nbits > 16384 || wiener_map(nbits) + 2 >= nbits) {
         return GPG_ERR_INV_VALUE;
     }
 
     l1 = gcry_sexp_find_token(genparms, "xvalue", 0);
 
     if (l1) {
-        xvalue = gcry_sexp_nth_mpi(l1, 1, 0);
+        xvalue = gcry_sexp_nth_mpi(l1, 1, GCRYMPI_FMT_USG);
         gcry_sexp_release(l1);
 
         if (!xvalue) {
@@ -493,7 +580,11 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
     }
 
     if (xvalue) {
-        if (gcry_mpi_cmp_ui(xvalue, 0) <= 0 || gcry_mpi_cmp(xvalue, p_1) >= 0) {
+        unsigned int xb = gcry_mpi_get_nbits(xvalue);
+
+        /* A caller supplied secret must have at least 64 bits. */
+        if (xb < 64 || xb >= nbits || gcry_mpi_cmp_ui(xvalue, 0) <= 0
+            || gcry_mpi_cmp(xvalue, p_1) >= 0) {
             rc = GPG_ERR_INV_VALUE;
             goto leave;
         }
