@@ -1,0 +1,18 @@
+# https://cmake-format.readthedocs.io/en/latest/configuration.html
+format:
+  line_width: 80
+  tab_size: 4
+  dangle_parens: true
+  max_subgroups_hwrap: 2
+  max_pargs_hwrap: 4
+  keyword_case: upper
+lint:
+  # Our target/variable names use lower_snake_case with a project prefix,
+  # which cmake-lint's default patterns do not accept.
+  local_var_pattern: '[a-z][a-z0-9_]+'
+  private_var_pattern: '[a-z][a-z0-9_]+'
+  public_var_pattern: '[A-Z][A-Z0-9_]+'
+  global_var_pattern: '[A-Z][A-Z0-9_]+'
+  function_pattern: '[a-z][a-z0-9_]+'
+markup:
+  enable_markup: false

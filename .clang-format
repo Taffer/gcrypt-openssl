@@ -1,0 +1,24 @@
+# Kernel-ish C style: 4-space indent, function braces on their own line,
+# return type on its own line for definitions, 80 columns.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++03
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+BreakBeforeBraces: Linux
+BreakAfterReturnType: AllDefinitions
+PointerAlignment: Right
+AlignConsecutiveMacros: Consecutive
+AlignEscapedNewlines: Left
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+IndentCaseLabels: false
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
+SpaceAfterCStyleCast: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

@@ -34,12 +34,23 @@ Useful options:
 |-------------------------------------|---------|---------------------------------|
 | `GCRYPT_OPENSSL_BUILD_SHARED`       | `ON`    | Build the shared library        |
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
-| `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build the tests (top-level only)|
-| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level only)|
+| `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
+| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
 | `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `OFF`   | Pass `-Werror`                  |
 
 Consumers can `find_package(gcrypt-openssl)` after `cmake --install` and link
 against `gcrypt-openssl::shared` or `gcrypt-openssl::static`.
+
+## Contributing
+
+Linting runs through [pre-commit](https://pre-commit.com/): clang-format for
+C, cmake-format and cmake-lint for CMake, markdownlint for Markdown, and
+codespell for spelling. Install the hooks once after cloning:
+
+```sh
+pre-commit install
+pre-commit run --all-files
+```
 
 ## License
 
