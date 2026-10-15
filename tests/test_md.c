@@ -224,9 +224,27 @@ TEST(cshake)
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, 3));
     gcry_md_close(hd);
 
+    /* A function name N is reserved for NIST-defined functions and OpenSSL
+     * refuses other values; the reference library computes it.  The call
+     * fails cleanly and the handle keeps working. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_CSHAKE128, 0));
+    cust.n = "fn";
+    cust.n_len = 2;
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    cust.n = NULL;
+    cust.n_len = 0;
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    gcry_md_write(hd, data, sizeof data);
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_close(hd);
+
     ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, 0));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
                gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    /* A plain handle has nothing to key, whatever the arguments. */
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_setkey(hd, NULL, 16));
     gcry_md_close(hd);
 }
 
@@ -609,6 +627,13 @@ TEST(algorithm_info)
     ASSERT_OK(gcry_md_test_algo(GCRY_MD_CRC32));
     ASSERT_OK(gcry_md_test_algo(GCRY_MD_BLAKE2S_128));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_TIGER));
+    /* An unavailable algorithm must not abort gcry_md_hash_buffer(); the
+     * digest is zeroed instead. */
+    memset(oid, 0xaa, sizeof oid);
+    gcry_md_hash_buffer(GCRY_MD_TIGER, oid, "abc", 3);
+    memset(expect, 0, sizeof expect);
+    ASSERT_MEM_EQ(expect, oid, 19);
+    ASSERT_EQ(0xaa, oid[24]);
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_HAVAL));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_STRIBOG512));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_GOSTR3411_94));

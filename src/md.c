@@ -1222,12 +1222,14 @@ md_setkey(gcry_md_hd_t hd, const void *key, size_t keylen)
         return GPG_ERR_DIGEST_ALGO;
     }
 
-    if (keylen && !key) {
-        return GPG_ERR_INV_ARG;
-    }
-
     if (ctx->hmac) {
-        unsigned char *copy = md_alloc(ctx, keylen ? keylen : 1);
+        unsigned char *copy;
+
+        if (keylen && !key) {
+            return GPG_ERR_INV_ARG;
+        }
+
+        copy = md_alloc(ctx, keylen ? keylen : 1);
 
         if (!copy) {
             return _gcry_err_code_from_syserror();
@@ -1248,7 +1250,8 @@ md_setkey(gcry_md_hd_t hd, const void *key, size_t keylen)
         return 0;
     }
 
-    /* Plain handles: only keyed BLAKE2 accepts a key. */
+    /* Plain handles: only keyed BLAKE2 accepts a key.  The algorithm is
+     * checked before the arguments, as the reference library does. */
     for (e = ctx->list; e; e = e->next) {
         if (e->spec->flags & MD_F_BLAKE2B) {
             if (keylen > 64) {
@@ -1262,6 +1265,11 @@ md_setkey(gcry_md_hd_t hd, const void *key, size_t keylen)
             }
         } else {
             rc = GPG_ERR_DIGEST_ALGO;
+            break;
+        }
+
+        if (keylen && !key) {
+            rc = GPG_ERR_INV_ARG;
             break;
         }
 
@@ -1346,6 +1354,16 @@ md_customize(gcry_md_hd_t hd, const void *buffer, size_t buflen)
         rc = entry_reset(ctx, e);
 
         if (rc) {
+            /* OpenSSL only knows the NIST-defined function names, so a
+             * customisation it rejects cannot be provided.  Drop it so the
+             * handle keeps working as before the call. */
+            _gcry_free(e->cust_n);
+            _gcry_free(e->cust_s);
+            e->cust_n = NULL;
+            e->cust_s = NULL;
+            e->cust_nlen = 0;
+            e->cust_slen = 0;
+            rc = GPG_ERR_NOT_SUPPORTED;
             break;
         }
     }
@@ -1527,8 +1545,13 @@ gcry_md_hash_buffer(int algo, void *digest, const void *buffer,
     rc = md_open(&hd, algo, 0);
 
     if (rc) {
-        _gcry_log(GCRY_LOG_BUG, "gcry_md_open failed for algo %d: %s\n", algo,
-                  gcry_strerror(GCRY_ERR(rc)));
+        /* The reference library cannot fail here because every algorithm
+         * in its table is built in.  An algorithm OpenSSL lacks must not
+         * abort the caller: report it and hand back a zeroed digest. */
+        log_error("gcry_md_hash_buffer: %s not available: %s\n",
+                  gcry_md_algo_name(algo), gcry_strerror(GCRY_ERR(rc)));
+        memset(digest, 0, gcry_md_get_algo_dlen(algo));
+        return;
     }
 
     md_write(hd, buffer, length);

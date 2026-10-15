@@ -245,14 +245,12 @@ cipher_name(const struct mac_spec *spec, size_t keylen, char *buf,
     }
 
     if (!strcmp(spec->cipher, "DES-EDE")) {
-        if (keylen == 24) {
-            snprintf(buf, bufsize, "DES-EDE3-CBC");
-        } else if (keylen == 16) {
-            snprintf(buf, bufsize, "DES-EDE-CBC");
-        } else {
+        /* Only three-key Triple-DES, as in the reference library. */
+        if (keylen != 24) {
             return GPG_ERR_INV_KEYLEN;
         }
 
+        snprintf(buf, bufsize, "DES-EDE3-CBC");
         return 0;
     }
 
@@ -359,6 +357,9 @@ mac_alloc(gcry_mac_hd_t hd, size_t n)
  * restart a Poly1305 context with the key it already holds, so the key is
  * handed over again.
  */
+/* Never written; not const because OSSL_PARAM wants a mutable pointer. */
+static unsigned char gmac_zero_iv[16];
+
 static gcry_err_code_t
 mac_init_ctx(gcry_mac_hd_t hd)
 {
@@ -401,17 +402,17 @@ mac_init_ctx(gcry_mac_hd_t hd)
         break;
 
     case MAC_GMAC:
-        if (!hd->iv_set) {
-            return 0; /* Wait for the IV. */
-        }
-
         if (!hd->keyed) {
             params[np++] = OSSL_PARAM_construct_utf8_string(
                                OSSL_MAC_PARAM_CIPHER, hd->cipher_name, 0);
         }
 
-        params[np++] = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_IV,
-                                                         hd->iv, hd->ivlen);
+        /* Without an IV the reference library authenticates under an
+         * all-zero 16 byte IV, so data may be written before setiv. */
+        params[np++] = OSSL_PARAM_construct_octet_string(
+                           OSSL_MAC_PARAM_IV,
+                           hd->iv_set ? hd->iv : gmac_zero_iv,
+                           hd->iv_set ? hd->ivlen : sizeof gmac_zero_iv);
         break;
 
     case MAC_POLY1305:
@@ -499,6 +500,26 @@ mac_close(gcry_mac_hd_t hd)
     _gcry_free(hd);
 }
 
+/* Run KEY through the Triple-DES cipher's key check so that weak and
+ * semi-weak subkeys are refused exactly as gcry_cipher_setkey() refuses
+ * them. */
+static gcry_err_code_t
+check_3des_key(const void *key, size_t keylen)
+{
+    gcry_cipher_hd_t ch;
+    gcry_error_t err;
+
+    err = gcry_cipher_open(&ch, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_ECB, 0);
+
+    if (err) {
+        return gcry_err_code(err);
+    }
+
+    err = gcry_cipher_setkey(ch, key, keylen);
+    gcry_cipher_close(ch);
+    return gcry_err_code(err);
+}
+
 static gcry_err_code_t
 mac_setkey(gcry_mac_hd_t hd, const void *key, size_t keylen)
 {
@@ -520,6 +541,16 @@ mac_setkey(gcry_mac_hd_t hd, const void *key, size_t keylen)
 
         if (rc) {
             return rc;
+        }
+
+        /* The reference library rejects weak Triple-DES keys for CMAC as
+         * it does for the cipher; reuse the cipher module's check. */
+        if (hd->algo == GCRY_MAC_CMAC_3DES) {
+            rc = check_3des_key(key, keylen);
+
+            if (rc) {
+                return rc;
+            }
         }
 
         memcpy(hd->cipher_name, name, sizeof hd->cipher_name);
@@ -572,7 +603,7 @@ mac_setiv(gcry_mac_hd_t hd, const void *iv, size_t ivlen)
     }
 
     if (!ivlen) {
-        return GPG_ERR_INV_ARG;
+        return GPG_ERR_INV_LENGTH;
     }
 
     copy = mac_alloc(hd, ivlen);

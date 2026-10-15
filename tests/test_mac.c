@@ -178,7 +178,15 @@ TEST(gmac_and_poly1305)
 
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
         ASSERT_OK(gcry_mac_setkey(hd, key, 16));
-        ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, key, 16)); /* no IV yet */
+        /* Data before any IV is authenticated under a 16 byte zero IV,
+         * as in the reference library (value cross-checked with it). */
+        ASSERT_OK(gcry_mac_write(hd, key, 16));
+        ASSERT_OK(gcry_mac_read(hd, tag1, &len));
+        ASSERT_EQ(16, len);
+        unhex("9103a01f968fd51aaf65695d40cf88d8", tag2, 16);
+        ASSERT_MEM_EQ(tag2, tag1, 16);
+        ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_mac_setiv(hd, iv, 0));
+        /* A new IV starts a fresh message. */
         ASSERT_OK(gcry_mac_setiv(hd, iv, 12));
         ASSERT_OK(gcry_mac_write(hd, key, 16));
         ASSERT_OK(gcry_mac_read(hd, tag1, &len));
@@ -371,9 +379,15 @@ TEST(key_and_state_rules)
     ASSERT_EQ(16, len);
     gcry_mac_close(hd);
 
+    /* Triple-DES CMAC takes three-key material only, and refuses weak or
+     * semi-weak subkeys like the cipher does. */
     ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 20));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
     ASSERT_OK(gcry_mac_setkey(hd, key, 24));
+    memset(key + 8, 0x01, 8);
+    ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_mac_setkey(hd, key, 24));
+    memset(key, 7, sizeof key);
     gcry_mac_close(hd);
     ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
