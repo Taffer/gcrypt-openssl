@@ -54,7 +54,7 @@ not allow injecting the nonce.
 |---------------|------------------------------------------------------------|
 | `src/`        | Library sources; public header `src/include/gcrypt.h`     |
 | `tests/`      | One test program per module with published test vectors   |
-| `benchmarks/` | Benchmark executables, built but not run automatically     |
+| `benchmarks/` | `bench_gcrypt` suite and `compare.sh` for stock libgcrypt  |
 | `cmake/`      | Package config, pkg-config and drop-in templates           |
 | `scripts/`    | `build-openssl.sh`, `check-exports.sh`                     |
 
@@ -127,6 +127,35 @@ To avoid repeating the option, put it in an untracked `CMakeUserPresets.json`:
   ]
 }
 ```
+
+### Benchmarks
+
+`bench_gcrypt` times every operation family through the public API: key
+generation, signing and verification, public-key encryption and
+decryption, KEM keypair/encap/decap, hashing, MACs, KDFs, symmetric
+encryption and decryption in every mode, plus S-expression, MPI and random
+number overhead. Each case runs for a time budget (default 0.5 s) and
+reports operations per second and, for bulk operations, MiB/s.
+
+Because the header is ABI-compatible, the same sources are also linked
+against the stock `libgcrypt.so.20` when CMake finds one, producing
+`bench_gcrypt_stock`. `compare.sh` runs both and joins the results, with a
+ratio above 1.0 meaning this library is faster:
+
+```sh
+cmake --build build --target bench-compare
+# or, with arguments passed to both binaries:
+benchmarks/compare.sh build/benchmarks/bench_gcrypt \
+    build/benchmarks/bench_gcrypt_stock --seconds 2 cipher/AES256 hash/SHA
+```
+
+Positional arguments are substrings matched against `group/name`; groups
+are `hash`, `mac`, `kdf`, `cipher`, `pk`, `kem` and `misc`. `--list` shows
+every case, `--size` changes the bulk buffer, `--csv` gives raw output and
+`compare.sh -m` prints a Markdown table. Operations one library lacks show
+as `n/a`. A full run takes ten to fifteen minutes, most of it in RSA,
+DSA and ElGamal key generation. Point `GCRYPT_OPENSSL_STOCK_GCRYPT` at a
+library file to compare against a specific build.
 
 ## Contributing
 
