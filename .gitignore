@@ -61,3 +61,6 @@ dkms.conf
 build/
 build-*/
 CMakeUserPresets.json
+
+# The linker version script is not linker output.
+!src/libgcrypt.map
