@@ -56,3 +56,8 @@ dkms.conf
 
 # Sublime Text
 *.sublime-workspace
+
+# CMake
+build/
+build-*/
+CMakeUserPresets.json
