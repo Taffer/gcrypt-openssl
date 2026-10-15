@@ -21,6 +21,7 @@ static int fips_mode;
 static int no_fips_mode_required;
 static unsigned int debug_flags;
 static int preferred_rng_type;
+static int quick_random; /* GCRYCTL_ENABLE_QUICK_RANDOM was used. */
 static unsigned int fips_reject_flags = GCRY_FIPS_FLAG_REJECT_DEFAULT;
 static OSSL_LIB_CTX *libctx;
 
@@ -560,7 +561,6 @@ fips_indicator_cipher(int algo, int mode)
     }
 
     switch (mode) {
-    case GCRY_CIPHER_MODE_NONE:
     case GCRY_CIPHER_MODE_ECB:
     case GCRY_CIPHER_MODE_CBC:
     case GCRY_CIPHER_MODE_CFB:
@@ -595,6 +595,8 @@ fips_indicator_md(int algo)
     case GCRY_MD_SHA3_512:
     case GCRY_MD_SHAKE128:
     case GCRY_MD_SHAKE256:
+    case GCRY_MD_CSHAKE128:
+    case GCRY_MD_CSHAKE256:
         return 0;
 
     default:
@@ -618,7 +620,6 @@ fips_indicator_mac(int algo)
     case GCRY_MAC_HMAC_SHA3_384:
     case GCRY_MAC_HMAC_SHA3_512:
     case GCRY_MAC_CMAC_AES:
-    case GCRY_MAC_GMAC_AES:
         return 0;
 
     default:
@@ -629,24 +630,18 @@ fips_indicator_mac(int algo)
 static gcry_err_code_t
 fips_indicator_kdf(int algo)
 {
-    switch (algo) {
-    case GCRY_KDF_PBKDF2:
-    case GCRY_KDF_HKDF:
-    case GCRY_KDF_ONESTEP_KDF:
-    case GCRY_KDF_ONESTEP_KDF_MAC:
-        return 0;
-
-    default:
-        return GPG_ERR_NOT_SUPPORTED;
-    }
+    /* The reference approves PBKDF2 alone. */
+    return algo == GCRY_KDF_PBKDF2 ? 0 : GPG_ERR_NOT_SUPPORTED;
 }
 
 static gcry_err_code_t
 fips_indicator_function(const char *name)
 {
+    /* Only the functions that have an approved alternative are flagged,
+     * exactly the set the reference library names. */
     static const char *const forbidden[] = {
-        "gcry_pk_encrypt", "gcry_pk_decrypt", "gcry_kdf_derive",
-        "gcry_md_hash_buffer", "gcry_pk_sign", "gcry_pk_verify"
+        "gcry_pk_encrypt", "gcry_pk_decrypt", "gcry_pk_sign",
+        "gcry_pk_verify", "gcry_pk_random_override_new"
     };
     size_t i;
 
@@ -670,11 +665,8 @@ fips_indicator_pk_flags(const char *flags)
         return GPG_ERR_INV_ARG;
     }
 
-    if (!strcmp(flags, "pkcs1") || !strcmp(flags, "pss")
-        || !strcmp(flags, "rfc6979") || !strcmp(flags, "prehash")
-        || !strcmp(flags, "param") || !strcmp(flags, "comp")
-        || !strcmp(flags, "nocomp") || !strcmp(flags, "no-keytest")
-        || !strcmp(flags, "transient-key")) {
+    if (!strcmp(flags, "raw") || !strcmp(flags, "pkcs1")
+        || !strcmp(flags, "pss") || !strcmp(flags, "eddsa")) {
         return 0;
     }
 
@@ -728,11 +720,15 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_ENABLE_QUICK_RANDOM:
-        /* OpenSSL's DRBG is always fast; nothing to do. */
+        /* OpenSSL's DRBG is always fast, but remember the request so
+         * that GCRYCTL_FAKED_RANDOM_P answers like the reference. */
+        quick_random = 1;
         break;
 
     case GCRYCTL_FAKED_RANDOM_P:
-        break; /* Never faked. */
+        /* "True" (an error code) once quick random was enabled. */
+        rc = quick_random ? GPG_ERR_GENERAL : 0;
+        break;
 
     case GCRYCTL_DUMP_RANDOM_STATS:
     case GCRYCTL_DUMP_MEMORY_STATS:
@@ -876,13 +872,9 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         if (!any_init_done) {
             force_fips_mode = 1;
         } else {
-            if (!fips_mode) {
-                fips_mode = try_enable_fips();
-            }
-
-            if (fips_mode) {
-                rc = GPG_ERR_GENERAL;
-            }
+            /* Too late to switch; the reference answers the same way
+             * whether or not FIPS mode is active. */
+            rc = GPG_ERR_GENERAL;
         }
 
         break;
@@ -904,7 +896,8 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR:
-        rc = _gcry_fips_mode() ? 0 : GPG_ERR_NOT_SUPPORTED;
+        /* The reference tracks the last operation per thread; nothing
+         * here is ever marked non-approved, so the answer is "approved". */
         break;
 
     case GCRYCTL_FIPS_REJECT_NON_FIPS:
@@ -949,7 +942,9 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
     case GCRYCTL_SET_PREFERRED_RNG_TYPE: {
         int i = va_arg(arg_ptr, int);
 
-        if (i > 0) {
+        /* Only honoured before the library is initialised; afterwards
+         * the reference silently keeps the type in use. */
+        if (i > 0 && !any_init_done) {
             preferred_rng_type = i;
         }
 
@@ -975,6 +970,8 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         (void)va_arg(arg_ptr, const char *);
         (void)va_arg(arg_ptr, gcry_buffer_t *);
         (void)va_arg(arg_ptr, int);
+        /* The generator is OpenSSL's; the reference answers the same
+         * when its own DRBG is not the active generator. */
         rc = GPG_ERR_NOT_SUPPORTED;
         break;
 

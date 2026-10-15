@@ -307,6 +307,14 @@ TEST(argument_edges)
     gcry_mpi_release(f[1]);
     gcry_mpi_release(eleven);
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_check(NULL, 0));
+    /* An opaque MPI is simply "not a prime", as in the reference. */
+    {
+        gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "abc", 24);
+
+        ASSERT_NOT_NULL(o);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(o, 0));
+        gcry_mpi_release(o);
+    }
 }
 
 int

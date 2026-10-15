@@ -350,7 +350,8 @@ _gcry_xstrdup(const char *string)
     char *p;
 
     while (!(p = strdup_core(string, 1))) {
-        out_of_core(strlen(string) + 1, _gcry_is_secure(string) ? 1u : 0u);
+        /* The reference reports the string length, not the allocation. */
+        out_of_core(strlen(string), _gcry_is_secure(string) ? 1u : 0u);
     }
 
     return p;

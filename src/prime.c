@@ -601,8 +601,12 @@ gcry_prime_check(gcry_mpi_t x, unsigned int flags)
 
     (void)flags;
 
-    if (!x || mpi_is_opaque(x)) {
+    if (!x) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    if (mpi_is_opaque(x)) {
+        return GCRY_ERR(GPG_ERR_NO_PRIME); /* As the reference answers. */
     }
 
     switch (gcry_mpi_cmp_ui(x, 2)) {

@@ -85,36 +85,50 @@ _gcry_log(int level, const char *fmt, ...)
     va_end(ap);
 }
 
+/*
+ * Hex dump in the reference library's layout: "TEXT:TEXT2" followed by
+ * the bytes, wrapped after 32 bytes with a backslash and an indentation
+ * matching the header.  A TEXT2 that is a bracketed annotation (the
+ * "[N bit]" of opaque MPIs) goes on its own line and the data starts on
+ * the next, indented by two more than the text.  With a NULL TEXT only
+ * the bare bytes are printed, without wrapping or a final newline.
+ */
 static void
 do_printhex(const char *text, const char *text2, const void *buffer,
             size_t length)
 {
-    const unsigned char *p = buffer;
-    size_t i;
-    char line[80];
-    size_t n = 0;
+    int wrap = 0;
+    int cnt = 0;
 
     if (text && *text) {
-        _gcry_log(GCRY_LOG_DEBUG, "%s:%s", text, text2 ? text2 : " ");
-    } else {
-        _gcry_log(GCRY_LOG_DEBUG, "%s", text2 ? text2 : " ");
-    }
+        wrap = 1;
+        _gcry_log(GCRY_LOG_DEBUG, "%s:%s", text, text2);
 
-    for (i = 0; i < length; i++) {
-        n += (size_t)snprintf(line + n, sizeof line - n, "%02x", p[i]);
-
-        if (n >= sizeof line - 3) {
-            _gcry_log(GCRY_LOG_CONT, "%s", line);
-            n = 0;
-            line[0] = 0;
+        if (text2[1] == '[' && length && buffer) {
+            _gcry_log(GCRY_LOG_CONT, "\n");
+            text2 = " ";
+            _gcry_log(GCRY_LOG_DEBUG, "%*s  ", (int)strlen(text), "");
         }
     }
 
-    if (n) {
-        _gcry_log(GCRY_LOG_CONT, "%s", line);
+    if (length && buffer) {
+        const unsigned char *p = buffer;
+
+        for (; length--; p++) {
+            _gcry_log(GCRY_LOG_CONT, "%02x", *p);
+
+            if (wrap && ++cnt == 32 && length) {
+                cnt = 0;
+                _gcry_log(GCRY_LOG_CONT, " \\\n");
+                _gcry_log(GCRY_LOG_DEBUG, "%*s %*s", (int)strlen(text), "",
+                          (int)strlen(text2), "");
+            }
+        }
     }
 
-    _gcry_log(GCRY_LOG_CONT, "\n");
+    if (text) {
+        _gcry_log(GCRY_LOG_CONT, "\n");
+    }
 }
 
 void
@@ -235,17 +249,91 @@ gcry_log_debugmpi(const char *text, gcry_mpi_t mpi)
     }
 }
 
+/*
+ * Point dump in the reference layout: "TEXT.x"/"TEXT.y" for the affine
+ * coordinates when a context allows the conversion, otherwise the
+ * projective "TEXT.X"/"TEXT.Y"/"TEXT.Z".  The reference aborts for
+ * Montgomery curves (no affine y); here they fall back to the
+ * projective form.  A NULL text prints as "(null)", like printf does.
+ */
 void
 gcry_log_debugpnt(const char *text, gcry_mpi_point_t point, gcry_ctx_t ctx)
 {
-    _gcry_log_printpnt(text, point, ctx);
+    mpi_ec_t ec = ctx ? _gcry_ctx_get_ec(ctx) : NULL;
+    char buf[100];
+
+    if (!text) {
+        text = "(null)";
+    }
+
+    if (!point) {
+        snprintf(buf, sizeof buf, "%s.*", text);
+        gcry_log_debugmpi(buf, NULL);
+        return;
+    }
+
+    if (ec && ec->model != GCRY_ECC_MODEL_MONTGOMERY) {
+        gcry_mpi_t x = gcry_mpi_new(0);
+        gcry_mpi_t y = gcry_mpi_new(0);
+        int ok = !_gcry_mpi_ec_affine(x, y, point, ec);
+
+        if (ok) {
+            snprintf(buf, sizeof buf, "%s.x", text);
+            gcry_log_debugmpi(buf, x);
+            snprintf(buf, sizeof buf, "%s.y", text);
+            gcry_log_debugmpi(buf, y);
+        }
+
+        gcry_mpi_release(x);
+        gcry_mpi_release(y);
+
+        if (ok) {
+            return;
+        }
+    }
+
+    snprintf(buf, sizeof buf, "%s.X", text);
+    gcry_log_debugmpi(buf, point->x);
+    snprintf(buf, sizeof buf, "%s.Y", text);
+    gcry_log_debugmpi(buf, point->y);
+    snprintf(buf, sizeof buf, "%s.Z", text);
+    gcry_log_debugmpi(buf, point->z);
 }
 
+/* The number of closing parentheses at P when nothing but closing
+ * parentheses and white space follow; 0 otherwise. */
+static int
+count_closing_parens(const char *p)
+{
+    int count = 0;
+
+    for (; *p; p++) {
+        if (*p == ')') {
+            count++;
+        } else if (!strchr("\n \t", *p)) {
+            return 0;
+        }
+    }
+
+    return count;
+}
+
+/*
+ * S-expression dump in the reference layout: "TEXT: " followed by the
+ * advanced format, continuation lines indented under the text, and the
+ * trailing run of closing parentheses pulled onto the last line.  A TEXT
+ * containing a newline is printed as is and every line of the expression
+ * is then a debug line of its own.
+ */
 void
 gcry_log_debugsxp(const char *text, gcry_sexp_t sexp)
 {
+    int with_lf = 0;
+
     if (text && *text) {
-        if (strchr(text, '\n')) {
+        with_lf = strchr(text, '\n') != NULL;
+
+        if (with_lf) {
             _gcry_log(GCRY_LOG_DEBUG, "%s", text);
         } else {
             _gcry_log(GCRY_LOG_DEBUG, "%s: ", text);
@@ -255,18 +343,40 @@ gcry_log_debugsxp(const char *text, gcry_sexp_t sexp)
     if (sexp) {
         size_t size = gcry_sexp_sprint(sexp, GCRYSEXP_FMT_ADVANCED, NULL, 0);
         char *buf = _gcry_xmalloc(size);
-        char *p;
+        const char *p = buf;
+        int any = 0;
 
         gcry_sexp_sprint(sexp, GCRYSEXP_FMT_ADVANCED, buf, size);
 
-        /* Drop the trailing newline the printer adds; we add our own. */
-        p = buf + strlen(buf);
+        do {
+            const char *pend;
+            int n_closing;
 
-        while (p > buf && p[-1] == '\n') {
-            *--p = 0;
-        }
+            if (any && !with_lf) {
+                _gcry_log(GCRY_LOG_DEBUG, "%*s  ", text ? (int)strlen(text) : 0,
+                          "");
+            } else {
+                any = 1;
+            }
 
-        _gcry_log(GCRY_LOG_CONT, "%s\n", buf);
+            pend = strchr(p, '\n');
+            size = pend ? (size_t)(pend - p) : strlen(p);
+            _gcry_log(with_lf ? GCRY_LOG_DEBUG : GCRY_LOG_CONT, "%.*s",
+                      (int)size, p);
+            p = pend ? pend + 1 : p + size;
+            n_closing = count_closing_parens(p);
+
+            if (n_closing) {
+                while (n_closing--) {
+                    _gcry_log(GCRY_LOG_CONT, ")");
+                }
+
+                p = "";
+            }
+
+            _gcry_log(GCRY_LOG_CONT, "\n");
+        } while (*p);
+
         _gcry_free(buf);
     } else if (text) {
         _gcry_log(GCRY_LOG_CONT, "\n");

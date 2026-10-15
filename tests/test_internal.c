@@ -195,9 +195,13 @@ TEST(printhex)
     log_reset();
     _gcry_log_printhex("x", b, sizeof b);
     ASSERT_STR_EQ("x: 0102\n", logbuf);
+    /* Without a text only the bare bytes appear, not even a newline. */
     log_reset();
     _gcry_log_printhex(NULL, b, sizeof b);
-    ASSERT_NOT_NULL(strstr(logbuf, "0102\n"));
+    ASSERT_STR_EQ("0102", logbuf);
+    log_reset();
+    _gcry_log_printhex("", b, sizeof b);
+    ASSERT_STR_EQ("0102\n", logbuf);
     gcry_set_log_handler(NULL, NULL);
 }
 

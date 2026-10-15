@@ -132,7 +132,10 @@ TEST(version_parser)
 
 TEST(control_noops)
 {
+    /* Quick random is remembered: FAKED_RANDOM_P turns "true". */
+    ASSERT_OK(gcry_control(GCRYCTL_FAKED_RANDOM_P));
     ASSERT_OK(gcry_control(GCRYCTL_ENABLE_QUICK_RANDOM));
+    ASSERT_ERR(GPG_ERR_GENERAL, gcry_control(GCRYCTL_FAKED_RANDOM_P));
     ASSERT_OK(gcry_control(GCRYCTL_DUMP_RANDOM_STATS));
     ASSERT_OK(gcry_control(GCRYCTL_DUMP_MEMORY_STATS));
     ASSERT_OK(gcry_control(GCRYCTL_DUMP_SECMEM_STATS));
@@ -167,6 +170,13 @@ TEST(control_unsupported)
                gcry_control(GCRYCTL_INACTIVATE_FIPS_FLAG));
     ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED,
                gcry_control(GCRYCTL_REACTIVATE_FIPS_FLAG));
+    /* The DRBG cannot be re-seeded through this interface. */
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_DRBG_REINIT, "", NULL, 0));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_DRBG_REINIT, "sha256", NULL, 0));
+    /* Switching to FIPS mode is refused once initialised. */
+    ASSERT_ERR(GPG_ERR_GENERAL, gcry_control(GCRYCTL_FORCE_FIPS_MODE));
     /* Cipher handle commands are not global commands. */
     ASSERT_ERR(GPG_ERR_INV_OP, gcry_control(GCRYCTL_SET_CCM_LENGTHS));
     ASSERT_ERR(GPG_ERR_INV_OP, gcry_control(GCRYCTL_SET_TAGLEN));
@@ -187,8 +197,21 @@ TEST(fips_mode_off)
 
 TEST(fips_service_indicators)
 {
+    /* Every answer below is what the reference library gives. */
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR));
+
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
                            GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
+                           GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CFB8));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
+                           GCRY_CIPHER_AES, GCRY_CIPHER_MODE_AESWRAP));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
+                            GCRY_CIPHER_AES, GCRY_CIPHER_MODE_NONE));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
+                            GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
                            GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_ECB));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER,
@@ -209,8 +232,15 @@ TEST(fips_service_indicators)
                            GCRY_MD_SHA3_256));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD,
                            GCRY_MD_SHAKE128));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD,
+                           GCRY_MD_CSHAKE256));
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD, GCRY_MD_MD5));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD,
+                            GCRY_MD_BLAKE2B_512));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD, GCRY_MD_NONE));
 
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MAC,
                            GCRY_MAC_HMAC_SHA1));
@@ -223,25 +253,57 @@ TEST(fips_service_indicators)
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MAC,
                             GCRY_MAC_HMAC_MD5));
+    /* GMAC and Poly1305 are not on the reference's approved list. */
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MAC,
+                            GCRY_MAC_GMAC_AES));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MAC,
+                            GCRY_MAC_POLY1305));
 
+    /* PBKDF2 is the only approved KDF. */
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_KDF, GCRY_KDF_PBKDF2));
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_KDF,
                             GCRY_KDF_SCRYPT));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_KDF,
+                            GCRY_KDF_HKDF));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_KDF,
+                            GCRY_KDF_ONESTEP_KDF));
 
+    /* Only the functions with an approved replacement are flagged. */
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
                             "gcry_pk_sign"));
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
                             "gcry_pk_encrypt"));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
+                            "gcry_pk_random_override_new"));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
                            "gcry_pk_hash_sign"));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
+                           "gcry_md_hash_buffer"));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
+                           "gcry_kdf_derive"));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION, ""));
 
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "raw"));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "pkcs1"));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "pss"));
+    ASSERT_OK(gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "eddsa"));
     ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
                gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "oaep"));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS,
+                            "rfc6979"));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "param"));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, ""));
 }
 
 TEST(selftest)
@@ -258,6 +320,12 @@ TEST(rng_type)
     ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE,
                            GCRY_RNG_TYPE_STANDARD));
     ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE, 0));
+    type = -1;
+    ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
+    ASSERT_EQ(GCRY_RNG_TYPE_STANDARD, type);
+    /* After initialisation a preference is accepted but ignored. */
+    ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE,
+                           GCRY_RNG_TYPE_SYSTEM));
     type = -1;
     ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
     ASSERT_EQ(GCRY_RNG_TYPE_STANDARD, type);
@@ -350,6 +418,27 @@ TEST(log_handler_text)
         }
     }
 
+    /* The reference wraps after 32 bytes with a backslash and indents
+     * the continuation under the data; exactly 32 bytes do not wrap. */
+    log_reset();
+    gcry_log_debughex("big", big, 33);
+    ASSERT_STR_EQ("big: "
+                  "abababababababababababababababababababababababababababab"
+                  "abababab \\\n     ab\n", logbuf);
+    log_reset();
+    gcry_log_debughex("big", big, 32);
+    ASSERT_STR_EQ("big: "
+                  "abababababababababababababababababababababababababababab"
+                  "abababab\n", logbuf);
+    log_reset();
+    gcry_log_debughex("big", big, 0);
+    ASSERT_STR_EQ("big: \n", logbuf);
+    /* No text: bare bytes, no wrapping and no newline. */
+    log_reset();
+    gcry_log_debughex(NULL, big, 33);
+    ASSERT_EQ(66, loglen);
+    ASSERT_NULL(strchr(logbuf, '\n'));
+
     gcry_set_log_handler(NULL, NULL);
 }
 
@@ -380,16 +469,22 @@ TEST(log_handler_mpi)
     gcry_log_debugmpi("null", NULL);
     ASSERT_STR_EQ("null: (null)\n", logbuf);
 
+    /* Opaque values: the bit count on the first line, the bytes on the
+     * next, indented two past the text. */
     o = gcry_mpi_set_opaque_copy(NULL, opaque, 16);
     ASSERT_NOT_NULL(o);
     log_reset();
     gcry_log_debugmpi("op", o);
-    ASSERT_NOT_NULL(strstr(logbuf, "op: [16 bit]"));
-    ASSERT_NOT_NULL(strstr(logbuf, "aabb"));
+    ASSERT_STR_EQ("op: [16 bit]\n    aabb\n", logbuf);
     log_reset();
     gcry_log_debugmpi(NULL, o);
-    ASSERT_NOT_NULL(strstr(logbuf, "[16 bit]"));
-    ASSERT_NOT_NULL(strstr(logbuf, "aabb"));
+    ASSERT_STR_EQ(" : [16 bit]\n   aabb\n", logbuf);
+
+    /* A plain value without text prints bare bytes and no newline. */
+    gcry_mpi_set_ui(m, 0x1234);
+    log_reset();
+    gcry_log_debugmpi(NULL, m);
+    ASSERT_STR_EQ("1234", logbuf);
 
     gcry_mpi_release(o);
     gcry_mpi_release(m);
@@ -407,20 +502,30 @@ TEST(log_handler_sexp_and_point)
     ASSERT_OK(gcry_sexp_build(&s, NULL, "(a (b 1:x))"));
     gcry_set_log_handler(capture_log, NULL);
 
+    /* Continuation lines are indented under the text and the closing
+     * parentheses are pulled onto the last line, as in the reference. */
     log_reset();
     gcry_log_debugsxp("sx", s);
-    ASSERT_TRUE(strncmp(logbuf, "sx: (a ", 7) == 0);
-    ASSERT_NOT_NULL(strstr(logbuf, "(b x)"));
-    ASSERT_EQ('\n', logbuf[loglen - 1]);
+    ASSERT_STR_EQ("sx: (a \n     (b x))\n", logbuf);
 
     log_reset();
     gcry_log_debugsxp("two\nlines", s);
-    ASSERT_TRUE(strncmp(logbuf, "two\nlines", 9) == 0);
-    ASSERT_NOT_NULL(strstr(logbuf, "(b x)"));
+    ASSERT_STR_EQ("two\nlines(a \n (b x))\n", logbuf);
 
     log_reset();
     gcry_log_debugsxp(NULL, s);
-    ASSERT_TRUE(strncmp(logbuf, "(a ", 3) == 0);
+    ASSERT_STR_EQ("(a \n   (b x))\n", logbuf);
+
+    {
+        gcry_sexp_t nested = NULL;
+
+        ASSERT_OK(gcry_sexp_build(&nested, NULL, "(a (b (c d)) (e f))"));
+        log_reset();
+        gcry_log_debugsxp("n", nested);
+        ASSERT_STR_EQ("n: (a \n    (b \n     (c d)\n     )\n    (e f))\n",
+                      logbuf);
+        gcry_sexp_release(nested);
+    }
 
     log_reset();
     gcry_log_debugsxp("nosexp", NULL);
@@ -434,24 +539,30 @@ TEST(log_handler_sexp_and_point)
     pt = gcry_mpi_point_set(NULL, one, two, one);
     ASSERT_NOT_NULL(pt);
 
+    /* With a context the affine coordinates are labelled x/y. */
     log_reset();
     gcry_log_debugpnt("pt", pt, ctx);
-    ASSERT_TRUE(strncmp(logbuf, "pt", 2) == 0);
-    ASSERT_NOT_NULL(strstr(logbuf, "x:+01"));
-    ASSERT_NOT_NULL(strstr(logbuf, "y:+02"));
+    ASSERT_STR_EQ("pt.x:+01\npt.y:+02\n", logbuf);
 
-    /* Without a context the projective coordinates are printed; the
-     * reference library labels them X/Y/Z. */
+    /* Without a context the projective coordinates are printed as
+     * X/Y/Z, and so is a point at infinity even with a context. */
     log_reset();
     gcry_log_debugpnt("pt", pt, NULL);
-    ASSERT_TRUE(strstr(logbuf, "x:+01") || strstr(logbuf, "X:+01"));
-    ASSERT_TRUE(strstr(logbuf, "y:+02") || strstr(logbuf, "Y:+02"));
-    ASSERT_TRUE(strstr(logbuf, "z:+01") || strstr(logbuf, "Z:+01"));
+    ASSERT_STR_EQ("pt.X:+01\npt.Y:+02\npt.Z:+01\n", logbuf);
+
+    gcry_mpi_set_ui(two, 0);
+    gcry_mpi_point_set(pt, one, one, two);
+    log_reset();
+    gcry_log_debugpnt("inf", pt, ctx);
+    ASSERT_STR_EQ("inf.X:+01\ninf.Y:+01\ninf.Z:+00\n", logbuf);
 
     log_reset();
     gcry_log_debugpnt("nullpt", NULL, ctx);
-    ASSERT_TRUE(strncmp(logbuf, "nullpt", 6) == 0);
-    ASSERT_NOT_NULL(strstr(logbuf, "(null)"));
+    ASSERT_STR_EQ("nullpt.*: (null)\n", logbuf);
+
+    log_reset();
+    gcry_log_debugpnt(NULL, pt, NULL);
+    ASSERT_TRUE(strncmp(logbuf, "(null).X:+01\n", 13) == 0);
 
     gcry_set_log_handler(NULL, NULL);
     gcry_mpi_point_release(pt);

@@ -223,6 +223,7 @@ TEST(outofcore_handler_retries)
     s = gcry_xstrdup("retry");
     ASSERT_STR_EQ("retry", s);
     ASSERT_EQ(5, oom_calls);
+    ASSERT_EQ(5, oom_last_size); /* The string length, as upstream. */
     gcry_free(s);
 
     /* Growing through the custom realloc does not consult the handler. */
