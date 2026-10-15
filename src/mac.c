@@ -7,6 +7,7 @@
  */
 #include "gcrypt-int.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -105,11 +106,13 @@ struct gcry_mac_handle {
     int algo;
     const struct mac_spec *spec;
     int secure;
-    EVP_MAC *mac;
+    EVP_MAC *mac;           /* Shared, process-wide; not owned. */
     EVP_MAC_CTX *ctx;
     unsigned char *key;
     size_t keylen;
     int key_set;
+    int keyed;              /* CTX carries the key (EVP_MAC_init done). */
+    char cipher_name[64];   /* OpenSSL cipher for CMAC/GMAC, set at setkey. */
     unsigned char *iv;
     size_t ivlen;
     int iv_set;
@@ -182,6 +185,43 @@ evp_mac_name(const struct mac_spec *spec)
     }
 }
 
+/* The four EVP_MAC implementations are fetched once per process; a fetch
+ * is a property-string match against OpenSSL's method store and showed up
+ * in profiles of every open. */
+static EVP_MAC *evp_macs[MAC_POLY1305 + 1];
+static pthread_once_t evp_macs_once = PTHREAD_ONCE_INIT;
+
+static void
+fetch_evp_macs(void)
+{
+    static const struct mac_spec kinds[] = {
+        { 0, "", MAC_HMAC, 0, NULL, 0, 0, 0, 0 },
+        { 0, "", MAC_CMAC, 0, NULL, 0, 0, 0, 0 },
+        { 0, "", MAC_GMAC, 0, NULL, 0, 0, 0, 0 },
+        { 0, "", MAC_POLY1305, 0, NULL, 0, 0, 0, 0 },
+    };
+    size_t i;
+
+    for (i = 0; i < DIM(kinds); i++) {
+        evp_macs[kinds[i].kind] = EVP_MAC_fetch(_gcry_libctx(),
+                                                evp_mac_name(&kinds[i]),
+                                                _gcry_propq());
+    }
+
+    ERR_clear_error();
+}
+
+static EVP_MAC *
+evp_mac_for(const struct mac_spec *spec)
+{
+    if ((size_t)spec->kind >= DIM(evp_macs)) {
+        return NULL;
+    }
+
+    pthread_once(&evp_macs_once, fetch_evp_macs);
+    return evp_macs[spec->kind];
+}
+
 /* The OpenSSL cipher name for SPEC with a key of KEYLEN bytes, written to
  * BUF.  Returns GPG_ERR_INV_KEYLEN for lengths the cipher cannot take. */
 static gcry_err_code_t
@@ -241,7 +281,6 @@ static gcry_err_code_t
 check_mac_algo(int algo)
 {
     const struct mac_spec *spec = spec_from_algo(algo);
-    EVP_MAC *mac;
 
     if (!spec) {
         return GPG_ERR_MAC_ALGO;
@@ -296,14 +335,10 @@ check_mac_algo(int algo)
         return GPG_ERR_MAC_ALGO;
     }
 
-    mac = EVP_MAC_fetch(_gcry_libctx(), evp_mac_name(spec), _gcry_propq());
-
-    if (!mac) {
-        ERR_clear_error();
+    if (!evp_mac_for(spec)) {
         return GPG_ERR_MAC_ALGO;
     }
 
-    EVP_MAC_free(mac);
     return 0;
 }
 
@@ -313,15 +348,24 @@ mac_alloc(gcry_mac_hd_t hd, size_t n)
     return hd->secure ? _gcry_malloc_secure(n) : _gcry_malloc(n);
 }
 
-/* Run EVP_MAC_init with the stored key (and IV); this is also how a
- * handle is reset. */
+/*
+ * (Re)initialise the EVP_MAC context.
+ *
+ * The first initialisation after gcry_mac_setkey() passes the key and the
+ * digest or cipher name; OpenSSL fetches the cipher and runs its key
+ * schedule then.  Later messages (gcry_mac_reset(), a new GMAC IV) pass a
+ * NULL key, which makes OpenSSL keep the key material it has and only
+ * reset the running state.  Poly1305 is the exception: OpenSSL refuses to
+ * restart a Poly1305 context with the key it already holds, so the key is
+ * handed over again.
+ */
 static gcry_err_code_t
 mac_init_ctx(gcry_mac_hd_t hd)
 {
     OSSL_PARAM params[4];
     size_t np = 0;
-    char name[64];
-    gcry_err_code_t rc;
+    const unsigned char *key = NULL;
+    size_t keylen = 0;
 
     hd->finalized = 0;
     hd->taglen = 0;
@@ -331,24 +375,29 @@ mac_init_ctx(gcry_mac_hd_t hd)
         return 0; /* Nothing to initialise yet. */
     }
 
+    if (!hd->keyed || hd->spec->kind == MAC_POLY1305) {
+        key = hd->key;
+        keylen = hd->keylen;
+    }
+
     switch (hd->spec->kind) {
     case MAC_HMAC:
-        params[np++] = OSSL_PARAM_construct_utf8_string(
-                           OSSL_MAC_PARAM_DIGEST,
-                           (char *)(uintptr_t)_gcry_md_openssl_name(
-                               hd->spec->mdalgo),
-                           0);
+        if (!hd->keyed) {
+            params[np++] = OSSL_PARAM_construct_utf8_string(
+                               OSSL_MAC_PARAM_DIGEST,
+                               (char *)(uintptr_t)_gcry_md_openssl_name(
+                                   hd->spec->mdalgo),
+                               0);
+        }
+
         break;
 
     case MAC_CMAC:
-        rc = cipher_name(hd->spec, hd->keylen, name, sizeof name);
-
-        if (rc) {
-            return rc;
+        if (!hd->keyed) {
+            params[np++] = OSSL_PARAM_construct_utf8_string(
+                               OSSL_MAC_PARAM_CIPHER, hd->cipher_name, 0);
         }
 
-        params[np++] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER,
-                                                        name, 0);
         break;
 
     case MAC_GMAC:
@@ -356,14 +405,11 @@ mac_init_ctx(gcry_mac_hd_t hd)
             return 0; /* Wait for the IV. */
         }
 
-        rc = cipher_name(hd->spec, hd->keylen, name, sizeof name);
-
-        if (rc) {
-            return rc;
+        if (!hd->keyed) {
+            params[np++] = OSSL_PARAM_construct_utf8_string(
+                               OSSL_MAC_PARAM_CIPHER, hd->cipher_name, 0);
         }
 
-        params[np++] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER,
-                                                        name, 0);
         params[np++] = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_IV,
                                                          hd->iv, hd->ivlen);
         break;
@@ -377,10 +423,12 @@ mac_init_ctx(gcry_mac_hd_t hd)
 
     params[np] = OSSL_PARAM_construct_end();
 
-    if (!EVP_MAC_init(hd->ctx, hd->key, hd->keylen, params)) {
+    if (!EVP_MAC_init(hd->ctx, key, keylen, np ? params : NULL)) {
+        hd->keyed = 0;
         return _gcry_err_from_openssl(GPG_ERR_INV_KEYLEN);
     }
 
+    hd->keyed = 1;
     hd->initialized = 1;
     return 0;
 }
@@ -418,17 +466,16 @@ mac_open(gcry_mac_hd_t *r_hd, int algo, unsigned int flags)
     hd->algo = algo;
     hd->spec = spec;
     hd->secure = !!(flags & GCRY_MAC_FLAG_SECURE);
-    hd->mac = EVP_MAC_fetch(_gcry_libctx(), evp_mac_name(spec), _gcry_propq());
+    hd->mac = evp_mac_for(spec);
 
     if (!hd->mac) {
         _gcry_free(hd);
-        return _gcry_err_from_openssl(GPG_ERR_MAC_ALGO);
+        return GPG_ERR_MAC_ALGO;
     }
 
     hd->ctx = EVP_MAC_CTX_new(hd->mac);
 
     if (!hd->ctx) {
-        EVP_MAC_free(hd->mac);
         _gcry_free(hd);
         return GPG_ERR_ENOMEM;
     }
@@ -441,7 +488,6 @@ static void
 mac_close(gcry_mac_hd_t hd)
 {
     EVP_MAC_CTX_free(hd->ctx);
-    EVP_MAC_free(hd->mac);
 
     if (hd->key) {
         _gcry_wipememory(hd->key, hd->keylen);
@@ -476,6 +522,7 @@ mac_setkey(gcry_mac_hd_t hd, const void *key, size_t keylen)
             return rc;
         }
 
+        memcpy(hd->cipher_name, name, sizeof hd->cipher_name);
         break;
 
     case MAC_POLY1305:
@@ -507,6 +554,7 @@ mac_setkey(gcry_mac_hd_t hd, const void *key, size_t keylen)
     hd->key = copy;
     hd->keylen = keylen;
     hd->key_set = 1;
+    hd->keyed = 0;
     return mac_init_ctx(hd);
 }
 
