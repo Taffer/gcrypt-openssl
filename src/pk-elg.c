@@ -394,14 +394,21 @@ wiener_map(unsigned int n)
         { 512, 119 }, { 768, 145 }, { 1024, 165 }, { 1280, 183 },
         { 1536, 198 }, { 1792, 212 }, { 2048, 225 }, { 2304, 237 },
         { 2560, 249 }, { 2816, 259 }, { 3072, 269 }, { 3328, 279 },
-        { 3584, 288 }, { 3840, 296 }, { 4096, 305 }, { 4352, 313 },
-        { 4608, 320 }, { 4864, 328 }, { 5120, 335 }, { 5376, 342 },
-        { 5632, 349 }, { 5888, 355 }, { 6144, 362 }, { 6400, 368 },
-        { 6656, 374 }, { 6912, 380 }, { 7168, 386 }, { 7424, 391 },
-        { 7680, 397 }, { 7936, 402 }, { 8192, 408 }, { 9472, 433 },
-        { 10752, 456 }, { 12032, 477 }, { 13312, 496 }, { 14592, 515 },
-        { 15872, 532 }, { 17152, 548 }, { 18432, 564 }, { 19712, 579 },
-        { 20992, 593 }, { 0, 0 }
+        { 3584, 288 }, { 3840, 296 }, { 4096, 305 }, { 4608, 320 },
+        { 5120, 334 }, { 5632, 347 }, { 6144, 359 }, { 6656, 371 },
+        { 7168, 382 }, { 7680, 392 }, { 8192, 402 }, { 9728, 439 },
+        { 10240, 451 }, { 10752, 462 }, { 11264, 473 }, { 11776, 483 },
+        { 12288, 493 }, { 13312, 512 }, { 13824, 521 }, { 14336, 530 },
+        { 14848, 539 }, { 15360, 548 }, { 15872, 556 }, { 16384, 564 },
+        { 16896, 572 }, { 17408, 580 }, { 17920, 587 }, { 18432, 595 },
+        { 18944, 602 }, { 19456, 609 }, { 19968, 616 }, { 20480, 623 },
+        { 20992, 630 }, { 21504, 637 }, { 22016, 643 }, { 22528, 650 },
+        { 23040, 656 }, { 23552, 662 }, { 24064, 668 }, { 24576, 674 },
+        { 25088, 680 }, { 25600, 686 }, { 26112, 692 }, { 26624, 698 },
+        { 27136, 703 }, { 27648, 709 }, { 28160, 714 }, { 28672, 720 },
+        { 29184, 725 }, { 29696, 731 }, { 30208, 736 }, { 30720, 741 },
+        { 31232, 746 }, { 31744, 752 }, { 32256, 757 }, { 32768, 762 },
+        { 0, 0 }
     };
     size_t i;
 
@@ -424,15 +431,13 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
     gcry_sexp_t l1;
     gcry_mpi_t xvalue = NULL;
     gcry_mpi_t p = NULL;
-    gcry_mpi_t q = NULL;
     gcry_mpi_t g = NULL;
     gcry_mpi_t y = NULL;
     gcry_mpi_t x = NULL;
-    gcry_mpi_t t = NULL;
     gcry_mpi_t p_1 = NULL;
+    gcry_mpi_t *factors = NULL;
+    size_t nfactors = 0;
     gcry_sexp_t misc_info = NULL;
-    BN_CTX *bctx = NULL;
-    unsigned long gval;
 
     rc = _gcry_pk_util_get_nbits(genparms, &nbits);
 
@@ -455,38 +460,36 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         }
     }
 
-    bctx = BN_CTX_new_ex(_gcry_libctx());
-    p = gcry_mpi_new(0);
-    q = gcry_mpi_new(0);
-    g = gcry_mpi_new(0);
     y = gcry_mpi_new(0);
-    t = gcry_mpi_new(0);
     p_1 = gcry_mpi_new(0);
 
-    /* A safe prime p = 2q + 1, so that the factors of (p-1)/2 are known. */
-    if (!bctx || !BN_generate_prime_ex2(_gcry_mpi_bn(p), (int)nbits, 1, NULL,
-                                        NULL, NULL, bctx)) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+    /* The group size follows Wiener's table, as in the reference
+     * implementation: p - 1 = 2 * q * f_1 ... f_n with q of QBITS bits and
+     * the f_i known, so that a generator of the whole group can be found
+     * from the factorisation. */
+    qbits = wiener_map(nbits);
+
+    if (qbits & 1) {
+        qbits++;
+    }
+
+    rc = gcry_err_code(gcry_prime_generate(&p, nbits, qbits, &factors, NULL,
+                                           NULL, GCRY_VERY_STRONG_RANDOM, 0));
+
+    if (rc) {
+        goto leave;
+    }
+
+    rc = gcry_err_code(gcry_prime_group_generator(&g, p, factors, NULL));
+
+    if (rc) {
         goto leave;
     }
 
     gcry_mpi_sub_ui(p_1, p, 1);
-    gcry_mpi_rshift(q, p_1, 1);
 
-    /* The smallest generator of the whole group: g^2 != 1 and g^q != 1. */
-    for (gval = 2;; gval++) {
-        gcry_mpi_set_ui(g, gval);
-        gcry_mpi_mulm(t, g, g, p);
-
-        if (!gcry_mpi_cmp_ui(t, 1)) {
-            continue;
-        }
-
-        gcry_mpi_powm(t, g, q, p);
-
-        if (gcry_mpi_cmp_ui(t, 1)) {
-            break;
-        }
+    for (nfactors = 0; factors[nfactors]; nfactors++) {
+        ;
     }
 
     if (xvalue) {
@@ -498,12 +501,6 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         x = gcry_mpi_copy(xvalue);
         gcry_mpi_set_flag(x, GCRYMPI_FLAG_SECURE);
     } else {
-        qbits = wiener_map(nbits);
-
-        if (qbits & 1) {
-            qbits++;
-        }
-
         xbits = qbits * 3 / 2;
 
         if (xbits >= nbits) {
@@ -519,11 +516,38 @@ elg_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
     }
 
     gcry_mpi_powm(y, g, x, p);
-    rc = _gcry_sexp_build(&misc_info, NULL, "(misc-key-info(pm1-factors%m))",
-                          q);
 
-    if (rc) {
-        goto leave;
+    /* misc-key-info lists every factor of p - 1: "(pm1-factors%m%m...)". */
+    {
+        const char *prefix = "(misc-key-info(pm1-factors";
+        size_t fmtlen = strlen(prefix) + 2 * nfactors + 3;
+        char *fmt = _gcry_malloc(fmtlen);
+        void **args = _gcry_calloc(nfactors + 1, sizeof * args);
+        size_t i;
+
+        if (!fmt || !args) {
+            _gcry_free(fmt);
+            _gcry_free(args);
+            rc = _gcry_err_code_from_syserror();
+            goto leave;
+        }
+
+        strcpy(fmt, prefix);
+
+        for (i = 0; i < nfactors; i++) {
+            strcat(fmt, "%m");
+            args[i] = &factors[i]; /* %m takes a pointer to the MPI. */
+        }
+
+        strcat(fmt, "))");
+        rc = gcry_err_code(gcry_sexp_build_array(&misc_info, NULL, fmt,
+                                                 args));
+        _gcry_free(fmt);
+        _gcry_free(args);
+
+        if (rc) {
+            goto leave;
+        }
     }
 
     rc = _gcry_sexp_build(r_skey, NULL,
@@ -539,13 +563,11 @@ leave:
     gcry_sexp_release(misc_info);
     gcry_mpi_release(xvalue);
     gcry_mpi_release(p);
-    gcry_mpi_release(q);
     gcry_mpi_release(g);
     gcry_mpi_release(y);
     gcry_mpi_release(x);
-    gcry_mpi_release(t);
     gcry_mpi_release(p_1);
-    BN_CTX_free(bctx);
+    gcry_prime_release_factors(factors);
     return rc;
 }
 

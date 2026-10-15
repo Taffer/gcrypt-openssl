@@ -859,15 +859,33 @@ TEST(elgamal)
     ASSERT_EQ(1024, gcry_pk_get_nbits(pub));
     ASSERT_OK(gcry_pk_testkey(priv));
 
-    /* misc-key-info carries the factor of (p-1)/2. */
-    factor = param_mpi(key, "pm1-factors");
-    p = param_mpi(pub, "p");
-    ASSERT_NOT_NULL(factor);
-    gcry_mpi_mul_2exp(factor, factor, 1);
-    gcry_mpi_add_ui(factor, factor, 1);
-    ASSERT_EQ(0, gcry_mpi_cmp(factor, p));
-    gcry_mpi_release(factor);
-    gcry_mpi_release(p);
+    /* misc-key-info carries the complete factorisation of p - 1, so that
+     * g is known to generate the whole group. */
+    {
+        gcry_sexp_t pm1 = gcry_sexp_find_token(key, "pm1-factors", 0);
+        gcry_mpi_t prod = gcry_mpi_set_ui(NULL, 1);
+        int i;
+        int n;
+
+        ASSERT_NOT_NULL(pm1);
+        n = gcry_sexp_length(pm1);
+        ASSERT_TRUE(n >= 3); /* Token, 2, q and the small factors. */
+
+        for (i = 1; i < n; i++) {
+            factor = gcry_sexp_nth_mpi(pm1, i, GCRYMPI_FMT_USG);
+            ASSERT_NOT_NULL(factor);
+            ASSERT_OK(gcry_prime_check(factor, 0));
+            gcry_mpi_mul(prod, prod, factor);
+            gcry_mpi_release(factor);
+        }
+
+        p = param_mpi(pub, "p");
+        gcry_mpi_add_ui(prod, prod, 1);
+        ASSERT_EQ(0, gcry_mpi_cmp(prod, p));
+        gcry_mpi_release(prod);
+        gcry_mpi_release(p);
+        gcry_sexp_release(pm1);
+    }
 
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags raw) (value #0102030405060708#))"));

@@ -9,6 +9,7 @@
  */
 #include "gcrypt-int.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,10 +18,72 @@
 /* Candidates whose bit count misses the target this often get a new q. */
 #define MAX_MISSES 20
 
-/* Consecutive composite candidates before the pool of small primes is
- * replaced.  Without this a pool whose subset products are all composite
- * would make the generator loop forever. */
+/* Consecutive composite candidates before one entry of the pool of small
+ * primes is replaced.  Without this a pool whose subset products are all
+ * composite would make the generator loop forever; replacing a single
+ * entry at a time keeps that guarantee without paying for a whole new
+ * pool every time. */
 #define MAX_COMPOSITES 64
+
+/* Trial division bound: every prime below this is tried before a
+ * candidate is handed to the expensive tests.  There are 669 of them. */
+#define SMALL_PRIME_LIMIT 5000
+#define SMALL_PRIME_COUNT 669
+
+static BN_ULONG small_primes[SMALL_PRIME_COUNT];
+static pthread_once_t small_primes_once = PTHREAD_ONCE_INIT;
+
+/* Sieve of Eratosthenes below SMALL_PRIME_LIMIT. */
+static void
+init_small_primes(void)
+{
+    unsigned char composite[SMALL_PRIME_LIMIT];
+    unsigned int i;
+    unsigned int n = 0;
+
+    memset(composite, 0, sizeof composite);
+
+    for (i = 2; i < SMALL_PRIME_LIMIT; i++) {
+        unsigned int j;
+
+        if (composite[i]) {
+            continue;
+        }
+
+        if (n < SMALL_PRIME_COUNT) {
+            small_primes[n++] = i;
+        }
+
+        for (j = i * i; j < SMALL_PRIME_LIMIT; j += i) {
+            composite[j] = 1;
+        }
+    }
+}
+
+/* 1 if N has a factor below SMALL_PRIME_LIMIT (and is not itself that
+ * prime), 0 if it survives trial division, -1 on error. */
+static int
+has_small_factor(const BIGNUM *n)
+{
+    unsigned int i;
+
+    pthread_once(&small_primes_once, init_small_primes);
+
+    for (i = 0; i < SMALL_PRIME_COUNT; i++) {
+        BN_ULONG r = BN_mod_word(n, small_primes[i]);
+
+        if (r == (BN_ULONG) - 1) {
+            ERR_clear_error();
+            return -1;
+        }
+
+        if (r == 0) {
+            return BN_is_word(n, small_primes[i]) ? 0 : 1;
+        }
+    }
+
+    return 0;
+}
 
 static void
 progress(int c)
@@ -59,13 +122,28 @@ check_prime(gcry_mpi_t prime, BN_CTX *ctx, gcry_prime_check_func_t cb_func,
         return BN_is_word(prime->bn, 2);
     }
 
+    /* Trial division by small primes rejects more than nine in ten
+     * candidates for the price of a few hundred single word divisions,
+     * far cheaper than any modular exponentiation. */
+    switch (has_small_factor(prime->bn)) {
+    case 0:
+        break;
+
+    case 1:
+        progress('.');
+        return 0;
+
+    default:
+        return 0;
+    }
+
     BN_CTX_start(ctx);
     two = BN_CTX_get(ctx);
     pminus1 = BN_CTX_get(ctx);
     result = BN_CTX_get(ctx);
 
-    /* A quick Fermat test weeds out most composites cheaply, so that the
-     * callback is only consulted for serious candidates. */
+    /* A Fermat test on the survivors weeds out the remaining composites,
+     * so that the callback is only consulted for serious candidates. */
     if (!result || !BN_set_word(two, 2)
         || !BN_sub(pminus1, prime->bn, BN_value_one())
         || !BN_mod_exp(result, two, pminus1, prime->bn, ctx)) {
@@ -172,6 +250,7 @@ prime_generate_internal(int need_q_factor, gcry_mpi_t *r_prime,
     unsigned int count1 = 0;
     unsigned int count2 = 0;
     unsigned int composites = 0;
+    unsigned int next_replace = 0;
     unsigned int nprime;
     gcry_mpi_t q = NULL;
     gcry_mpi_t q_factor = NULL;
@@ -326,18 +405,20 @@ prime_generate_internal(int need_q_factor, gcry_mpi_t *r_prime,
         }
 
         if (++composites > MAX_COMPOSITES) {
+            /* Freshen the pool one entry at a time, round robin, so the
+             * subset space keeps changing while most of the primes already
+             * paid for stay in use. */
             composites = 0;
             progress('/');
+            gcry_mpi_release(pool[next_replace]);
+            pool[next_replace] = gen_prime(fbits, 0, ctx);
 
-            for (i = 0; i < m; i++) {
-                gcry_mpi_release(pool[i]);
-                pool[i] = gen_prime(fbits, 0, ctx);
-
-                if (!pool[i]) {
-                    err = GPG_ERR_INTERNAL;
-                    goto leave;
-                }
+            if (!pool[next_replace]) {
+                err = GPG_ERR_INTERNAL;
+                goto leave;
             }
+
+            next_replace = (next_replace + 1) % m;
         }
     }
 
