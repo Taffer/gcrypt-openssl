@@ -349,6 +349,87 @@ TEST(algorithm_tables)
                                                   NULL));
 }
 
+TEST(key_and_state_rules)
+{
+    gcry_mac_hd_t hd;
+    unsigned char key[128];
+    unsigned char tag[16];
+    size_t len;
+
+    memset(key, 7, sizeof key);
+
+    /* CMAC key lengths follow the underlying cipher. */
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_AES, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 20));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setkey(hd, NULL, 5));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 24));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 32)); /* re-keying is allowed */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_write(hd, NULL, 3));
+    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+    len = sizeof tag;
+    ASSERT_OK(gcry_mac_read(hd, tag, &len));
+    ASSERT_EQ(16, len);
+    gcry_mac_close(hd);
+
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 20));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 24));
+    gcry_mac_close(hd);
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 5));
+    gcry_mac_close(hd);
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 4));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 17));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 10));
+    gcry_mac_close(hd);
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 0));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 128));
+    gcry_mac_close(hd);
+
+    /* GMAC needs an IV before data and keeps the key across a reset. */
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 16));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, NULL, 12));
+    ASSERT_OK(gcry_mac_setiv(hd, key, 12));
+    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+    len = sizeof tag;
+    ASSERT_OK(gcry_mac_read(hd, tag, &len));
+    ASSERT_OK(gcry_mac_ctl(hd, GCRYCTL_RESET, NULL, 0));
+    ASSERT_OK(gcry_mac_setiv(hd, key, 12));
+    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+    ASSERT_OK(gcry_mac_verify(hd, tag, len));
+    gcry_mac_close(hd);
+
+    /* Poly1305 takes exactly 32 key bytes. */
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
+    len = sizeof tag;
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_read(hd, tag, &len));
+    gcry_mac_close(hd);
+
+    /* TEST_ALGO takes no output arguments. */
+    len = 0;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_algo_info(GCRY_MAC_CMAC_AES,
+                                                   GCRYCTL_TEST_ALGO, NULL, &len));
+    ASSERT_OK(gcry_mac_algo_info(GCRY_MAC_CMAC_AES, GCRYCTL_TEST_ALGO, NULL,
+                                 NULL));
+
+    /* NULL handles are rejected instead of dereferenced. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_open(NULL, GCRY_MAC_HMAC_SHA256, 0,
+                                              NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setkey(NULL, key, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(NULL, key, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_write(NULL, key, 1));
+    len = sizeof tag;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_read(NULL, tag, &len));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_verify(NULL, tag, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_ctl(NULL, GCRYCTL_RESET, NULL, 0));
+    ASSERT_EQ(0, gcry_mac_get_algo(NULL));
+}
+
 int
 main(void)
 {
@@ -359,5 +440,6 @@ main(void)
     RUN_TEST(legacy_cmacs);
     RUN_TEST(truncation_and_errors);
     RUN_TEST(algorithm_tables);
+    RUN_TEST(key_and_state_rules);
     return TEST_RESULT();
 }

@@ -405,6 +405,104 @@ TEST(unsupported)
                               32, NULL, 0));
 }
 
+TEST(dhkem_p384_p521)
+{
+    unsigned char pk[133];
+    unsigned char sk[66];
+    unsigned char ct[133];
+    unsigned char ss1[64];
+    unsigned char ss2[64];
+
+    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_DHKEMP384R1, pk, 97, sk, 48));
+    ASSERT_OK(gcry_kem_encap(GCRY_KEM_DHKEMP384R1, pk, 97, ct, 97, ss1, 48,
+                             NULL, 0));
+    ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP384R1, sk, 48, ct, 97, ss2, 48,
+                             NULL, 0));
+    ASSERT_MEM_EQ(ss1, ss2, 48);
+    ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP384R1, sk, 48, ct, 97, ss2, 48,
+                             pk, 97));
+    ASSERT_MEM_EQ(ss1, ss2, 48);
+
+    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_DHKEMP521R1, pk, 133, sk, 66));
+    ASSERT_OK(gcry_kem_encap(GCRY_KEM_DHKEMP521R1, pk, 133, ct, 133, ss1, 64,
+                             NULL, 0));
+    ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP521R1, sk, 66, ct, 133, ss2, 64,
+                             NULL, 0));
+    ASSERT_MEM_EQ(ss1, ss2, 64);
+}
+
+TEST(argument_validation)
+{
+    unsigned char pk[GCRY_KEM_MLKEM512_PUBKEY_LEN];
+    unsigned char sk[GCRY_KEM_MLKEM512_SECKEY_LEN];
+    unsigned char ct[GCRY_KEM_MLKEM512_CIPHER_LEN];
+    unsigned char ss[65];
+
+    /* Buffer lengths must match the algorithm exactly. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, 31, sk, 32));
+    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, 32, sk, 32));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* raw ECC: ciphertext is a public key */
+               gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, 32, ct, 31, ss, 32, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, 32, ct, 32, ss, 31, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, /* no optional input for raw ECC */
+               gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, 32, ct, 32, ss, 32, pk,
+                              32));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_decap(GCRY_KEM_RAW_X25519, sk, 32, ct, 32, ss, 31, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_decap(GCRY_KEM_RAW_X25519, sk, 32, ct, 32, ss, 32, pk,
+                              32));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_genkey(GCRY_KEM_RAW_X25519, pk, 32, sk, 32, pk, 32));
+    ASSERT_ERR(GPG_ERR_INV_ARG, /* ML-KEM seed is d || z, 64 bytes */
+               gcry_kem_genkey(GCRY_KEM_MLKEM512, pk, sizeof pk, sk, sizeof sk,
+                               pk, 10));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_encap(GCRY_KEM_MLKEM512, pk, sizeof pk, ct, sizeof ct,
+                              ss, 32, pk, 10));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_decap(GCRY_KEM_MLKEM512, sk, sizeof sk, ct, sizeof ct,
+                              ss, 32, pk, 10));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_keypair(GCRY_KEM_MLKEM512, pk, sizeof pk, sk, 100));
+
+    /* A point that is not on the curve is rejected. */
+    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_RAW_P256R1, pk, 65, sk, 32));
+    memset(pk, 0, 65);
+    pk[0] = 4;
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_decap(GCRY_KEM_RAW_P256R1, sk, 32, pk, 65, ss, 65, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_encap(GCRY_KEM_RAW_P256R1, pk, 65, ct, 65, ss, 65, NULL,
+                              0));
+
+    /* Unsupported and unknown algorithms through every entry point. */
+    ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+               gcry_kem_encap(GCRY_KEM_SNTRUP761, pk, 32, ct, 32, ss, 32, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+               gcry_kem_decap(GCRY_KEM_SNTRUP761, sk, 32, ct, 32, ss, 32, NULL,
+                              0));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_ALGORITHM,
+               gcry_kem_decap(999, sk, 32, ct, 32, ss, 32, NULL, 0));
+
+    /* NULL buffers: the reference library crashes, we return an error. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_keypair(GCRY_KEM_RAW_X25519, NULL, 32, sk, 32));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, 32, NULL, 32, ss, 32,
+                              NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kem_decap(GCRY_KEM_RAW_X25519, sk, 32, ct, 32, NULL, 32,
+                              NULL, 0));
+}
+
 int
 main(void)
 {
@@ -420,5 +518,7 @@ main(void)
     RUN_TEST(dhkem_x448);
     RUN_TEST(dhkem_p256);
     RUN_TEST(unsupported);
+    RUN_TEST(dhkem_p384_p521);
+    RUN_TEST(argument_validation);
     return TEST_RESULT();
 }

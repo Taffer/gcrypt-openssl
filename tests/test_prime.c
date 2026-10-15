@@ -234,6 +234,81 @@ TEST(callback)
     ASSERT_NULL(p);
 }
 
+static int veto_once_mode = -1;
+static int veto_done;
+
+static int
+veto_once_cb(void *arg, int mode, gcry_mpi_t candidate)
+{
+    (void)arg;
+    (void)candidate;
+
+    if (mode == veto_once_mode && !veto_done) {
+        veto_done = 1;
+        return 0;
+    }
+
+    return 1;
+}
+
+TEST(callback_vetoes_candidates)
+{
+    gcry_mpi_t p = NULL;
+
+    /* Rejecting a candidate makes the generator move on to the next. */
+    veto_once_mode = GCRY_PRIME_CHECK_AT_MAYBE_PRIME;
+    veto_done = 0;
+    ASSERT_OK(gcry_prime_generate(&p, 128, 0, NULL, veto_once_cb, NULL,
+                                  GCRY_WEAK_RANDOM, 0));
+    ASSERT_TRUE(veto_done);
+    ASSERT_OK(gcry_prime_check(p, 0));
+    gcry_mpi_release(p);
+
+    veto_once_mode = GCRY_PRIME_CHECK_AT_GOT_PRIME;
+    veto_done = 0;
+    p = NULL;
+    ASSERT_OK(gcry_prime_generate(&p, 128, 0, NULL, veto_once_cb, NULL,
+                                  GCRY_WEAK_RANDOM, 0));
+    ASSERT_TRUE(veto_done);
+    ASSERT_OK(gcry_prime_check(p, 0));
+    gcry_mpi_release(p);
+}
+
+TEST(argument_edges)
+{
+    gcry_mpi_t p = NULL;
+    gcry_mpi_t g = NULL;
+    gcry_mpi_t eleven = gcry_mpi_set_ui(NULL, 11);
+    gcry_mpi_t f[3];
+
+    /* No room for a q factor of the requested size. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_generate(&p, 64, 60, NULL, NULL,
+                                                    NULL, GCRY_WEAK_RANDOM, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_prime_generate(&p, 128, 100, NULL, NULL, NULL,
+                                   GCRY_WEAK_RANDOM,
+                                   GCRY_PRIME_FLAG_SPECIAL_FACTOR));
+    /* Unknown flag bits are ignored. */
+    ASSERT_OK(gcry_prime_generate(&p, 128, 0, NULL, NULL, NULL,
+                                  GCRY_WEAK_RANDOM, 0x100));
+    gcry_mpi_release(p);
+
+    /* p = 11, p - 1 = 2 * 5: the smallest generator from 3 is 6. */
+    f[0] = gcry_mpi_set_ui(NULL, 2);
+    f[1] = gcry_mpi_set_ui(NULL, 5);
+    f[2] = NULL;
+    ASSERT_OK(gcry_prime_group_generator(&g, eleven, f, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(g, 6));
+    gcry_mpi_release(g);
+    /* Zero factors are rejected (upstream divides by zero). */
+    gcry_mpi_set_ui(f[1], 0);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_group_generator(&g, eleven, f, NULL));
+    gcry_mpi_release(f[0]);
+    gcry_mpi_release(f[1]);
+    gcry_mpi_release(eleven);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_check(NULL, 0));
+}
+
 int
 main(void)
 {
@@ -242,5 +317,7 @@ main(void)
     RUN_TEST(generate_plain);
     RUN_TEST(generate_with_factors);
     RUN_TEST(callback);
+    RUN_TEST(callback_vetoes_candidates);
+    RUN_TEST(argument_edges);
     return TEST_RESULT();
 }

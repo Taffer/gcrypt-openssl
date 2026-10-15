@@ -112,6 +112,20 @@ TEST(negative_parameter_is_reduced)
     ASSERT_NULL(_gcry_ecc_curve_param(c, "zz"));
 }
 
+TEST(lookup_misses)
+{
+    EC_GROUP *foreign = EC_GROUP_new_by_curve_name(NID_secp112r1);
+
+    ASSERT_NULL(_gcry_ecc_curve_by_nbits(1000));
+    ASSERT_NULL(_gcry_ecc_curve_by_nbits(255)); /* not a NIST curve */
+    ASSERT_NULL(_gcry_ecc_curve_by_index(_gcry_ecc_curve_count()));
+    ASSERT_NULL(_gcry_ecc_curve_from_group(NULL));
+    ASSERT_NOT_NULL(foreign);
+    ASSERT_NULL(_gcry_ecc_curve_from_group(foreign));
+    EC_GROUP_free(foreign);
+    ASSERT_NULL(_gcry_ecc_curve_param(_gcry_ecc_curve_find("NIST P-256"), "q"));
+}
+
 int
 main(void)
 {
@@ -119,5 +133,6 @@ main(void)
     RUN_TEST(lookup);
     RUN_TEST(groups_match_table);
     RUN_TEST(negative_parameter_is_reduced);
+    RUN_TEST(lookup_misses);
     return TEST_RESULT();
 }

@@ -657,6 +657,216 @@ TEST(algorithm_info)
     ASSERT_EQ(0, gcry_md_get_algo_dlen(4711));
 }
 
+TEST(handle_api_edges)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+    unsigned char out[32];
+    unsigned char expect[32];
+
+    /* Plain handles reject keys and controls meant for other kinds. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, 0));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_setkey(hd, "0123456789abcdef", 16));
+    ASSERT_ERR(GPG_ERR_INV_OP, gcry_md_ctl(hd, 9999, NULL, 0));
+    ASSERT_TRUE(gcry_md_is_enabled(hd, GCRY_MD_SHA256));
+    ASSERT_FALSE(gcry_md_is_enabled(hd, GCRY_MD_SHA1));
+    ASSERT_FALSE(gcry_md_is_secure(hd));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_extract(hd, 0, out, 32));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_extract(hd, GCRY_MD_SHA256, out, 32));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, 9999));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_TIGER));
+    /* Explicit finalisation through the control interface. */
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_FINALIZE, NULL, 0));
+    unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+
+    /* NULL handles are rejected or ignored, never dereferenced. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_enable(NULL, GCRY_MD_SHA1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_setkey(NULL, "k", 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_ctl(NULL, GCRYCTL_FINALIZE, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_extract(NULL, 0, out, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_open(NULL, GCRY_MD_SHA1, 0));
+    copy = hd;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_copy(&copy, NULL));
+    ASSERT_NULL(copy);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_copy(NULL, NULL));
+    ASSERT_EQ(0, gcry_md_get_algo(NULL));
+    ASSERT_FALSE(gcry_md_is_enabled(NULL, GCRY_MD_SHA1));
+    ASSERT_TRUE(gcry_md_is_secure(NULL)); /* "secure" when in doubt */
+    gcry_md_write(NULL, "x", 1);
+    gcry_md_reset(NULL);
+    gcry_md_close(NULL);
+    gcry_md_debug(NULL, "x");
+
+    /* Algorithm information edge cases. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_algo_info(GCRY_MD_SHA256,
+                                                  GCRYCTL_GET_ASNOID, NULL, NULL));
+    ASSERT_OK(gcry_md_algo_info(GCRY_MD_SHA256, GCRYCTL_SELFTEST, NULL, NULL));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_md_algo_info(4711, GCRYCTL_SELFTEST, NULL, NULL));
+}
+
+TEST(keyed_blake2_limits)
+{
+    gcry_md_hd_t hd;
+    unsigned char key[65];
+    unsigned char expect[32];
+
+    memset(key, 7, sizeof key);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 65));
+    ASSERT_OK(gcry_md_setkey(hd, key, 64));
+    gcry_md_close(hd);
+
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2S_256, 0));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 33));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_setkey(hd, NULL, 5));
+    ASSERT_OK(gcry_md_setkey(hd, key, 32));
+    gcry_md_write(hd, "abc", 3);
+    /* Reference value from the stock library. */
+    unhex("a7bcf1900a3f3b084ad27e6aa74771ed66ac3e94d7489967d692118532d2fc2a",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+}
+
+TEST(hmac_reset_and_rekey)
+{
+    gcry_md_hd_t hd;
+    unsigned char expect[32];
+    unsigned char first[32];
+
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    ASSERT_OK(gcry_md_setkey(hd, "key", 3));
+    gcry_md_write(hd, "abc", 3);
+    unhex("9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+          expect, sizeof expect);
+    memcpy(first, gcry_md_read(hd, 0), 32);
+    ASSERT_MEM_EQ(expect, first, 32);
+    /* A reset keeps the key. */
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 32);
+    /* A second setkey replaces it. */
+    ASSERT_OK(gcry_md_setkey(hd, "key2", 4));
+    gcry_md_write(hd, "abc", 3);
+    unhex("69ba1f142a63bb0e8f3f74bf55018364bf680b75d35e290918a34d6576861736",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+}
+
+TEST(cshake_copy)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+    struct gcry_cshake_customization cust;
+    unsigned char out[32];
+    unsigned char expect[32];
+    unsigned char data[4] = { 0, 1, 2, 3 };
+
+    /* The customisation string travels with gcry_md_copy. */
+    unhex("c1c36925b6409a04f1b504fcbca9d82b4017277cb5ed2b2065fc1d3814d5aaf5",
+          expect, sizeof expect);
+    cust.n = NULL;
+    cust.n_len = 0;
+    cust.s = "Email Signature";
+    cust.s_len = 15;
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_CSHAKE128, 0));
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    gcry_md_write(hd, data, 2);
+    ASSERT_OK(gcry_md_copy(&copy, hd));
+    gcry_md_write(hd, data + 2, 2);
+    gcry_md_write(copy, data + 2, 2);
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    memset(out, 0, sizeof out);
+    ASSERT_OK(gcry_md_extract(copy, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_close(copy);
+    /* Customising again resets the state and applies the new strings. */
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    gcry_md_write(hd, data, 4);
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_close(hd);
+}
+
+TEST(debug_dump)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+    unsigned char expect[20];
+    char suffix[] = "ctl";
+    FILE *f;
+
+    /* The dump files are written to the current directory with a running
+     * index; this is the first use in the process, so the names are
+     * predictable. */
+    unhex("a9993e364706816aba3e25717850c26c9cd0d89d", expect, sizeof expect);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA1, 0));
+    gcry_md_debug(hd, "covtest");
+    gcry_md_debug(hd, "covtest"); /* already started: ignored */
+    gcry_md_write(hd, "ab", 2);
+    gcry_md_putc(hd, 'c');
+    ASSERT_OK(gcry_md_copy(&copy, hd)); /* copies get their own dump */
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 20);
+    ASSERT_MEM_EQ(expect, gcry_md_read(copy, 0), 20);
+    gcry_md_debug(hd, NULL);
+    gcry_md_close(copy);
+    f = fopen("dbgmd-00001.covtest", "rb");
+    ASSERT_NOT_NULL(f);
+    fseek(f, 0, SEEK_END);
+    ASSERT_EQ(3, ftell(f));
+    fclose(f);
+    remove("dbgmd-00001.covtest");
+    remove("dbgmd-00002.unknown");
+
+    /* The same through the control interface. */
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_START_DUMP, suffix, 0));
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_STOP_DUMP, NULL, 0));
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 20);
+    remove("dbgmd-00003.ctl");
+    gcry_md_close(hd);
+}
+
+TEST(hash_buffers_edges)
+{
+    gcry_buffer_t iov[2];
+    unsigned char out[32];
+    unsigned char expect[32];
+    char key[] = "key";
+    char msg[] = "abc";
+
+    memset(iov, 0, sizeof iov);
+    iov[0].data = key;
+    iov[0].len = 3;
+    iov[1].data = msg;
+    iov[1].len = 3;
+
+    /* A fixed-length digest must be asked for with its exact length. */
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, out, 20, iov + 1, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, out, 32, NULL, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, out, 32, iov + 1, -1));
+    /* HMAC over a BLAKE2 digest and an XOF at its default length. */
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_BLAKE2S_256, GCRY_MD_FLAG_HMAC, out,
+                                   iov, 2));
+    unhex("0018bfddc0c878b3e270c6e59b35af01e164a42d89499c9447a90b58a4d60eb3",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 32);
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHAKE128, 0, out, iov + 1, 1));
+    unhex("5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 32);
+}
+
 int
 main(void)
 {
@@ -672,5 +882,11 @@ main(void)
     RUN_TEST(putc_buffering_and_copy);
     RUN_TEST(secure_handle);
     RUN_TEST(algorithm_info);
+    RUN_TEST(handle_api_edges);
+    RUN_TEST(keyed_blake2_limits);
+    RUN_TEST(hmac_reset_and_rekey);
+    RUN_TEST(cshake_copy);
+    RUN_TEST(debug_dump);
+    RUN_TEST(hash_buffers_edges);
     return TEST_RESULT();
 }

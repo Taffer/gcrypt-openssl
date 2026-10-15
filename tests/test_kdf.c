@@ -4,6 +4,23 @@
 
 #include "test_common.h"
 
+/* Decode a hex string into BUF; returns the number of bytes. */
+static size_t
+unhex(const char *hex, unsigned char *buf, size_t bufsize)
+{
+    size_t n = 0;
+
+    while (hex[0] && hex[1] && n < bufsize) {
+        unsigned int v;
+
+        sscanf(hex, "%2x", &v);
+        buf[n++] = (unsigned char)v;
+        hex += 2;
+    }
+
+    return n;
+}
+
 /* Derive through the handle based API (open/compute/final/close). */
 static gcry_error_t
 kdf_derive_hd(int algo, int subalgo, const unsigned long *param,
@@ -614,6 +631,182 @@ TEST(x963_vectors)
                              z1, 24, NULL, 0, NULL, 0, NULL, 0));
 }
 
+static int
+dispatch_inline(void *jobs_context, gcry_kdf_job_fn_t job_fn, void *job_priv)
+{
+    (*(int *)jobs_context)++;
+    job_fn(job_priv);
+    return 0;
+}
+
+static int
+wait_none(void *jobs_context)
+{
+    (void)jobs_context;
+    return 0;
+}
+
+TEST(argument_validation)
+{
+    unsigned char out[32];
+    unsigned char out2[32];
+    unsigned char expect[16];
+    unsigned long param[4];
+    gcry_kdf_hd_t hd;
+
+    /* gcry_kdf_derive. */
+    ASSERT_ERR(GPG_ERR_UNKNOWN_ALGORITHM,
+               gcry_kdf_derive("pw", 2, 9999, GCRY_MD_SHA256, "salt", 4, 1, 32,
+                               out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SCRYPT, 0, "salt", 4, 1, 32, out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SCRYPT, 1024, "salt", 4, 0, 32,
+                               out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* N must be a power of two */
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SCRYPT, 1000, "salt", 4, 1, 32,
+                               out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, "salt",
+                               4, 0, 32, out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, NULL, 0,
+                               1, 32, out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, "salt",
+                               4, 1, 0, out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, "salt",
+                               4, 1, 32, NULL));
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kdf_derive(NULL, 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, "salt",
+                               4, 1, 32, out));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* S2K salts are eight bytes */
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SALTED_S2K, GCRY_MD_SHA1, "salt",
+                               4, 0, 16, out));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SIMPLE_S2K, 9999, NULL, 0, 0, 16,
+                               out));
+    /* An iteration count below salt + passphrase is raised to it. */
+    ASSERT_OK(gcry_kdf_derive("pw", 2, GCRY_KDF_ITERSALTED_S2K, GCRY_MD_SHA1,
+                              "saltsalt", 8, 1, 16, out));
+    unhex("68778c5d46180727d701e54bafa15978", expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 16);
+    ASSERT_OK(gcry_kdf_derive("pw", 2, GCRY_KDF_ITERSALTED_S2K, GCRY_MD_SHA1,
+                              "saltsalt", 8, 10, 16, out));
+    ASSERT_MEM_EQ(expect, out, 16);
+    ASSERT_OK(gcry_kdf_derive("pw", 2, GCRY_KDF_ITERSALTED_S2K, GCRY_MD_SHA1,
+                              "saltsalt", 8, 1024, 16, out));
+    unhex("10cfd56c201f6af0f6f4128afd90b467", expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 16);
+
+    /* gcry_kdf_open parameter checks. */
+    param[0] = 32;
+    param[1] = 3;
+    param[2] = 32;
+    param[3] = 1;
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* Argon2 needs a salt */
+               gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    param[3] = 0;
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* zero lanes */
+               gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
+                             "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+    param[3] = 1;
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* unknown variant */
+               gcry_kdf_open(&hd, GCRY_KDF_ARGON2, 7, param, 4, "pw", 2,
+                             "saltsalt", 8, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* too few parameters */
+               gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 2,
+                             "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
+                            "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 16, out));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_kdf_final(hd, 32, NULL));
+    ASSERT_OK(gcry_kdf_compute(hd, NULL));
+    ASSERT_OK(gcry_kdf_final(hd, 32, out));
+    gcry_kdf_close(hd);
+    /* A caller supplied thread dispatcher gives the same result. */
+    {
+        gcry_kdf_thread_ops_t ops;
+        int jobs = 0;
+
+        ops.jobs_context = &jobs;
+        ops.dispatch_job = dispatch_inline;
+        ops.wait_all_jobs = wait_none;
+        ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
+                                "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+        ASSERT_OK(gcry_kdf_compute(hd, &ops));
+        ASSERT_OK(gcry_kdf_final(hd, 32, out2));
+        gcry_kdf_close(hd);
+        ASSERT_MEM_EQ(out, out2, 32);
+    }
+
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* one-step KDF needs FixedInfo */
+               gcry_kdf_open(&hd, GCRY_KDF_ONESTEP_KDF, GCRY_MD_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_ONESTEP_KDF, GCRY_MD_SHA256, param, 2,
+                             "pw", 2, NULL, 0, NULL, 0, "ad", 2));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_kdf_open(&hd, GCRY_KDF_ONESTEP_KDF, GCRY_MD_TIGER, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, "ad", 2));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* the MAC variant needs a key */
+               gcry_kdf_open(&hd, GCRY_KDF_ONESTEP_KDF_MAC, GCRY_MAC_HMAC_SHA256,
+                             param, 1, "pw", 2, NULL, 0, NULL, 0, "ad", 2));
+    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ONESTEP_KDF, GCRY_MD_SHA256, param, 1,
+                            "pw", 2, NULL, 0, NULL, 0, "ad", 2));
+    {
+        gcry_kdf_thread_ops_t ops;
+        int jobs = 0;
+
+        ops.jobs_context = &jobs;
+        ops.dispatch_job = dispatch_inline;
+        ops.wait_all_jobs = wait_none;
+        /* Thread dispatch is only defined for Argon2. */
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_compute(hd, &ops));
+    }
+    gcry_kdf_close(hd);
+
+    param[0] = 255 * 32 + 1;
+    ASSERT_ERR(GPG_ERR_INV_VALUE, /* HKDF output limit */
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    param[0] = 32;
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 3,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, 9999, param, 1, "pw", 2, NULL, 0,
+                             NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 0, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_X963_KDF, GCRY_MD_SHA256, param, 2,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_X963_KDF, GCRY_MD_SHA256, param, 1,
+                             "pw", 0, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_ALGORITHM,
+               gcry_kdf_open(&hd, 9999, 0, param, 1, "pw", 2, NULL, 0, NULL, 0,
+                             NULL, 0));
+    /* The reference library crashes on these; we return errors. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, NULL, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    param[0] = 0;
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(NULL, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_kdf_compute(NULL, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_kdf_final(NULL, 32, out));
+    gcry_kdf_close(NULL);
+}
+
 int
 main(void)
 {
@@ -626,5 +819,6 @@ main(void)
     RUN_TEST(onestep_kdf_vectors);
     RUN_TEST(hkdf_vectors);
     RUN_TEST(x963_vectors);
+    RUN_TEST(argument_validation);
     return TEST_RESULT();
 }

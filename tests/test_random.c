@@ -72,6 +72,7 @@ TEST(add_bytes)
     ASSERT_OK(gcry_random_add_bytes(seed, sizeof seed, 100));
     ASSERT_OK(gcry_random_add_bytes(seed, sizeof seed, 1000)); /* clamped */
     ASSERT_OK(gcry_random_add_bytes(seed, sizeof seed, 5)); /* ignored */
+    ASSERT_OK(gcry_random_add_bytes(seed, sizeof seed, -5)); /* clamped */
     ASSERT_OK(gcry_random_add_bytes(seed, 0, 50));
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_random_add_bytes(NULL, 10, 50));
     ASSERT_OK(gcry_control(GCRYCTL_FAST_POLL, NULL));
