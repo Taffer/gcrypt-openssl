@@ -2619,6 +2619,84 @@ gcm_ctr_stream(const unsigned char *in, unsigned char *out, size_t blocks,
     }
 }
 
+/*
+ * OpenSSL's AES-GCM decryption context refuses to hand out the tag it has
+ * computed, but re-initialising the context for encryption without a key
+ * or IV only flips its direction, and the following EncryptFinal then
+ * exposes the tag over the data that was decrypted.  That lets the fused
+ * AES-GCM kernel be used for decryption while still being able to read
+ * the tag, as the reference library allows.  Because this relies on the
+ * provider keeping its state across the flip, it is checked once against
+ * a known answer and the slower GCM128 driver is used if it fails.
+ */
+static pthread_once_t gcm_flip_once = PTHREAD_ONCE_INIT;
+static int gcm_flip_ok;
+
+static void
+gcm_flip_probe(void)
+{
+    /* NIST GCM test case 2: zero key, zero IV, one zero block. */
+    static const unsigned char ct[16] = {
+        0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
+        0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78
+    };
+    static const unsigned char want[16] = {
+        0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd,
+        0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57, 0xbd, 0xdf
+    };
+    unsigned char zero[16] = { 0 };
+    unsigned char out[16];
+    unsigned char tag[16];
+    EVP_CIPHER *gcm;
+    EVP_CIPHER_CTX *ctx;
+    int outl = 0;
+
+    gcm = EVP_CIPHER_fetch(_gcry_libctx(), "AES-128-GCM", _gcry_propq());
+    ctx = EVP_CIPHER_CTX_new();
+
+    if (gcm && ctx
+        && EVP_DecryptInit_ex2(ctx, gcm, zero, zero, NULL)
+        && EVP_DecryptUpdate(ctx, out, &outl, ct, 16)
+        && EVP_CipherInit_ex2(ctx, NULL, NULL, NULL, 1, NULL)
+        && EVP_EncryptFinal_ex(ctx, out, &outl)
+        && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag)
+        && !memcmp(tag, want, 16)) {
+        gcm_flip_ok = 1;
+    }
+
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_free(gcm);
+}
+
+static int
+gcm_flip_supported(void)
+{
+    pthread_once(&gcm_flip_once, gcm_flip_probe);
+    return gcm_flip_ok;
+}
+
+/* Finish a GCM decryption that ran through the EVP context: flip it to
+ * encryption and read the tag computed over the ciphertext. */
+static gcry_err_code_t
+gcm_finish_evp_decrypt(gcry_cipher_hd_t h)
+{
+    unsigned char dummy[16];
+    int outl = 0;
+
+    if (!EVP_CipherInit_ex2(h->ctx, NULL, NULL, NULL, 1, NULL)
+        || !EVP_EncryptFinal_ex(h->ctx, dummy, &outl)
+        || !EVP_CIPHER_CTX_ctrl(h->ctx, EVP_CTRL_AEAD_GET_TAG, 16, h->tag)) {
+        h->ctx_keyed = 0;
+        return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+    }
+
+    h->aad_done = 1;
+    h->tag_ready = 1;
+    h->data_done = 1;
+    return 0;
+}
+
 /* Start a GCM decryption: key the driver and the counter stream, apply
  * the IV and any associated data given so far. */
 static gcry_err_code_t
@@ -2708,6 +2786,10 @@ gcm_finish(gcry_cipher_hd_t h)
         return 0;
     }
 
+    if (!h->gcm_started && h->ctx_ready && !h->enc && h->data_started) {
+        return gcm_finish_evp_decrypt(h);
+    }
+
     if (h->gcm_started || (h->data_started && !h->enc)) {
         rc = gcm_dec_start(h);
 
@@ -2744,7 +2826,8 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
         return GPG_ERR_INV_STATE; /* Cannot turn around mid-message. */
     }
 
-    if (h->mode == GCRY_CIPHER_MODE_GCM && !enc) {
+    if (h->mode == GCRY_CIPHER_MODE_GCM && !enc
+        && (h->gcm_started || !gcm_flip_supported())) {
         rc = gcm_dec_start(h);
 
         if (rc) {

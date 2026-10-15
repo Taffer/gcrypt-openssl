@@ -1636,6 +1636,61 @@ hex_eq(const unsigned char *buf, const char *hex)
     return memcmp(buf, expect, n) == 0;
 }
 
+/* NIST GCM test case 6: a 60-byte IV (J0 from GHASH, arbitrary counter
+ * low word), chunked decryption, and the decryption side reading its tag
+ * before and after checks; stock libgcrypt produces the same output. */
+TEST(gcm_long_iv_decrypt_tag)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char key[16];
+    unsigned char iv[60];
+    unsigned char aad[20];
+    unsigned char ct[60];
+    unsigned char pt[60];
+    unsigned char tag[16];
+
+    unhex("feffe9928665731c6d6a8f9467308308", key, sizeof key);
+    unhex("9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728"
+          "c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b",
+          iv, sizeof iv);
+    unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2", aad, sizeof aad);
+    unhex("8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca7"
+          "01e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5",
+          ct, sizeof ct);
+
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
+    ASSERT_OK(gcry_cipher_setiv(hd, iv, sizeof iv));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad, sizeof aad));
+    ASSERT_OK(gcry_cipher_decrypt(hd, pt, 17, ct, 17));
+    ASSERT_OK(gcry_cipher_decrypt(hd, pt + 17, 43, ct + 17, 43));
+    ASSERT_TRUE(hex_eq(pt, "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da"
+                       "2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16a"
+                       "edf5aa0de657ba637b39"));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_TRUE(hex_eq(tag, "619cc5aefffe0bfa462af43c1699d050"));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 12));
+    tag[0] ^= 1;
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 16));
+    tag[0] ^= 1;
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 8));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_TRUE(hex_eq(tag, "619cc5aefffe0bfa462af43c1699d050"));
+
+    /* The handle keeps working in both directions afterwards and both
+     * directions agree on the tag. */
+    ASSERT_OK(gcry_cipher_setiv(hd, iv, 12));
+    ASSERT_OK(gcry_cipher_decrypt(hd, pt, sizeof pt, ct, sizeof ct));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_TRUE(hex_eq(tag, "ed73409ea070c994381d65d3b7073d8b"));
+    ASSERT_OK(gcry_cipher_setiv(hd, iv, 12));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, sizeof ct, pt, sizeof pt));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_TRUE(hex_eq(tag, "ed73409ea070c994381d65d3b7073d8b"));
+    gcry_cipher_close(hd);
+}
+
 TEST(upstream_gcm_tags)
 {
     gcry_cipher_hd_t hd;
@@ -2296,6 +2351,7 @@ main(void)
     RUN_TEST(xts_and_keywrap_lengths);
     RUN_TEST(ocb_generic_block_ciphers);
     RUN_TEST(controls_and_misc);
+    RUN_TEST(gcm_long_iv_decrypt_tag);
     RUN_TEST(upstream_gcm_tags);
     RUN_TEST(upstream_siv_states);
     RUN_TEST(upstream_gcm_siv_states);
