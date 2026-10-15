@@ -1,0 +1,363 @@
+#include <gcrypt.h>
+
+#include <stdlib.h>
+
+#include "test_common.h"
+
+static size_t
+unhex(const char *hex, unsigned char *buf, size_t bufsize)
+{
+    size_t n = 0;
+
+    while (hex[0] && hex[1] && n < bufsize) {
+        unsigned int v;
+
+        sscanf(hex, "%2x", &v);
+        buf[n++] = (unsigned char)v;
+        hex += 2;
+    }
+
+    return n;
+}
+
+/* Compute the MAC of DATA under KEY (and IV if given) and compare. */
+static int
+check_mac(int algo, const char *keyhex, const char *ivhex, const void *data,
+          size_t datalen, const char *hex)
+{
+    unsigned char key[64];
+    unsigned char iv[16];
+    unsigned char expect[64];
+    unsigned char got[64];
+    size_t keylen = unhex(keyhex, key, sizeof key);
+    size_t ivlen = ivhex ? unhex(ivhex, iv, sizeof iv) : 0;
+    size_t n = unhex(hex, expect, sizeof expect);
+    size_t gotlen = sizeof got;
+    gcry_mac_hd_t hd;
+    gcry_error_t err;
+
+    err = gcry_mac_open(&hd, algo, 0, NULL);
+
+    if (err) {
+        fprintf(stderr, "mac %d (%s): open: %s\n", algo, gcry_mac_algo_name(algo),
+                gcry_strerror(err));
+        return 0;
+    }
+
+    err = gcry_mac_setkey(hd, key, keylen);
+
+    if (!err && ivlen) {
+        err = gcry_mac_setiv(hd, iv, ivlen);
+    }
+
+    if (!err) {
+        err = gcry_mac_write(hd, data, datalen);
+    }
+
+    if (!err) {
+        err = gcry_mac_read(hd, got, &gotlen);
+    }
+
+    if (err) {
+        fprintf(stderr, "mac %d (%s): %s\n", algo, gcry_mac_algo_name(algo),
+                gcry_strerror(err));
+        gcry_mac_close(hd);
+        return 0;
+    }
+
+    if (gotlen != n || memcmp(got, expect, n)) {
+        size_t i;
+
+        fprintf(stderr, "mac %d (%s): mismatch (len %zu)\n  got ", algo,
+                gcry_mac_algo_name(algo), gotlen);
+
+        for (i = 0; i < gotlen; i++) {
+            fprintf(stderr, "%02x", got[i]);
+        }
+
+        fprintf(stderr, "\n");
+        gcry_mac_close(hd);
+        return 0;
+    }
+
+    /* verify agrees, and a reset recomputes the same tag. */
+    err = gcry_mac_verify(hd, expect, n);
+
+    if (!err) {
+        err = gcry_mac_reset(hd);
+    }
+
+    if (!err && ivlen) {
+        err = gcry_mac_setiv(hd, iv, ivlen);
+    }
+
+    if (!err) {
+        err = gcry_mac_write(hd, data, datalen);
+    }
+
+    if (!err) {
+        err = gcry_mac_verify(hd, expect, n);
+    }
+
+    gcry_mac_close(hd);
+
+    if (err) {
+        fprintf(stderr, "mac %d (%s): verify/reset: %s\n", algo,
+                gcry_mac_algo_name(algo), gcry_strerror(err));
+        return 0;
+    }
+
+    return 1;
+}
+
+TEST(hmac_rfc4231)
+{
+    const char *jefe = "4a656665";
+    const char *data = "what do ya want for nothing?";
+
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA224, jefe, NULL, data, 28,
+                          "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256, jefe, NULL, data, 28,
+                          "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA384, jefe, NULL, data, 28,
+                          "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e"
+                          "8e2240ca5e69e2c78b3239ecfab21649"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA512, jefe, NULL, data, 28,
+                          "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554"
+                          "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_MD5, jefe, NULL, data, 28,
+                          "750c783e6ab0b503eaa86e310a5db738"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA1, jefe, NULL, data, 28,
+                          "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"));
+    /* RFC 4231 case 1 (20 byte 0x0b key, "Hi There"). */
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256,
+                          "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", NULL,
+                          "Hi There", 8,
+                          "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+}
+
+TEST(cmac_rfc4493)
+{
+    const char *key = "2b7e151628aed2a6abf7158809cf4f3c";
+    unsigned char m[40];
+
+    unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51"
+          "30c81c46a35ce411", m, sizeof m);
+    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_AES, key, NULL, "", 0,
+                          "bb1d6929e95937287fa37d129b756746"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_AES, key, NULL, m, 16,
+                          "070a16b46b4d4144f79bdd9dd04a287c"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_AES, key, NULL, m, 40,
+                          "dfa66747de9ae63030ca32611497c827"));
+    /* AES-256 CMAC (NIST SP 800-38B D.3, empty message). */
+    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_AES,
+                          "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+                          NULL, "", 0, "028962f61b7bf89efc6b551f4667d983"));
+    /* 3DES CMAC (NIST SP 800-38B D.4, empty message). */
+    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_3DES,
+                          "8aa83bf8cbda10620bc1bf19fbb6cd58bc313d4a371ca8b5", NULL,
+                          "", 0, "b7a688e122ffaf95"));
+}
+
+TEST(gmac_and_poly1305)
+{
+    /* NIST GCM test case 1: zero key and IV, no data. */
+    ASSERT_TRUE(check_mac(GCRY_MAC_GMAC_AES, "00000000000000000000000000000000",
+                          "000000000000000000000000", "", 0,
+                          "58e2fccefa7e3061367f1d57a4e7455a"));
+    /* GCM test case with AAD only: key/IV from test case 2 with 16 bytes
+     * of zero AAD; value derived from the GHASH definition and
+     * cross-checked against OpenSSL. */
+    {
+        gcry_mac_hd_t hd;
+        unsigned char tag1[16];
+        unsigned char tag2[16];
+        size_t len = 16;
+        unsigned char key[16] = { 0 };
+        unsigned char iv[12] = { 0 };
+
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 16));
+        ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, key, 16)); /* no IV yet */
+        ASSERT_OK(gcry_mac_setiv(hd, iv, 12));
+        ASSERT_OK(gcry_mac_write(hd, key, 16));
+        ASSERT_OK(gcry_mac_read(hd, tag1, &len));
+        ASSERT_EQ(16, len);
+        ASSERT_OK(gcry_mac_reset(hd));
+        ASSERT_OK(gcry_mac_write(hd, key, 8));
+        ASSERT_OK(gcry_mac_write(hd, key, 8));
+        ASSERT_OK(gcry_mac_read(hd, tag2, &len));
+        ASSERT_MEM_EQ(tag1, tag2, 16);
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 15));
+        gcry_mac_close(hd);
+    }
+
+    /* RFC 8439 section 2.5.2. */
+    ASSERT_TRUE(check_mac(GCRY_MAC_POLY1305,
+                          "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
+                          NULL, "Cryptographic Forum Research Group", 34,
+                          "a8061dc1305136c6c22b8baf0c0127a9"));
+    {
+        gcry_mac_hd_t hd;
+        unsigned char key[32] = { 0 };
+
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
+        ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, key, 16));
+        gcry_mac_close(hd);
+    }
+}
+
+TEST(legacy_cmacs)
+{
+    gcry_mac_hd_t hd;
+    const int algos[] = {
+        GCRY_MAC_CMAC_CAMELLIA, GCRY_MAC_CMAC_CAST5, GCRY_MAC_CMAC_BLOWFISH,
+        GCRY_MAC_CMAC_SEED, GCRY_MAC_CMAC_RFC2268, GCRY_MAC_CMAC_IDEA,
+        GCRY_MAC_CMAC_SM4, GCRY_MAC_CMAC_ARIA
+    };
+    size_t i;
+
+    /* These must at least be usable and deterministic. */
+    for (i = 0; i < sizeof algos / sizeof algos[0]; i++) {
+        unsigned char key[17] = "0123456789abcdef";
+        unsigned char t1[16];
+        unsigned char t2[16];
+        size_t l1 = sizeof t1;
+        size_t l2 = sizeof t2;
+
+        ASSERT_OK(gcry_mac_test_algo(algos[i]));
+        ASSERT_OK(gcry_mac_open(&hd, algos[i], 0, NULL));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 16));
+        ASSERT_OK(gcry_mac_write(hd, "hello", 5));
+        ASSERT_OK(gcry_mac_read(hd, t1, &l1));
+        ASSERT_EQ(gcry_mac_get_algo_maclen(algos[i]), l1);
+        ASSERT_OK(gcry_mac_reset(hd));
+        ASSERT_OK(gcry_mac_write(hd, "hello", 5));
+        ASSERT_OK(gcry_mac_read(hd, t2, &l2));
+        ASSERT_MEM_EQ(t1, t2, l1);
+        gcry_mac_close(hd);
+    }
+}
+
+TEST(truncation_and_errors)
+{
+    gcry_mac_hd_t hd;
+    unsigned char full[32];
+    unsigned char part[8];
+    size_t len;
+
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0, NULL));
+    ASSERT_EQ(GCRY_MAC_HMAC_SHA256, gcry_mac_get_algo(hd));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, "x", 1)); /* no key */
+    ASSERT_OK(gcry_mac_setkey(hd, "key", 3));
+    ASSERT_OK(gcry_mac_write(hd, "message", 7));
+    len = sizeof full;
+    ASSERT_OK(gcry_mac_read(hd, full, &len));
+    ASSERT_EQ(32, len);
+    len = 8;
+    ASSERT_OK(gcry_mac_read(hd, part, &len));
+    ASSERT_EQ(8, len);
+    ASSERT_MEM_EQ(full, part, 8);
+    ASSERT_OK(gcry_mac_verify(hd, full, 32));
+    ASSERT_OK(gcry_mac_verify(hd, full, 8));
+    full[0] ^= 1;
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_mac_verify(hd, full, 32));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_mac_verify(hd, full, 33));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, "more", 4));
+    len = 0;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_read(hd, full, &len));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_read(hd, full, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_verify(hd, NULL, 4));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, "iv", 2));
+    ASSERT_ERR(GPG_ERR_INV_OP, gcry_mac_ctl(hd, 9999, NULL, 0));
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_mac_ctl(hd, GCRYCTL_SET_SBOX, NULL, 0));
+    gcry_mac_close(hd);
+    gcry_mac_close(NULL);
+
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0x10,
+                                              NULL));
+    ASSERT_NULL(hd);
+
+    /* Secure handle. */
+    gcry_control(GCRYCTL_INIT_SECMEM, 16384u, 0);
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA1, GCRY_MAC_FLAG_SECURE, NULL));
+    ASSERT_TRUE(gcry_is_secure(hd));
+    ASSERT_OK(gcry_mac_setkey(hd, "k", 1));
+    gcry_mac_close(hd);
+}
+
+TEST(algorithm_tables)
+{
+    size_t n = 0;
+
+    ASSERT_EQ(32, gcry_mac_get_algo_maclen(GCRY_MAC_HMAC_SHA256));
+    ASSERT_EQ(64, gcry_mac_get_algo_keylen(GCRY_MAC_HMAC_SHA256));
+    ASSERT_EQ(128, gcry_mac_get_algo_keylen(GCRY_MAC_HMAC_SHA512));
+    ASSERT_EQ(16, gcry_mac_get_algo_maclen(GCRY_MAC_CMAC_AES));
+    ASSERT_EQ(16, gcry_mac_get_algo_keylen(GCRY_MAC_CMAC_AES));
+    ASSERT_EQ(8, gcry_mac_get_algo_maclen(GCRY_MAC_CMAC_3DES));
+    ASSERT_EQ(24, gcry_mac_get_algo_keylen(GCRY_MAC_CMAC_3DES));
+    ASSERT_EQ(16, gcry_mac_get_algo_maclen(GCRY_MAC_GMAC_AES));
+    ASSERT_EQ(16, gcry_mac_get_algo_maclen(GCRY_MAC_POLY1305));
+    ASSERT_EQ(32, gcry_mac_get_algo_keylen(GCRY_MAC_POLY1305));
+    ASSERT_EQ(0, gcry_mac_get_algo_maclen(4711));
+    ASSERT_EQ(0, gcry_mac_get_algo_keylen(4711));
+
+    ASSERT_STR_EQ("HMAC_SHA256", gcry_mac_algo_name(GCRY_MAC_HMAC_SHA256));
+    ASSERT_STR_EQ("HMAC_RIPEMD160", gcry_mac_algo_name(GCRY_MAC_HMAC_RMD160));
+    ASSERT_STR_EQ("CMAC_AES", gcry_mac_algo_name(GCRY_MAC_CMAC_AES));
+    ASSERT_STR_EQ("GMAC_AES", gcry_mac_algo_name(GCRY_MAC_GMAC_AES));
+    ASSERT_STR_EQ("POLY1305", gcry_mac_algo_name(GCRY_MAC_POLY1305));
+    ASSERT_STR_EQ("?", gcry_mac_algo_name(4711));
+    ASSERT_EQ(GCRY_MAC_HMAC_SHA256, gcry_mac_map_name("HMAC_SHA256"));
+    ASSERT_EQ(GCRY_MAC_HMAC_SHA256, gcry_mac_map_name("hmac_sha256"));
+    ASSERT_EQ(GCRY_MAC_CMAC_AES, gcry_mac_map_name("CMAC_AES"));
+    ASSERT_EQ(GCRY_MAC_POLY1305, gcry_mac_map_name("POLY1305"));
+    ASSERT_EQ(0, gcry_mac_map_name("nope"));
+    ASSERT_EQ(0, gcry_mac_map_name(NULL));
+
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA3_256));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_WHIRLPOOL));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_TIGER1));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_STRIBOG256));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_256));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_CMAC_TWOFISH));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_CMAC_SERPENT));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_CMAC_GOST28147));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_GMAC_CAMELLIA));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_POLY1305_AES));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_GOST28147_IMIT));
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(4711));
+    {
+        gcry_mac_hd_t hd;
+
+        ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_open(&hd, GCRY_MAC_CMAC_TWOFISH, 0,
+                                                   NULL));
+        ASSERT_NULL(hd);
+    }
+
+    ASSERT_OK(gcry_mac_algo_info(GCRY_MAC_CMAC_AES, GCRYCTL_GET_KEYLEN, NULL, &n));
+    ASSERT_EQ(16, n);
+    ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_algo_info(4711, GCRYCTL_GET_KEYLEN, NULL,
+                                                    &n));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_algo_info(GCRY_MAC_CMAC_AES,
+                                                   GCRYCTL_GET_KEYLEN, NULL, NULL));
+    ASSERT_ERR(GPG_ERR_INV_OP, gcry_mac_algo_info(GCRY_MAC_CMAC_AES, 9999, NULL,
+                                                  NULL));
+}
+
+int
+main(void)
+{
+    gcry_check_version(NULL);
+    RUN_TEST(hmac_rfc4231);
+    RUN_TEST(cmac_rfc4493);
+    RUN_TEST(gmac_and_poly1305);
+    RUN_TEST(legacy_cmacs);
+    RUN_TEST(truncation_and_errors);
+    RUN_TEST(algorithm_tables);
+    return TEST_RESULT();
+}

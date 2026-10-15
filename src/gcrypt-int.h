@@ -215,6 +215,15 @@ gcry_mpi_t _gcry_ecc_curve_param(const struct gcry_ecc_curve *curve,
                                  const char *name);
 EC_GROUP *_gcry_ecc_curve_group(const struct gcry_ecc_curve *curve);
 
+/* ---- md.c -------------------------------------------------------- */
+
+/* OpenSSL digest name for a GCRY_MD_* algorithm, NULL if none. */
+const char *_gcry_md_openssl_name(int algo);
+/* Fetched EVP_MD for ALGO (caller frees), NULL if unavailable. */
+EVP_MD *_gcry_md_fetch(int algo);
+/* Output size parameter needed for the truncated BLAKE2 variants, else 0. */
+unsigned int _gcry_md_reduced_size(int algo);
+
 /* ---- mpi-ec.c ---------------------------------------------------- */
 
 void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,
