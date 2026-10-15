@@ -56,7 +56,7 @@ not allow injecting the nonce.
 | `tests/`      | One test program per module with published test vectors   |
 | `benchmarks/` | `bench_gcrypt` suite and `compare.sh` for stock libgcrypt  |
 | `cmake/`      | Package config, pkg-config and drop-in templates           |
-| `scripts/`    | `build-openssl.sh`, `check-exports.sh`                     |
+| `scripts/`    | `build-openssl.sh`, `check-exports.sh`, `coverage.py`      |
 
 ## Building
 
@@ -79,6 +79,7 @@ Useful options:
 | `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
 | `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `OFF`   | Pass `-Werror`                  |
 | `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`    |
+| `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage    |
 
 Consumers can `find_package(gcrypt-openssl)` after `cmake --install` and link
 against `gcrypt-openssl::shared` or `gcrypt-openssl::static`, or use the
@@ -156,6 +157,27 @@ every case, `--size` changes the bulk buffer, `--csv` gives raw output and
 as `n/a`. A full run takes ten to fifteen minutes, most of it in RSA,
 DSA and ElGamal key generation. Point `GCRYPT_OPENSSL_STOCK_GCRYPT` at a
 library file to compare against a specific build.
+
+### Code coverage
+
+The `coverage` preset builds a Debug tree instrumented with the compiler's
+`--coverage` option and adds a `coverage` target that runs the test suite
+and summarises the counters with `scripts/coverage.py`, which only needs
+`gcov` (or `llvm-cov` with clang) and Python 3:
+
+```sh
+cmake --preset coverage
+cmake --build --preset coverage
+cmake --build --preset coverage-report
+```
+
+The report lands in `build-coverage/coverage/`: `summary.txt` and
+`coverage.json` with line, function and branch coverage per file, and
+`index.html` linking to annotated sources. Counters from the shared and the
+static library are merged, so every test counts once. The script can also
+gate a CI job: `scripts/coverage.py --build-dir build-coverage
+--source-dir . --output cov --min-lines 75` exits non-zero below the
+threshold.
 
 ## Contributing
 

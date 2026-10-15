@@ -58,6 +58,10 @@ option(GCRYPT_OPENSSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"
 option(GCRYPT_OPENSSL_DROP_IN
        "Also build libgcrypt.so.20 plus libgcrypt.pc and libgcrypt-config" OFF
 )
+option(GCRYPT_OPENSSL_COVERAGE
+       "Instrument for code coverage (gcc/clang --coverage) and add the
+       coverage target" OFF
+)
 
 if(NOT GCRYPT_OPENSSL_BUILD_SHARED AND NOT GCRYPT_OPENSSL_BUILD_STATIC)
     message(FATAL_ERROR "At least one of GCRYPT_OPENSSL_BUILD_SHARED or "
@@ -110,6 +114,53 @@ elseif(MSVC)
         gcrypt_openssl_warnings
         INTERFACE /W4 $<$<BOOL:${GCRYPT_OPENSSL_WARNINGS_AS_ERRORS}>:/WX>
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# Code coverage: instrument everything in this tree with gcc/clang's
+# --coverage and provide a `coverage` target that runs the tests and
+# produces a report with scripts/coverage.py (needs gcov or llvm-cov).
+# ---------------------------------------------------------------------------
+if(GCRYPT_OPENSSL_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "GCRYPT_OPENSSL_COVERAGE needs gcc or clang")
+    endif()
+
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(WARNING "Coverage builds should use CMAKE_BUILD_TYPE=Debug; "
+                        "optimisation makes line counts misleading"
+        )
+    endif()
+
+    add_compile_options(--coverage)
+    add_link_options(--coverage)
+
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        find_program(GCRYPT_OPENSSL_GCOV NAMES llvm-cov)
+        set(gcov_arg "--gcov=${GCRYPT_OPENSSL_GCOV} gcov")
+    else()
+        find_program(GCRYPT_OPENSSL_GCOV NAMES gcov)
+        set(gcov_arg "--gcov=${GCRYPT_OPENSSL_GCOV}")
+    endif()
+
+    find_package(
+        Python3
+        COMPONENTS Interpreter
+        REQUIRED
+    )
+    add_custom_target(
+        coverage
+        COMMAND
+            ${Python3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/scripts/coverage.py"
+            --build-dir "${PROJECT_BINARY_DIR}" --source-dir
+            "${PROJECT_SOURCE_DIR}" --output "${PROJECT_BINARY_DIR}/coverage"
+            --run-tests ${gcov_arg}
+        WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+        USES_TERMINAL
+        COMMENT "Running the tests and collecting coverage"
+        VERBATIM
+    )
+    unset(gcov_arg)
 endif()
 
 # ---------------------------------------------------------------------------

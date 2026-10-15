@@ -56,6 +56,12 @@ dkms.conf
 # debug information files
 *.dwo
 
+# Coverage data
+*.gcda
+*.gcno
+*.gcov
+*.gcov.json.gz
+
 # Sublime Text
 *.sublime-workspace
 
