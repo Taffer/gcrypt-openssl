@@ -1,0 +1,38 @@
+# Artistic Style options for this project. Applied by the astyle_py
+# pre-commit hook; see http://astyle.sourceforge.net/astyle.html
+#
+# Kernel-ish C: 4-space indent, function braces on their own line, other
+# braces attached, return type on its own line for definitions, 80 columns.
+
+--style=linux
+--indent=spaces=4
+--convert-tabs
+
+# Function definitions: return type on its own line; declarations stay on one.
+--break-return-type
+--attach-return-type-decl
+
+# Pointers bind to the name: `const char *p`
+--align-pointer=name
+--align-reference=name
+
+# Spacing
+--pad-oper
+--pad-header
+--pad-comma
+--unpad-paren
+
+# Blocks
+--add-braces
+--attach-closing-while
+--break-one-line-headers
+--break-blocks
+
+# Line length
+--max-code-length=80
+--break-after-logical
+--max-continuation-indent=80
+--min-conditional-indent=0
+
+# Leave preprocessor blocks and macros alone.
+--indent-preproc-block

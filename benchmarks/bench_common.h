@@ -43,6 +43,7 @@ bench_run(const char *name, unsigned long iterations, bench_fn fn)
     double ns_per;
 
     start = clock();
+
     for (i = 0; i < iterations; i++) {
         fn();
     }

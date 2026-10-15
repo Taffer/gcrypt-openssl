@@ -43,7 +43,7 @@ against `gcrypt-openssl::shared` or `gcrypt-openssl::static`.
 
 ## Contributing
 
-Linting runs through [pre-commit](https://pre-commit.com/): clang-format for
+Linting runs through [pre-commit](https://pre-commit.com/): astyle for
 C, cmake-format and cmake-lint for CMake, markdownlint for Markdown, and
 codespell for spelling. Install the hooks once after cloning:
 
