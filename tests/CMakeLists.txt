@@ -3,7 +3,13 @@
 # Tests use the tiny assertion helpers in test_common.h; no external
 # framework is required.
 # ---------------------------------------------------------------------------
-set(GCRYPT_OPENSSL_TESTS test_version)
+set(GCRYPT_OPENSSL_TESTS
+    test_version
+    test_error
+    test_memory
+    test_sexp
+    test_mpi
+)
 
 foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
     add_executable(${test} ${test}.c)

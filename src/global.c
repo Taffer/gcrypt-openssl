@@ -1,0 +1,1011 @@
+/*
+ * global.c - Library initialisation, version check, gcry_control() and the
+ * OpenSSL library context that every other module fetches from.
+ */
+#include "gcrypt-int.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <openssl/rand.h>
+
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+static int any_init_done;
+static int init_finished;
+static int force_fips_mode = -1; /* -1 undecided, 0 off, 1 on. */
+static int fips_mode;
+static int no_fips_mode_required;
+static unsigned int debug_flags;
+static int preferred_rng_type;
+static unsigned int fips_reject_flags = GCRY_FIPS_FLAG_REJECT_DEFAULT;
+static OSSL_LIB_CTX *libctx;
+
+/* Does the operating system ask for FIPS mode?  Mirrors the reference
+ * implementation's checks of /proc/sys/crypto/fips_enabled and the
+ * /etc/gcrypt/fips_enabled marker file. */
+static int
+system_wants_fips(void)
+{
+    FILE *fp;
+    int c;
+
+    fp = fopen("/etc/gcrypt/fips_enabled", "r");
+
+    if (fp) {
+        fclose(fp);
+        return 1;
+    }
+
+    fp = fopen("/proc/sys/crypto/fips_enabled", "r");
+
+    if (!fp) {
+        return 0;
+    }
+
+    c = fgetc(fp);
+    fclose(fp);
+    return c == '1';
+}
+
+static int
+try_enable_fips(void)
+{
+    if (!OSSL_PROVIDER_available(libctx, "fips")) {
+        OSSL_PROVIDER *fips = OSSL_PROVIDER_load(libctx, "fips");
+
+        if (!fips) {
+            ERR_clear_error();
+            return 0;
+        }
+    }
+
+    if (!EVP_default_properties_enable_fips(libctx, 1)) {
+        ERR_clear_error();
+        return 0;
+    }
+
+    return 1;
+}
+
+static void
+do_global_init(void)
+{
+    int want_fips;
+
+    libctx = OSSL_LIB_CTX_new();
+
+    if (!libctx) {
+        _gcry_fatal_error(GPG_ERR_ENOMEM, "cannot create OpenSSL context");
+    }
+
+    /* Honour the system OpenSSL configuration (which may activate the FIPS
+     * provider), but never fail because of it. */
+    if (!OSSL_LIB_CTX_load_config(libctx, NULL)) {
+        ERR_clear_error();
+    }
+
+    /* Old and weak algorithms that Libgcrypt offers live in the legacy
+     * provider.  Keep the fallback behaviour so that the default provider
+     * is still activated implicitly on first use. */
+    if (!OSSL_PROVIDER_try_load(libctx, "legacy", 1)) {
+        ERR_clear_error();
+    }
+
+    want_fips = force_fips_mode;
+
+    if (want_fips < 0) {
+        want_fips = system_wants_fips();
+    }
+
+    if (want_fips && !no_fips_mode_required) {
+        fips_mode = try_enable_fips();
+    } else {
+        fips_mode = EVP_default_properties_is_fips_enabled(libctx) > 0;
+    }
+
+    any_init_done = 1;
+}
+
+void
+_gcry_global_init(void)
+{
+    pthread_once(&init_once, do_global_init);
+}
+
+OSSL_LIB_CTX *
+_gcry_libctx(void)
+{
+    _gcry_global_init();
+    return libctx;
+}
+
+const char *
+_gcry_propq(void)
+{
+    return NULL;
+}
+
+int
+_gcry_fips_mode(void)
+{
+    if (!any_init_done) {
+        return 0;
+    }
+
+    return fips_mode;
+}
+
+unsigned int
+_gcry_get_debug_flags(void)
+{
+    return debug_flags;
+}
+
+int
+_gcry_get_rng_type(void)
+{
+    if (preferred_rng_type) {
+        return preferred_rng_type;
+    }
+
+    return _gcry_fips_mode() ? GCRY_RNG_TYPE_FIPS : GCRY_RNG_TYPE_STANDARD;
+}
+
+/* ------------------------------------------------------------------ */
+/* Generic context objects                                             */
+/* ------------------------------------------------------------------ */
+
+struct gcry_context {
+    int type;
+    void (*deinit)(void *);
+    union {
+        long l;
+        void *p;
+        double d;
+    } align;
+    /* Payload follows. */
+};
+
+#define CTX_PAYLOAD(ctx) ((void *)((unsigned char *)(ctx) \
+                                   + sizeof(struct gcry_context)))
+
+gcry_ctx_t
+_gcry_ctx_alloc(int type, size_t length, void (*deinit)(void *))
+{
+    gcry_ctx_t ctx = _gcry_calloc(1, sizeof * ctx + length);
+
+    if (!ctx) {
+        return NULL;
+    }
+
+    ctx->type = type;
+    ctx->deinit = deinit;
+    return ctx;
+}
+
+void *
+_gcry_ctx_get_pointer(gcry_ctx_t ctx, int type)
+{
+    if (!ctx) {
+        return NULL;
+    }
+
+    if (ctx->type != type) {
+        log_error("context type mismatch: expected %d, got %d\n", type,
+                  ctx->type);
+        BUG();
+    }
+
+    return CTX_PAYLOAD(ctx);
+}
+
+void *
+_gcry_ctx_find_pointer(gcry_ctx_t ctx, int type)
+{
+    if (!ctx || ctx->type != type) {
+        return NULL;
+    }
+
+    return CTX_PAYLOAD(ctx);
+}
+
+void
+gcry_ctx_release(gcry_ctx_t ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->deinit) {
+        ctx->deinit(CTX_PAYLOAD(ctx));
+    }
+
+    _gcry_free(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* Version                                                             */
+/* ------------------------------------------------------------------ */
+
+static const char *
+parse_version_number(const char *s, int *number)
+{
+    int val = 0;
+
+    if (*s == '0' && isdigit((unsigned char)s[1])) {
+        return NULL; /* No leading zeros. */
+    }
+
+    for (; isdigit((unsigned char) * s); s++) {
+        val *= 10;
+        val += *s - '0';
+    }
+
+    *number = val;
+    return val < 0 ? NULL : s;
+}
+
+static const char *
+parse_version_string(const char *s, int *major, int *minor, int *micro)
+{
+    s = parse_version_number(s, major);
+
+    if (!s || *s != '.') {
+        return NULL;
+    }
+
+    s++;
+    s = parse_version_number(s, minor);
+
+    if (!s || *s != '.') {
+        return NULL;
+    }
+
+    s++;
+    s = parse_version_number(s, micro);
+    return s;
+}
+
+const char *
+gcry_check_version(const char *req_version)
+{
+    const char *ver = GCRYPT_VERSION;
+    int my_major;
+    int my_minor;
+    int my_micro;
+    int rq_major;
+    int rq_minor;
+    int rq_micro;
+
+    if (req_version && req_version[0] == 1 && req_version[1] == 1) {
+        return "\n\n"
+               "This is gcrypt-openssl " GCRYPT_OPENSSL_VERSION_STRING
+               " - the Libgcrypt API implemented on OpenSSL\n"
+               "Public domain.\n\n"
+               "(" OPENSSL_VERSION_TEXT ")\n";
+    }
+
+    _gcry_global_init();
+
+    if (!req_version) {
+        return ver;
+    }
+
+    if (!parse_version_string(ver, &my_major, &my_minor, &my_micro)) {
+        return NULL;
+    }
+
+    if (!parse_version_string(req_version, &rq_major, &rq_minor,
+                              &rq_micro)) {
+        return NULL;
+    }
+
+    if (my_major > rq_major
+        || (my_major == rq_major && my_minor > rq_minor)
+        || (my_major == rq_major && my_minor == rq_minor
+            && my_micro >= rq_micro)) {
+        return ver;
+    }
+
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Configuration report                                                */
+/* ------------------------------------------------------------------ */
+
+struct strbuf {
+    char *data;
+    size_t len;
+    size_t cap;
+    int oom;
+};
+
+static void strbuf_addf(struct strbuf *sb, const char *fmt, ...)
+_GCRY_GCC_ATTR_PRINTF(2, 3);
+
+static void
+strbuf_addf(struct strbuf *sb, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    for (;;) {
+        size_t avail = sb->cap - sb->len;
+
+        va_start(ap, fmt);
+        n = vsnprintf(sb->data ? sb->data + sb->len : NULL, avail, fmt, ap);
+        va_end(ap);
+
+        if (n < 0) {
+            sb->oom = 1;
+            return;
+        }
+
+        if ((size_t)n < avail) {
+            sb->len += (size_t)n;
+            return;
+        }
+
+        {
+            size_t newcap = sb->cap ? sb->cap * 2 : 256;
+            char *p;
+
+            while (newcap < sb->len + (size_t)n + 1) {
+                newcap *= 2;
+            }
+
+            p = _gcry_realloc(sb->data, newcap);
+
+            if (!p) {
+                sb->oom = 1;
+                return;
+            }
+
+            sb->data = p;
+            sb->cap = newcap;
+        }
+    }
+}
+
+static const char *
+fips_provider_version(void)
+{
+    OSSL_PROVIDER *prov;
+
+    if (!_gcry_fips_mode()) {
+        return "";
+    }
+
+    prov = OSSL_PROVIDER_load(libctx, "fips");
+
+    if (!prov) {
+        ERR_clear_error();
+        return "";
+    }
+
+    /* The provider stays loaded; we only need a stable string. */
+    {
+        OSSL_PARAM params[2];
+        static char version[64];
+
+        params[0] = OSSL_PARAM_construct_utf8_string("version", version,
+                                                     sizeof version);
+        params[1] = OSSL_PARAM_construct_end();
+
+        if (OSSL_PROVIDER_get_params(prov, params)) {
+            return version;
+        }
+
+        ERR_clear_error();
+    }
+
+    return "";
+}
+
+static void
+print_config(const char *what, struct strbuf *sb)
+{
+    if (!what || !strcmp(what, "version")) {
+        strbuf_addf(sb, "version:%s:%x:%s:%lx:\n", GCRYPT_VERSION,
+                    GCRYPT_VERSION_NUMBER, OPENSSL_VERSION_STR,
+                    (unsigned long)OPENSSL_VERSION_NUMBER);
+    }
+
+    if (!what || !strcmp(what, "cc")) {
+        strbuf_addf(sb, "cc:%d:%s:\n",
+#ifdef __GNUC__
+                    _GCRY_GCC_VERSION,
+#else
+                    0,
+#endif
+#if defined(__clang__)
+                    "clang:" __VERSION__
+#elif defined(__GNUC__)
+                    "gcc:" __VERSION__
+#else
+                    ":"
+#endif
+                   );
+    }
+
+    if (!what || !strcmp(what, "ciphers")) {
+        strbuf_addf(sb, "ciphers:%s:\n",
+                    "idea:3des:cast5:blowfish:aes:rfc2268:seed:camellia:"
+                    "chacha20:sm4:aria:arcfour:des");
+    }
+
+    if (!what || !strcmp(what, "pubkeys")) {
+        strbuf_addf(sb, "pubkeys:%s:\n", "dsa:elgamal:rsa:ecc");
+    }
+
+    if (!what || !strcmp(what, "digests")) {
+        strbuf_addf(sb, "digests:%s:\n",
+                    "crc:md4:md5:rmd160:sha1:sha256:sha512:sha3:whirlpool:"
+                    "blake2:sm3");
+    }
+
+    if (!what || !strcmp(what, "rnd-mod")) {
+        strbuf_addf(sb, "rnd-mod:openssl:\n");
+    }
+
+    if (!what || !strcmp(what, "cpu-arch")) {
+        strbuf_addf(sb, "cpu-arch:"
+#if defined(__x86_64__) || defined(_M_X64)
+                    "x86:amd64"
+#elif defined(__i386__) || defined(_M_IX86)
+                    "x86:i386"
+#elif defined(__aarch64__) || defined(__arm__)
+                    "arm"
+#elif defined(__powerpc__)
+                    "ppc"
+#elif defined(__s390x__)
+                    "s390x"
+#elif defined(__riscv)
+                    "riscv"
+#endif
+                    ":\n");
+    }
+
+    if (!what || !strcmp(what, "mpi-asm")) {
+        strbuf_addf(sb, "mpi-asm:openssl-bn:\n");
+    }
+
+    if (!what || !strcmp(what, "mpi-pow")) {
+        strbuf_addf(sb, "mpi-powm:openssl-bn\n");
+    }
+
+    if (!what || !strcmp(what, "hwflist")) {
+        strbuf_addf(sb, "hwflist:\n");
+    }
+
+    if (!what || !strcmp(what, "fips-mode")) {
+        strbuf_addf(sb, "fips-mode:%c::%s:\n", _gcry_fips_mode() ? 'y' : 'n',
+                    fips_provider_version());
+    }
+
+    if (!what || !strcmp(what, "rng-type")) {
+        int t = _gcry_get_rng_type();
+        const char *s = t == GCRY_RNG_TYPE_FIPS ? "fips"
+                        : t == GCRY_RNG_TYPE_SYSTEM ? "system" : "standard";
+
+        strbuf_addf(sb, "rng-type:%s:%d:%u:%d:\n", s, t, 0u, 0);
+    }
+
+    if (!what || !strcmp(what, "compliance")) {
+        strbuf_addf(sb, "compliance:%s::\n", "");
+    }
+
+    if (!what || !strcmp(what, "backend")) {
+        strbuf_addf(sb, "backend:gcrypt-openssl:%s:%s:\n",
+                    GCRYPT_OPENSSL_VERSION_STRING,
+                    OpenSSL_version(OPENSSL_VERSION));
+    }
+}
+
+char *
+gcry_get_config(int mode, const char *what)
+{
+    struct strbuf sb = { NULL, 0, 0, 0 };
+
+    if (mode) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    _gcry_global_init();
+    print_config(what, &sb);
+
+    if (sb.oom) {
+        _gcry_free(sb.data);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    if (!sb.data) {
+        errno = 0; /* Unknown WHAT: nothing printed. */
+        return NULL;
+    }
+
+    if (what) {
+        char *p = strchr(sb.data, '\n');
+
+        if (p) {
+            *p = 0;
+        }
+    }
+
+    return sb.data;
+}
+
+/* ------------------------------------------------------------------ */
+/* FIPS service indicators                                             */
+/* ------------------------------------------------------------------ */
+
+static gcry_err_code_t
+fips_indicator_cipher(int algo, int mode)
+{
+    switch (algo) {
+    case GCRY_CIPHER_AES:
+    case GCRY_CIPHER_AES192:
+    case GCRY_CIPHER_AES256:
+        break;
+
+    default:
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+
+    switch (mode) {
+    case GCRY_CIPHER_MODE_NONE:
+    case GCRY_CIPHER_MODE_ECB:
+    case GCRY_CIPHER_MODE_CBC:
+    case GCRY_CIPHER_MODE_CFB:
+    case GCRY_CIPHER_MODE_CFB8:
+    case GCRY_CIPHER_MODE_OFB:
+    case GCRY_CIPHER_MODE_CTR:
+    case GCRY_CIPHER_MODE_CCM:
+    case GCRY_CIPHER_MODE_GCM:
+    case GCRY_CIPHER_MODE_XTS:
+    case GCRY_CIPHER_MODE_AESWRAP:
+        return 0;
+
+    default:
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+}
+
+static gcry_err_code_t
+fips_indicator_md(int algo)
+{
+    switch (algo) {
+    case GCRY_MD_SHA1:
+    case GCRY_MD_SHA224:
+    case GCRY_MD_SHA256:
+    case GCRY_MD_SHA384:
+    case GCRY_MD_SHA512:
+    case GCRY_MD_SHA512_224:
+    case GCRY_MD_SHA512_256:
+    case GCRY_MD_SHA3_224:
+    case GCRY_MD_SHA3_256:
+    case GCRY_MD_SHA3_384:
+    case GCRY_MD_SHA3_512:
+    case GCRY_MD_SHAKE128:
+    case GCRY_MD_SHAKE256:
+        return 0;
+
+    default:
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+}
+
+static gcry_err_code_t
+fips_indicator_mac(int algo)
+{
+    switch (algo) {
+    case GCRY_MAC_HMAC_SHA1:
+    case GCRY_MAC_HMAC_SHA224:
+    case GCRY_MAC_HMAC_SHA256:
+    case GCRY_MAC_HMAC_SHA384:
+    case GCRY_MAC_HMAC_SHA512:
+    case GCRY_MAC_HMAC_SHA512_224:
+    case GCRY_MAC_HMAC_SHA512_256:
+    case GCRY_MAC_HMAC_SHA3_224:
+    case GCRY_MAC_HMAC_SHA3_256:
+    case GCRY_MAC_HMAC_SHA3_384:
+    case GCRY_MAC_HMAC_SHA3_512:
+    case GCRY_MAC_CMAC_AES:
+    case GCRY_MAC_GMAC_AES:
+        return 0;
+
+    default:
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+}
+
+static gcry_err_code_t
+fips_indicator_kdf(int algo)
+{
+    switch (algo) {
+    case GCRY_KDF_PBKDF2:
+    case GCRY_KDF_HKDF:
+    case GCRY_KDF_ONESTEP_KDF:
+    case GCRY_KDF_ONESTEP_KDF_MAC:
+        return 0;
+
+    default:
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+}
+
+static gcry_err_code_t
+fips_indicator_function(const char *name)
+{
+    static const char *const forbidden[] = {
+        "gcry_pk_encrypt", "gcry_pk_decrypt", "gcry_kdf_derive",
+        "gcry_md_hash_buffer", "gcry_pk_sign", "gcry_pk_verify"
+    };
+    size_t i;
+
+    if (!name) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    for (i = 0; i < DIM(forbidden); i++) {
+        if (!strcmp(forbidden[i], name)) {
+            return GPG_ERR_NOT_SUPPORTED;
+        }
+    }
+
+    return 0;
+}
+
+static gcry_err_code_t
+fips_indicator_pk_flags(const char *flags)
+{
+    if (!flags) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    if (!strcmp(flags, "pkcs1") || !strcmp(flags, "pss")
+        || !strcmp(flags, "rfc6979") || !strcmp(flags, "prehash")
+        || !strcmp(flags, "param") || !strcmp(flags, "comp")
+        || !strcmp(flags, "nocomp") || !strcmp(flags, "no-keytest")
+        || !strcmp(flags, "transient-key")) {
+        return 0;
+    }
+
+    return GPG_ERR_NOT_SUPPORTED;
+}
+
+/* ------------------------------------------------------------------ */
+/* Self test                                                           */
+/* ------------------------------------------------------------------ */
+
+static int
+selftest_provider_cb(OSSL_PROVIDER *prov, void *cbdata)
+{
+    int *failed = cbdata;
+
+    if (!OSSL_PROVIDER_self_test(prov)) {
+        ERR_clear_error();
+        *failed = 1;
+    }
+
+    return 1;
+}
+
+static gcry_err_code_t
+run_selftests(void)
+{
+    int failed = 0;
+
+    _gcry_global_init();
+
+    if (!OSSL_PROVIDER_do_all(libctx, selftest_provider_cb, &failed)) {
+        ERR_clear_error();
+        return GPG_ERR_SELFTEST_FAILED;
+    }
+
+    return failed ? GPG_ERR_SELFTEST_FAILED : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* gcry_control                                                        */
+/* ------------------------------------------------------------------ */
+
+static gcry_err_code_t
+vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
+{
+    gcry_err_code_t rc = 0;
+
+    switch (cmd) {
+    case GCRYCTL_ENABLE_M_GUARD:
+        rc = GPG_ERR_NOT_SUPPORTED;
+        break;
+
+    case GCRYCTL_ENABLE_QUICK_RANDOM:
+        /* OpenSSL's DRBG is always fast; nothing to do. */
+        break;
+
+    case GCRYCTL_FAKED_RANDOM_P:
+        break; /* Never faked. */
+
+    case GCRYCTL_DUMP_RANDOM_STATS:
+    case GCRYCTL_DUMP_MEMORY_STATS:
+    case GCRYCTL_DUMP_SECMEM_STATS:
+        break;
+
+    case GCRYCTL_DROP_PRIVS:
+        _gcry_global_init();
+        break;
+
+    case GCRYCTL_DISABLE_SECMEM:
+        _gcry_global_init();
+
+        if (!_gcry_fips_mode()) {
+            _gcry_secmem_disable();
+        }
+
+        break;
+
+    case GCRYCTL_INIT_SECMEM:
+        _gcry_global_init();
+        _gcry_secmem_init(va_arg(arg_ptr, unsigned int));
+        break;
+
+    case GCRYCTL_TERM_SECMEM:
+        _gcry_global_init();
+        _gcry_secmem_term();
+        break;
+
+    case GCRYCTL_DISABLE_SECMEM_WARN:
+    case GCRYCTL_SUSPEND_SECMEM_WARN:
+    case GCRYCTL_RESUME_SECMEM_WARN:
+    case GCRYCTL_DISABLE_LOCKED_SECMEM:
+    case GCRYCTL_DISABLE_PRIV_DROP:
+        break;
+
+    case GCRYCTL_AUTO_EXPAND_SECMEM:
+        (void)va_arg(arg_ptr, unsigned int);
+        break;
+
+    case GCRYCTL_USE_SECURE_RNDPOOL:
+        _gcry_global_init();
+        break;
+
+    case GCRYCTL_SET_RANDOM_SEED_FILE:
+        (void)va_arg(arg_ptr, const char *);
+        break;
+
+    case GCRYCTL_UPDATE_RANDOM_SEED_FILE:
+        break;
+
+    case GCRYCTL_SET_VERBOSITY:
+        _gcry_set_log_verbosity(va_arg(arg_ptr, int));
+        break;
+
+    case GCRYCTL_SET_DEBUG_FLAGS:
+        debug_flags |= va_arg(arg_ptr, unsigned int);
+        break;
+
+    case GCRYCTL_CLEAR_DEBUG_FLAGS:
+        debug_flags &= ~va_arg(arg_ptr, unsigned int);
+        break;
+
+    case GCRYCTL_DISABLE_INTERNAL_LOCKING:
+        _gcry_global_init();
+        break;
+
+    case GCRYCTL_ANY_INITIALIZATION_P:
+        if (any_init_done) {
+            rc = GPG_ERR_GENERAL; /* Used as TRUE. */
+        }
+
+        break;
+
+    case GCRYCTL_INITIALIZATION_FINISHED_P:
+        if (init_finished) {
+            rc = GPG_ERR_GENERAL;
+        }
+
+        break;
+
+    case GCRYCTL_INITIALIZATION_FINISHED:
+        if (!init_finished) {
+            _gcry_global_init();
+            init_finished = 1;
+        }
+
+        break;
+
+    case GCRYCTL_SET_THREAD_CBS:
+        _gcry_global_init();
+        break;
+
+    case GCRYCTL_FAST_POLL:
+        _gcry_global_init();
+        break;
+
+    case GCRYCTL_SET_RNDEGD_SOCKET:
+    case GCRYCTL_SET_RANDOM_DAEMON_SOCKET:
+        (void)va_arg(arg_ptr, const char *);
+        rc = GPG_ERR_NOT_SUPPORTED;
+        break;
+
+    case GCRYCTL_USE_RANDOM_DAEMON:
+        rc = GPG_ERR_NOT_SUPPORTED;
+        break;
+
+    case GCRYCTL_CLOSE_RANDOM_DEVICE:
+        break;
+
+    case GCRYCTL_PRINT_CONFIG: {
+        FILE *fp = va_arg(arg_ptr, FILE *);
+        char *tmpstr = gcry_get_config(0, NULL);
+
+        if (tmpstr) {
+            if (fp) {
+                fputs(tmpstr, fp);
+            } else {
+                log_info("%s", tmpstr);
+            }
+
+            _gcry_free(tmpstr);
+        }
+
+        break;
+    }
+
+    case GCRYCTL_OPERATIONAL_P:
+        _gcry_global_init();
+        rc = GPG_ERR_GENERAL; /* Always operational. */
+        break;
+
+    case GCRYCTL_FIPS_MODE_P:
+        if (_gcry_fips_mode()) {
+            rc = GPG_ERR_GENERAL;
+        }
+
+        break;
+
+    case GCRYCTL_FORCE_FIPS_MODE:
+        if (!any_init_done) {
+            force_fips_mode = 1;
+        } else {
+            if (!fips_mode) {
+                fips_mode = try_enable_fips();
+            }
+
+            if (fips_mode) {
+                rc = GPG_ERR_GENERAL;
+            }
+        }
+
+        break;
+
+    case GCRYCTL_NO_FIPS_MODE:
+        if (!any_init_done) {
+            force_fips_mode = 0;
+        } else if (!init_finished) {
+            no_fips_mode_required = 1;
+            fips_mode = 0;
+        } else {
+            rc = GPG_ERR_GENERAL;
+        }
+
+        break;
+
+    case GCRYCTL_SELFTEST:
+        rc = run_selftests();
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR:
+        rc = _gcry_fips_mode() ? 0 : GPG_ERR_NOT_SUPPORTED;
+        break;
+
+    case GCRYCTL_FIPS_REJECT_NON_FIPS:
+        fips_reject_flags = va_arg(arg_ptr, unsigned int);
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER: {
+        int algo = va_arg(arg_ptr, int);
+        int mode = va_arg(arg_ptr, int);
+
+        rc = fips_indicator_cipher(algo, mode);
+        break;
+    }
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_MAC:
+        rc = fips_indicator_mac(va_arg(arg_ptr, int));
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_MD:
+        rc = fips_indicator_md(va_arg(arg_ptr, int));
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_KDF:
+        rc = fips_indicator_kdf(va_arg(arg_ptr, int));
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION:
+        rc = fips_indicator_function(va_arg(arg_ptr, const char *));
+        break;
+
+    case GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS:
+        rc = fips_indicator_pk_flags(va_arg(arg_ptr, const char *));
+        break;
+
+    case GCRYCTL_DISABLE_HWF:
+        (void)va_arg(arg_ptr, const char *);
+        break;
+
+    case GCRYCTL_SET_ENFORCED_FIPS_FLAG:
+        break;
+
+    case GCRYCTL_SET_PREFERRED_RNG_TYPE: {
+        int i = va_arg(arg_ptr, int);
+
+        if (i > 0) {
+            preferred_rng_type = i;
+        }
+
+        break;
+    }
+
+    case GCRYCTL_GET_CURRENT_RNG_TYPE: {
+        int *ip = va_arg(arg_ptr, int *);
+
+        if (ip) {
+            *ip = _gcry_get_rng_type();
+        }
+
+        break;
+    }
+
+    case GCRYCTL_INACTIVATE_FIPS_FLAG:
+    case GCRYCTL_REACTIVATE_FIPS_FLAG:
+        rc = GPG_ERR_NOT_IMPLEMENTED;
+        break;
+
+    case GCRYCTL_DRBG_REINIT:
+        (void)va_arg(arg_ptr, const char *);
+        (void)va_arg(arg_ptr, gcry_buffer_t *);
+        (void)va_arg(arg_ptr, int);
+        rc = GPG_ERR_NOT_SUPPORTED;
+        break;
+
+    case GCRYCTL_REINIT_SYSCALL_CLAMP:
+        break;
+
+    default:
+        rc = GPG_ERR_INV_OP;
+        break;
+    }
+
+    return rc;
+}
+
+gcry_error_t
+gcry_control(enum gcry_ctl_cmds cmd, ...)
+{
+    gcry_err_code_t rc;
+    va_list arg_ptr;
+
+    va_start(arg_ptr, cmd);
+    rc = vcontrol(cmd, arg_ptr);
+    va_end(arg_ptr);
+    return GCRY_ERR(rc);
+}
+
+/* Exposed for the FIPS rejection logic of the algorithm modules. */
+unsigned int _gcry_fips_reject_flags(void);
+
+unsigned int
+_gcry_fips_reject_flags(void)
+{
+    return fips_reject_flags;
+}
