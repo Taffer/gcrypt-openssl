@@ -476,8 +476,13 @@ TEST(aes_ocb_rfc7253)
     ASSERT_EQ(16, taglen);
     ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
     ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    /* No tag until the data has been finalized, even if there is none. */
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_OK(gcry_cipher_final(hd));
+    ASSERT_OK(gcry_cipher_encrypt(hd, out, 0, data, 0));
     ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
     ASSERT_MEM_EQ(expect, tag, 16);
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, out, 8, data, 8));
 
     /* N=...01, A=P=0001020304050607. */
     nonce[11] = 1;
@@ -526,6 +531,54 @@ TEST(aes_ocb_rfc7253)
         ASSERT_ERR(GPG_ERR_INV_LENGTH,
                    gcry_cipher_ctl(hd, GCRYCTL_SET_TAGLEN, &tl, sizeof tl));
     }
+
+    /* Decrypting without gcry_cipher_final() leaves no tag to check. */
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 0, expect, 0));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_checktag(hd, tag, 12));
+
+    gcry_cipher_close(hd);
+}
+
+TEST(aes_gcm_siv_rfc8452)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char key[32] = { 1 };
+    unsigned char nonce[12] = { 3 };
+    unsigned char pt[8] = { 1 };
+    unsigned char expect_ct[8];
+    unsigned char expect_tag[16];
+    unsigned char out[8];
+    unsigned char tag[16];
+
+    unhex("b5d839330ac7b786", expect_ct, sizeof expect_ct);
+    unhex("578782fff6013b815b287c22493a364c", expect_tag, sizeof expect_tag);
+
+    /* RFC 8452 only defines 128 and 256 bit keys. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES192,
+                               GCRY_CIPHER_MODE_GCM_SIV, 0));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, key, 24));
+    gcry_cipher_close(hd);
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES256,
+                               GCRY_CIPHER_MODE_GCM_SIV, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, 32));
+    gcry_cipher_close(hd);
+
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, 16));
+
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_encrypt(hd, out, sizeof out, pt, sizeof pt));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_MEM_EQ(expect_ct, out, 8);
+    ASSERT_MEM_EQ(expect_tag, tag, 16);
+
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, sizeof tag));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, sizeof out, expect_ct, 8));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, sizeof tag));
+    ASSERT_MEM_EQ(pt, out, 8);
 
     gcry_cipher_close(hd);
 }
@@ -897,6 +950,7 @@ main(void)
     RUN_TEST(chacha20_poly1305_rfc8439);
     RUN_TEST(aes_ccm_rfc3610);
     RUN_TEST(aes_ocb_rfc7253);
+    RUN_TEST(aes_gcm_siv_rfc8452);
     RUN_TEST(aes_xts_ieee1619);
     RUN_TEST(aes_keywrap);
     RUN_TEST(cbc_cts_rfc3962);

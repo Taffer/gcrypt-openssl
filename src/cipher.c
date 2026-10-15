@@ -1441,6 +1441,11 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
         return rc;
     }
 
+    /* RFC 8452 defines AES-GCM-SIV for 128 and 256 bit keys only. */
+    if (h->mode == GCRY_CIPHER_MODE_GCM_SIV && keylen != 16 && keylen != 32) {
+        return GPG_ERR_INV_KEYLEN;
+    }
+
     if (h->algo == GCRY_CIPHER_DES || h->algo == GCRY_CIPHER_3DES) {
         const unsigned char *k = key;
         size_t i;
@@ -2626,6 +2631,13 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
         return 0;
 
     case GCRY_CIPHER_MODE_OCB:
+
+        /* The caller must announce the last data chunk with
+         * gcry_cipher_final() before the tag exists. */
+        if (!h->data_done) {
+            return GPG_ERR_INV_STATE;
+        }
+
         rc = ocb_apply_nonce(h);
 
         if (rc) {
@@ -2639,7 +2651,6 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
             }
 
             h->tag_ready = 1;
-            h->data_done = 1;
         }
 
         memcpy(outtag, h->tag, taglen > h->taglen ? h->taglen : taglen);
@@ -2732,6 +2743,10 @@ cipher_checktag(gcry_cipher_hd_t h, const void *intag, size_t taglen)
         return CRYPTO_memcmp(intag, h->tag, taglen) ? GPG_ERR_CHECKSUM : 0;
 
     case GCRY_CIPHER_MODE_OCB:
+        if (!h->data_done) {
+            return GPG_ERR_INV_STATE;
+        }
+
         if (taglen != h->taglen) {
             return GPG_ERR_INV_LENGTH;
         }
@@ -2749,7 +2764,6 @@ cipher_checktag(gcry_cipher_hd_t h, const void *intag, size_t taglen)
             }
 
             h->tag_ready = 1;
-            h->data_done = 1;
         }
 
         memcpy(tag, h->tag, h->taglen);
