@@ -47,12 +47,48 @@ TEST(errno_mapping)
     ASSERT_EQ(GPG_ERR_SYSTEM_ERROR | 86, GPG_ERR_ENOMEM);
 }
 
+TEST(unknown_codes_and_sources)
+{
+    static const char *const sources[] = {
+        "Unspecified source", "gcrypt", "GnuPG", "GpgSM", "GPG Agent",
+        "Pinentry", "SCD", "GPGME", "Keybox", "KSBA", "Dirmngr", "GSTI",
+        "GPA", "Kleopatra", "G13", "Assuan", "TPM2d", "TLS", "TKD"
+    };
+    unsigned int i;
+
+    /* A system error bit with an errno index nothing maps to. */
+    ASSERT_STR_EQ("Unknown system error",
+                  gcry_strerror(gcry_error(GPG_ERR_SYSTEM_ERROR | 16383)));
+    ASSERT_EQ(0, gcry_err_code_to_errno(GPG_ERR_SYSTEM_ERROR | 16383));
+    ASSERT_EQ(GPG_ERR_UNKNOWN_ERRNO,
+              gcry_err_code(gcry_err_make_from_errno(GPG_ERR_SOURCE_GPG, 99999)));
+
+    for (i = 0; i < sizeof sources / sizeof sources[0]; i++) {
+        ASSERT_STR_EQ(sources[i],
+                      gcry_strsource(gcry_err_make((gcry_err_source_t)i, 1)));
+    }
+
+    ASSERT_STR_EQ("Unknown source",
+                  gcry_strsource(gcry_err_make((gcry_err_source_t)19, 1)));
+    ASSERT_STR_EQ("Unknown source",
+                  gcry_strsource(gcry_err_make((gcry_err_source_t)100, 1)));
+    ASSERT_STR_EQ("Any source",
+                  gcry_strsource(gcry_err_make(GPG_ERR_SOURCE_ANY, 1)));
+    ASSERT_STR_EQ("User defined source 4",
+                  gcry_strsource(gcry_err_make(GPG_ERR_SOURCE_USER_4, 1)));
+}
+
 TEST(gpg_error_compat_wrappers)
 {
     ASSERT_STR_EQ("Invalid argument", gpg_strerror(gpg_error(GPG_ERR_INV_ARG)));
     ASSERT_EQ(GPG_ERR_EINVAL, gpg_err_code_from_errno(EINVAL));
     errno = ENOENT;
     ASSERT_EQ(GPG_ERR_ENOENT, gpg_err_code_from_syserror());
+    errno = 0;
+    ASSERT_EQ(0, gpg_err_code_from_syserror());
+    ASSERT_STR_EQ("Success", gpg_strerror(0));
+    ASSERT_STR_EQ("gcrypt",
+                  gpg_strsource(gpg_err_make(GPG_ERR_SOURCE_GCRYPT, 1)));
 }
 
 int
@@ -61,6 +97,7 @@ main(void)
     RUN_TEST(code_and_source);
     RUN_TEST(strings);
     RUN_TEST(errno_mapping);
+    RUN_TEST(unknown_codes_and_sources);
     RUN_TEST(gpg_error_compat_wrappers);
     return TEST_RESULT();
 }
