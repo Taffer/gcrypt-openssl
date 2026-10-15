@@ -5,6 +5,7 @@ set(GCRYPT_OPENSSL_SOURCES
     ecc-curves.c
     error.c
     global.c
+    kem.c
     memory.c
     misc.c
     mpi.c

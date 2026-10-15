@@ -9,6 +9,7 @@ set(GCRYPT_OPENSSL_TESTS
     test_memory
     test_sexp
     test_mpi
+    test_kem
 )
 
 # Tests of internal helpers link the static library so that symbols hidden
