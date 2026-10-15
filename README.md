@@ -1,20 +1,62 @@
 # gcrypt-openssl
 
-The gcrypt API, implemented using OpenSSL for the cryptography.
+The [Libgcrypt](https://gnupg.org/software/libgcrypt/) API, implemented on
+top of OpenSSL 4.
 
-The point is to let you use our own tuned or FIPS-certified OpenSSL with
-software that uses the gcrypt API.
+The point is to let software written against the gcrypt API use your own
+tuned or FIPS-certified OpenSSL instead. The library implements the complete
+public API of Libgcrypt 1.12 (every symbol of its `GCRYPT_1.6` version node)
+and can be built under the reference library's own name and soname
+(`libgcrypt.so.20`) so that existing binaries pick it up unchanged.
 
 This project was extruded by Claude. Use at your own risk.
+
+## How it is built
+
+- **No cryptography is implemented here.** Every primitive comes from
+  OpenSSL's EVP, BIGNUM, EC and RAND APIs, fetched from a private
+  `OSSL_LIB_CTX` that loads the system OpenSSL configuration (so a FIPS
+  provider configured there applies) and tries the legacy provider for the
+  old algorithms the gcrypt API exposes. Hand-written code is limited to
+  glue: S-expressions, MPI import/export formats, the OpenPGP S2K and
+  PBKDF1 iterated hashes, the three CRCs, ElGamal's modular arithmetic, and
+  the composition of modes OpenSSL has no single cipher for.
+- **No dependencies besides the C library, POSIX threads and OpenSSL 4.**
+  `gcrypt.h` embeds the subset of libgpg-error it needs (error types, every
+  `GPG_ERR_*` value, inline helpers); a real `<gpg-error.h>` included first
+  takes precedence.
+- **Clean room.** Upstream was read for behaviour only; the public header,
+  constants and S-expression formats are reproduced because they are the
+  API, the code is new. See [LICENSE](LICENSE).
+- "Secure memory" is OpenSSL's secure heap, so secure allocations are wiped
+  on free and `gcry_is_secure()` is an exact range check.
+
+## Support
+
+| Area | Supported | Not available |
+|------|-----------|---------------|
+| Ciphers | AES, Camellia, ARIA, SM4, 3DES, DES, CAST5, Blowfish, IDEA, RC2, SEED, RC4, ChaCha20; ECB, CBC (+CTS, +MAC), CFB, CFB8, OFB, CTR, GCM, CCM, OCB, XTS, SIV, GCM-SIV, AES key wrap (+padding), ChaCha20-Poly1305 | Twofish, Serpent, Salsa20, GOST 28147, SAFER; EAX mode |
+| Digests | MD4, MD5, SHA-1, SHA-2 (all), SHA-3, SHAKE, cSHAKE, RIPEMD-160, Whirlpool, BLAKE2b/s (all sizes), SM3, CRC32/CRC24; HMAC flag | Tiger, Haval, GOST R 34.11, Stribog, MD2 |
+| MACs | HMAC (all available digests), CMAC (available block ciphers), GMAC-AES, Poly1305 | Poly1305-cipher variants, GMAC for non-AES, GOST IMIT |
+| KDFs | S2K (all three), PBKDF2, scrypt, Argon2 (d/i/id), HKDF, one-step KDF (hash and HMAC), X9.63 | PBKDF1 (upstream also rejects it), Balloon |
+| Public key | RSA (PKCS#1 v1.5, PSS, OAEP, raw), DSA (incl. RFC 6979), ElGamal, ECDSA, ECDH, EdDSA (Ed25519, Ed448), X25519/X448; key generation, keygrips, curve queries | ECDSA on GOST curves, SM2/GOST signatures |
+| KEMs | ML-KEM-512/768/1024, raw X25519/X448 and Weierstrass KEMs, DHKEM (RFC 9180) | sntrup761, Classic McEliece |
+| Low-level EC | All `gcry_mpi_ec_*` operations on Weierstrass curves (NIST, Brainpool, secp256k1, SM2, GOST) | Point addition/doubling on Edwards curves |
+
+Unsupported algorithms report the error codes upstream uses for an unknown
+algorithm; names and sizes are still answered. The ECDSA/DSA nonce override
+(`gcry_pk_random_override_new`) is accepted but ignored, because OpenSSL does
+not allow injecting the nonce.
 
 ## Layout
 
 | Directory     | Contents                                                   |
 |---------------|------------------------------------------------------------|
-| `src/`        | Library sources; public headers in `src/include/`          |
-| `tests/`      | Unit tests, run via CTest                                  |
+| `src/`        | Library sources; public header `src/include/gcrypt.h`     |
+| `tests/`      | One test program per module with published test vectors   |
 | `benchmarks/` | Benchmark executables, built but not run automatically     |
-| `cmake/`      | CMake package-config template for `find_package()` support |
+| `cmake/`      | Package config, pkg-config and drop-in templates           |
+| `scripts/`    | `build-openssl.sh`, `check-exports.sh`                     |
 
 ## Building
 
@@ -24,8 +66,38 @@ Requires CMake 3.21+, a C99 compiler, and OpenSSL 4.x development files.
 cmake --preset default
 cmake --build --preset default
 ctest --preset default
-./build/benchmarks/bench_version
 ```
+
+Both `libgcrypt-openssl.so` and `libgcrypt-openssl.a` are built by default.
+Useful options:
+
+| Option                              | Default | Effect                          |
+|-------------------------------------|---------|---------------------------------|
+| `GCRYPT_OPENSSL_BUILD_SHARED`       | `ON`    | Build the shared library        |
+| `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
+| `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
+| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
+| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `OFF`   | Pass `-Werror`                  |
+| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`    |
+
+Consumers can `find_package(gcrypt-openssl)` after `cmake --install` and link
+against `gcrypt-openssl::shared` or `gcrypt-openssl::static`, or use the
+installed `gcrypt-openssl.pc`.
+
+### Drop-in replacement
+
+With `-DGCRYPT_OPENSSL_DROP_IN=ON` the install also contains
+`libgcrypt.so.20.8.9` (upstream's current version), `libgcrypt.pc` and a
+`libgcrypt-config` script. Programs built against the reference library run
+unchanged when the install's library directory is on their library path,
+for example:
+
+```sh
+LD_LIBRARY_PATH=/opt/gcrypt-openssl/lib64 gpg --version
+```
+
+Set `CMAKE_INSTALL_PREFIX` at configure time so the pkg-config file and the
+config script carry the right paths.
 
 ### OpenSSL 4
 
@@ -55,20 +127,6 @@ To avoid repeating the option, put it in an untracked `CMakeUserPresets.json`:
   ]
 }
 ```
-
-Both `libgcrypt-openssl.so` and `libgcrypt-openssl.a` are built by default.
-Useful options:
-
-| Option                              | Default | Effect                          |
-|-------------------------------------|---------|---------------------------------|
-| `GCRYPT_OPENSSL_BUILD_SHARED`       | `ON`    | Build the shared library        |
-| `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
-| `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
-| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
-| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `OFF`   | Pass `-Werror`                  |
-
-Consumers can `find_package(gcrypt-openssl)` after `cmake --install` and link
-against `gcrypt-openssl::shared` or `gcrypt-openssl::static`.
 
 ## Contributing
 

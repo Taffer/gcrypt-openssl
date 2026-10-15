@@ -5,3 +5,4 @@ MD013:
   code_blocks: false
   tables: false
 MD033: false   # allow inline HTML
+MD060: false  # table pipe alignment; wide tables are kept compact
