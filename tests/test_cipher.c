@@ -434,6 +434,17 @@ TEST(aes_ccm_rfc3610)
     ASSERT_MEM_EQ(pt, dec, 23);
     ASSERT_OK(gcry_cipher_checktag(hd, expect_tag, 8));
 
+    /* Decryption in several chunks. */
+    memset(dec, 0, sizeof dec);
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad, sizeof aad));
+    ASSERT_OK(gcry_cipher_decrypt(hd, dec, 10, ct, 10));
+    ASSERT_OK(gcry_cipher_decrypt(hd, dec + 10, 13, ct + 10, 13));
+    ASSERT_MEM_EQ(pt, dec, 23);
+    ASSERT_OK(gcry_cipher_checktag(hd, expect_tag, 8));
+
     ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
     ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
                               sizeof lengths));
@@ -536,6 +547,35 @@ TEST(aes_ocb_rfc7253)
     ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
     ASSERT_OK(gcry_cipher_decrypt(hd, out, 0, expect, 0));
     ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_checktag(hd, tag, 12));
+
+    /* The tag length is a handle setting: it survives a new key, and a
+     * multi-chunk message with a partial last block round-trips. */
+    {
+        int tl = 8;
+        unsigned char big[37];
+        unsigned char enc[37];
+        unsigned char dec[37];
+
+        memset(big, 0x5a, sizeof big);
+        ASSERT_OK(gcry_cipher_reset(hd));
+        ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_TAGLEN, &tl, sizeof tl));
+        ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
+        ASSERT_OK(gcry_cipher_info(hd, GCRYCTL_GET_TAGLEN, NULL, &taglen));
+        ASSERT_EQ(8, taglen);
+        ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+        ASSERT_OK(gcry_cipher_authenticate(hd, data, sizeof data));
+        ASSERT_OK(gcry_cipher_encrypt(hd, enc, 16, big, 16));
+        ASSERT_OK(gcry_cipher_final(hd));
+        ASSERT_OK(gcry_cipher_encrypt(hd, enc + 16, 21, big + 16, 21));
+        ASSERT_OK(gcry_cipher_gettag(hd, tag, 8));
+        ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+        ASSERT_OK(gcry_cipher_decrypt(hd, dec, 32, enc, 32));
+        ASSERT_OK(gcry_cipher_final(hd));
+        ASSERT_OK(gcry_cipher_decrypt(hd, dec + 32, 5, enc + 32, 5));
+        ASSERT_OK(gcry_cipher_authenticate(hd, data, sizeof data));
+        ASSERT_OK(gcry_cipher_checktag(hd, tag, 8));
+        ASSERT_MEM_EQ(big, dec, sizeof big);
+    }
 
     gcry_cipher_close(hd);
 }
