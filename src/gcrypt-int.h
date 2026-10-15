@@ -215,7 +215,203 @@ gcry_mpi_t _gcry_ecc_curve_param(const struct gcry_ecc_curve *curve,
                                  const char *name);
 EC_GROUP *_gcry_ecc_curve_group(const struct gcry_ecc_curve *curve);
 
+/* ---- pk-util.c --------------------------------------------------- */
+
+/* Flags collected from "(flags ...)" lists of keys and data. */
+#define PUBKEY_FLAG_NO_BLINDING (1 << 0)
+#define PUBKEY_FLAG_RFC6979 (1 << 1)
+#define PUBKEY_FLAG_FIXEDLEN (1 << 2)
+#define PUBKEY_FLAG_LEGACYRESULT (1 << 3)
+#define PUBKEY_FLAG_RAW_FLAG (1 << 4)
+#define PUBKEY_FLAG_TRANSIENT_KEY (1 << 5)
+#define PUBKEY_FLAG_USE_X931 (1 << 6)
+#define PUBKEY_FLAG_USE_FIPS186 (1 << 7)
+#define PUBKEY_FLAG_USE_FIPS186_2 (1 << 8)
+#define PUBKEY_FLAG_PARAM (1 << 9)
+#define PUBKEY_FLAG_COMP (1 << 10)
+#define PUBKEY_FLAG_NOCOMP (1 << 11)
+#define PUBKEY_FLAG_EDDSA (1 << 12)
+#define PUBKEY_FLAG_GOST (1 << 13)
+#define PUBKEY_FLAG_NO_KEYTEST (1 << 14)
+#define PUBKEY_FLAG_DJB_TWEAK (1 << 15)
+#define PUBKEY_FLAG_SM2 (1 << 16)
+#define PUBKEY_FLAG_PREHASH (1 << 17)
+#define PUBKEY_FLAG_NO_PREFIX (1 << 19)
+
+enum pk_encoding {
+    PUBKEY_ENC_RAW,
+    PUBKEY_ENC_PKCS1,
+    PUBKEY_ENC_PKCS1_RAW,
+    PUBKEY_ENC_OAEP,
+    PUBKEY_ENC_PSS,
+    PUBKEY_ENC_UNKNOWN
+};
+
+enum pk_operation {
+    PUBKEY_OP_ENCRYPT,
+    PUBKEY_OP_DECRYPT,
+    PUBKEY_OP_SIGN,
+    PUBKEY_OP_VERIFY
+};
+
+/* The parsed form of a "(data ...)" S-expression. */
+struct pk_data {
+    enum pk_operation op;
+    unsigned int nbits;        /* Key size, for the encodings that need it. */
+    enum pk_encoding encoding;
+    int flags;                 /* PUBKEY_FLAG_* (data and key flags). */
+    int hash_algo;             /* GCRY_MD_* or 0. */
+    unsigned char *value;      /* Digest or message bytes, or NULL. */
+    size_t valuelen;
+    int value_is_hash;         /* VALUE came from a (hash ...) element. */
+    gcry_mpi_t mpi;            /* Numeric value for raw operations. */
+    unsigned char *label;
+    size_t labellen;
+    unsigned int saltlen;      /* PSS salt length. */
+    unsigned char *rnd;        /* random-override, ignored but parsed. */
+    size_t rndlen;
+};
+
+void _gcry_pk_data_init(struct pk_data *pd, enum pk_operation op,
+                        unsigned int nbits);
+void _gcry_pk_data_free(struct pk_data *pd);
+gcry_err_code_t _gcry_pk_data_parse(gcry_sexp_t input, struct pk_data *pd);
+gcry_err_code_t _gcry_pk_util_parse_flaglist(gcry_sexp_t list, int *r_flags,
+                                             enum pk_encoding *r_encoding);
+gcry_err_code_t _gcry_pk_util_get_nbits(gcry_sexp_t list,
+                                        unsigned int *r_nbits);
+gcry_err_code_t _gcry_pk_util_get_rsa_use_e(gcry_sexp_t list,
+                                            unsigned long *r_e);
+gcry_err_code_t _gcry_pk_util_preparse_sigval(gcry_sexp_t s_sig,
+                                              const char *const *algo_names,
+                                              gcry_sexp_t *r_parms,
+                                              int *r_eccflags);
+gcry_err_code_t _gcry_pk_util_preparse_encval(gcry_sexp_t sexp,
+                                              const char *const *algo_names,
+                                              gcry_sexp_t *r_parms,
+                                              struct pk_data *pd);
+int _gcry_pk_util_hash_algo_from_name(const char *s, size_t n);
+
+/* Digest helpers for the public key code.  They talk to OpenSSL directly
+ * so that this module does not depend on the md module. */
+const char *_gcry_pk_md_openssl_name(int algo);
+const char *_gcry_pk_md_gcry_name(int algo);
+unsigned int _gcry_pk_md_dlen(int algo);
+gcry_err_code_t _gcry_pk_md_hash(int algo, const void *data, size_t len,
+                                 unsigned char *out, size_t outlen);
+
+/* Byte string helpers. */
+gcry_err_code_t _gcry_pk_mpi_to_fixed(gcry_mpi_t a, unsigned char *buf,
+                                      size_t len);
+gcry_err_code_t _gcry_pk_mpi_to_bytes(gcry_mpi_t a, unsigned char **r_buf,
+                                      size_t *r_len);
+gcry_err_code_t _gcry_pk_bn_to_fixed(const BIGNUM *bn, unsigned char *buf,
+                                     size_t len);
+gcry_mpi_t _gcry_pk_mpi_from_bn(const BIGNUM *bn);
+gcry_err_code_t _gcry_pk_rs_from_der(const unsigned char *der, size_t derlen,
+                                     int is_ecdsa, gcry_mpi_t *r_r,
+                                     gcry_mpi_t *r_s);
+gcry_err_code_t _gcry_pk_rs_to_der(gcry_mpi_t r, gcry_mpi_t s, int is_ecdsa,
+                                   unsigned char **r_der, size_t *r_derlen);
+
+/* ---- pk.c -------------------------------------------------------- */
+
+struct gcry_pk_spec {
+    int algo;
+    int fips;                  /* Allowed in FIPS mode. */
+    unsigned int use;          /* GCRY_PK_USAGE_* bits. */
+    const char *name;
+    const char *const *aliases;
+    const char *elements_pkey;
+    const char *elements_skey;
+    const char *elements_enc;
+    const char *elements_sig;
+    const char *elements_grip; /* NULL if no keygrip. */
+    gcry_err_code_t (*generate)(gcry_sexp_t genparms, gcry_sexp_t *r_skey);
+    gcry_err_code_t (*check_secret_key)(gcry_sexp_t keyparms);
+    gcry_err_code_t (*encrypt)(gcry_sexp_t *r_ciph, gcry_sexp_t s_data,
+                               gcry_sexp_t keyparms);
+    gcry_err_code_t (*decrypt)(gcry_sexp_t *r_plain, gcry_sexp_t s_data,
+                               gcry_sexp_t keyparms);
+    gcry_err_code_t (*sign)(gcry_sexp_t *r_sig, gcry_sexp_t s_data,
+                            gcry_sexp_t keyparms);
+    gcry_err_code_t (*verify)(gcry_sexp_t s_sig, gcry_sexp_t s_data,
+                              gcry_sexp_t keyparms);
+    unsigned int (*get_nbits)(gcry_sexp_t keyparms);
+    /* Algorithm specific keygrip: feed the parameters into MD. */
+    gcry_err_code_t (*comp_keygrip)(EVP_MD_CTX *md, gcry_sexp_t keyparms);
+    const char *(*get_curve)(gcry_sexp_t keyparms, int iterator,
+                             unsigned int *r_nbits);
+    gcry_sexp_t (*get_curve_param)(const char *name);
+};
+
+extern const struct gcry_pk_spec _gcry_pubkey_spec_rsa;
+extern const struct gcry_pk_spec _gcry_pubkey_spec_dsa;
+extern const struct gcry_pk_spec _gcry_pubkey_spec_elg;
+extern const struct gcry_pk_spec _gcry_pubkey_spec_ecc;
+
 /* ---- mpi-ec.c ---------------------------------------------------- */
+
+/* An elliptic curve context: curve description plus an optional key. */
+struct gcry_mpi_ec_ctx {
+    enum gcry_ecc_models model;
+    enum gcry_ecc_dialects dialect;
+    int flags;                 /* PUBKEY_FLAG_EDDSA, _DJB_TWEAK, ... */
+    unsigned int nbits;
+    const struct gcry_ecc_curve *curve; /* NULL for unknown curves. */
+    const char *name;          /* Curve name or NULL. */
+    EC_GROUP *group;           /* Weierstrass curves only. */
+    gcry_mpi_t p;
+    gcry_mpi_t a;
+    gcry_mpi_t b;
+    gcry_mpi_point_t G;
+    gcry_mpi_t n;
+    unsigned int h;
+    gcry_mpi_point_t Q;        /* Public key, may be NULL. */
+    gcry_mpi_t d;              /* Secret key, may be NULL. */
+};
+typedef struct gcry_mpi_ec_ctx *mpi_ec_t;
+
+gcry_err_code_t _gcry_mpi_ec_internal_new(mpi_ec_t *r_ec, int *r_flags,
+                                          gcry_sexp_t keyparam,
+                                          const char *curvename);
+void _gcry_mpi_ec_free(mpi_ec_t ec);
+int _gcry_mpi_ec_affine(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_point_t point,
+                        mpi_ec_t ec);
+gcry_err_code_t _gcry_mpi_ec_mul(gcry_mpi_point_t w, gcry_mpi_t n,
+                                 gcry_mpi_point_t u, mpi_ec_t ec);
+int _gcry_mpi_ec_on_curve(gcry_mpi_point_t point, mpi_ec_t ec);
+gcry_err_code_t _gcry_ecc_decode_point(gcry_mpi_point_t result,
+                                       gcry_mpi_t value, mpi_ec_t ec);
+gcry_err_code_t _gcry_ecc_compute_public(mpi_ec_t ec);
+gcry_mpi_t _gcry_ecc_ec2os(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_t p);
+gcry_mpi_t _gcry_mpi_ec_ec2os(gcry_mpi_point_t point, mpi_ec_t ec);
+gcry_err_code_t _gcry_ecc_eddsa_encode_x_y(gcry_mpi_t x, gcry_mpi_t y,
+                                           unsigned int nbits, int with_prefix,
+                                           unsigned char **r_buf,
+                                           unsigned int *r_len);
+gcry_err_code_t _gcry_ecc_eddsa_encodepoint(gcry_mpi_point_t point,
+                                            mpi_ec_t ec, int with_prefix,
+                                            unsigned char **r_buf,
+                                            unsigned int *r_len);
+gcry_err_code_t _gcry_ecc_eddsa_compact(gcry_mpi_t value, unsigned int nbits,
+                                        unsigned char **r_buf,
+                                        unsigned int *r_len);
+gcry_err_code_t _gcry_ecc_mont_encodepoint(gcry_mpi_t x, unsigned int nbits,
+                                           int with_prefix,
+                                           unsigned char **r_buf,
+                                           unsigned int *r_len);
+gcry_err_code_t _gcry_ecc_mont_decode_u(gcry_mpi_t value, unsigned int nbits,
+                                        unsigned char *out);
+gcry_err_code_t _gcry_ecc_eddsa_seed(mpi_ec_t ec, unsigned char **r_seed,
+                                     size_t *r_len);
+gcry_err_code_t _gcry_ecc_mont_scalar(gcry_mpi_t d, unsigned int nbits,
+                                      unsigned char **r_buf, size_t *r_len);
+EVP_PKEY *_gcry_ecc_evp_key(mpi_ec_t ec, int want_private,
+                            gcry_err_code_t *r_rc);
+gcry_err_code_t _gcry_pk_ecc_get_sexp(gcry_sexp_t *r_sexp, int mode,
+                                      mpi_ec_t ec);
+mpi_ec_t _gcry_ctx_get_ec(gcry_ctx_t ctx);
 
 void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,
                         gcry_ctx_t ctx);
