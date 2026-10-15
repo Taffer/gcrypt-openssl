@@ -21,16 +21,67 @@
     (GCRYMPI_FLAG_USER1 | GCRYMPI_FLAG_USER2 | GCRYMPI_FLAG_USER3 \
      | GCRYMPI_FLAG_USER4)
 
+/* One BN_CTX per thread.  Every arithmetic entry point needs a context
+ * and allocating one per call costs more than many of the operations
+ * themselves; OpenSSL's BN_CTX_start/end nesting makes sharing safe even
+ * when one of our functions calls another. */
+static pthread_once_t ctx_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t ctx_key;
+static int ctx_key_ok;
+
+static void
+ctx_destroy(void *p)
+{
+    BN_CTX_free(p);
+}
+
+static void
+ctx_key_init(void)
+{
+    ctx_key_ok = pthread_key_create(&ctx_key, ctx_destroy) == 0;
+}
+
 static BN_CTX *
 new_ctx(void)
 {
-    BN_CTX *ctx = BN_CTX_new_ex(_gcry_libctx());
+    BN_CTX *ctx = NULL;
+
+    pthread_once(&ctx_key_once, ctx_key_init);
+
+    if (ctx_key_ok) {
+        ctx = pthread_getspecific(ctx_key);
+
+        if (ctx) {
+            return ctx;
+        }
+
+        ctx = BN_CTX_new_ex(_gcry_libctx());
+
+        if (ctx && pthread_setspecific(ctx_key, ctx) == 0) {
+            return ctx;
+        }
+    }
+
+    if (!ctx) {
+        ctx = BN_CTX_new_ex(_gcry_libctx());
+    }
 
     if (!ctx) {
         _gcry_fatal_error(GPG_ERR_ENOMEM, NULL);
     }
 
     return ctx;
+}
+
+/* Counterpart of new_ctx(): the per-thread context is kept. */
+static void
+release_ctx(BN_CTX *ctx)
+{
+    if (ctx_key_ok && pthread_getspecific(ctx_key) == ctx) {
+        return;
+    }
+
+    BN_CTX_free(ctx);
 }
 
 static void
@@ -693,6 +744,41 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
         int extra = 0;
         size_t prefix = format == GCRYMPI_FMT_SSH ? 4 : 0;
 
+        if (!negative) {
+            /* Common case: the magnitude is the encoding, with a leading
+             * zero if the top bit is set; write it straight out. */
+            n = (unsigned int)BN_num_bytes(a->bn);
+            extra = (n && BN_num_bits(a->bn) % 8 == 0) ? 1 : 0;
+
+            if (buffer && n + (unsigned int)extra + prefix > buflen) {
+                return GPG_ERR_TOO_SHORT;
+            }
+
+            if (buffer) {
+                unsigned char *s = buffer;
+                unsigned int total = n + (unsigned int)extra;
+
+                if (prefix) {
+                    s[0] = (unsigned char)(total >> 24);
+                    s[1] = (unsigned char)(total >> 16);
+                    s[2] = (unsigned char)(total >> 8);
+                    s[3] = (unsigned char)total;
+                    s += 4;
+                }
+
+                if (extra) {
+                    *s++ = 0;
+                }
+
+                if (n) {
+                    BN_bn2bin(a->bn, s);
+                }
+            }
+
+            *nwritten = n + (unsigned int)extra + prefix;
+            return 0;
+        }
+
         tmp = _gcry_mpi_get_buffer(a, 0, &n, NULL);
 
         if (!tmp) {
@@ -975,7 +1061,7 @@ gcry_mpi_addm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
         bn_fail("BN_mod_add failed");
     }
 
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 void
@@ -1019,7 +1105,7 @@ gcry_mpi_subm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
         bn_fail("BN_mod_sub failed");
     }
 
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 void
@@ -1035,7 +1121,7 @@ gcry_mpi_mul(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
         bn_fail("BN_mul failed");
     }
 
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 void
@@ -1068,7 +1154,7 @@ gcry_mpi_mulm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
         bn_fail("BN_mod_mul failed");
     }
 
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 void
@@ -1137,7 +1223,7 @@ gcry_mpi_div(gcry_mpi_t q, gcry_mpi_t r, gcry_mpi_t dividend,
     }
 
     BN_CTX_end(ctx);
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 void
@@ -1161,7 +1247,7 @@ gcry_mpi_powm(gcry_mpi_t w, const gcry_mpi_t b, const gcry_mpi_t e,
         bn_fail("BN_mod_exp failed");
     }
 
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 }
 
 int
@@ -1196,7 +1282,7 @@ gcry_mpi_gcd(gcry_mpi_t g, gcry_mpi_t a, gcry_mpi_t b)
 
     rc = BN_is_one(g->bn);
     BN_CTX_end(ctx);
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
     return rc;
 }
 
@@ -1214,7 +1300,7 @@ gcry_mpi_invm(gcry_mpi_t x, gcry_mpi_t a, gcry_mpi_t m)
     free_opaque(x);
     ctx = new_ctx();
     res = BN_mod_inverse(x->bn, _gcry_mpi_bn(a), _gcry_mpi_bn(m), ctx);
-    BN_CTX_free(ctx);
+    release_ctx(ctx);
 
     if (!res) {
         ERR_clear_error();

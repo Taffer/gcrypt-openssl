@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/bn.h>
+
 typedef unsigned short DATALEN;
 
 #define ST_STOP 0
@@ -32,9 +34,35 @@ typedef unsigned short DATALEN;
 
 #define TOKEN_SPECIALS "-./_:*+="
 
-static const char tokenchars[] = "abcdefghijklmnopqrstuvwxyz"
-                                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                 "0123456789-./_:*+=";
+/* Is C one of the characters allowed in an unquoted token: a letter, a
+ * digit or one of TOKEN_SPECIALS?  A range test instead of strchr() on a
+ * character table, since this runs for every input byte.  Like the
+ * reference implementation's strchr() test, a NUL byte counts as a token
+ * character (it matches the table's terminator there). */
+static int
+tokencharp(int c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')) {
+        return 1;
+    }
+
+    switch (c) {
+    case 0:
+    case '-':
+    case '.':
+    case '/':
+    case '_':
+    case ':':
+    case '*':
+    case '+':
+    case '=':
+        return 1;
+
+    default:
+        return 0;
+    }
+}
 
 static int
 whitespacep(const char *p)
@@ -203,7 +231,13 @@ make_space(struct builder *c, size_t n)
 
     if (used + n + sizeof(DATALEN) + 1 >= c->allocated) {
         gcry_sexp_t newsexp;
-        size_t newsize = c->allocated + 2 * (n + sizeof(DATALEN) + 1);
+        size_t need = n + sizeof(DATALEN) + 1;
+        size_t newsize = c->allocated + 2 * need;
+
+        /* Grow geometrically so that long inputs do not realloc per item. */
+        if (newsize < 2 * c->allocated) {
+            newsize = 2 * c->allocated;
+        }
 
         if (newsize <= c->allocated) {
             return GPG_ERR_TOO_LARGE;
@@ -497,7 +531,9 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
         goto leave;                         \
     } while (0)
 
-    c.allocated = length + sizeof(DATALEN);
+    /* Canonical "L:" prefixes shrink to the 3 byte ST_DATA header but a
+     * single digit length grows by one, so start with some slack. */
+    c.allocated = length + length / 4 + 64;
     c.sexp = alloc_sexp(sizeof * c.sexp + c.allocated - 1,
                         length && _gcry_is_secure(buffer));
 
@@ -511,7 +547,7 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
 
     for (p = buffer, n = length; n; p++, n--) {
         if (tokenp && !hexfmt) {
-            if (strchr(tokenchars, *p)) {
+            if (tokencharp((unsigned char) * p)) {
                 continue;
             }
 
@@ -699,12 +735,23 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
             if (digitp(p)) {
                 ;
             } else if (*p == ':') {
-                char *endptr;
+                const char *d;
 
-                datalen = strtoul(digptr, &endptr, 10);
+                /* All characters from DIGPTR to P are known to be digits;
+                 * anything beyond MAX_DATALEN is rejected while adding. */
+                datalen = 0;
+
+                for (d = digptr; d < p; d++) {
+                    datalen = datalen * 10 + (size_t)(*d - '0');
+
+                    if (datalen > MAX_DATALEN) {
+                        break;
+                    }
+                }
+
                 digptr = NULL;
 
-                if (endptr != p || datalen > MAX_DATALEN) {
+                if (datalen > MAX_DATALEN) {
                     FAIL(GPG_ERR_INV_ARG);
                 }
 
@@ -773,11 +820,12 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
                         goto leave;
                     }
 
-                    err = _gcry_mpi_print(mpifmt, NULL, 0, &nm, m);
+                    unsigned char *lenpos;
 
-                    if (err) {
-                        goto leave;
-                    }
+                    /* STD needs at most one byte more than the magnitude
+                     * for the sign; reserve that and print straight into
+                     * the buffer instead of measuring with a dry run. */
+                    nm = (size_t)BN_num_bytes(_gcry_mpi_bn(m)) + 1;
 
                     if (nm > MAX_DATALEN) {
                         FAIL(GPG_ERR_INV_ARG);
@@ -794,7 +842,7 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
                     }
 
                     *c.pos++ = ST_DATA;
-                    put_len(c.pos, nm);
+                    lenpos = c.pos;
                     c.pos += sizeof(DATALEN);
                     err = _gcry_mpi_print(mpifmt, c.pos, nm, &nm, m);
 
@@ -802,6 +850,7 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
                         goto leave;
                     }
 
+                    put_len(lenpos, nm);
                     c.pos += nm;
                 }
             } else if (*p == 's') {
@@ -942,7 +991,7 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
             }
 
             digptr = p;
-        } else if (strchr(tokenchars, *p)) {
+        } else if (tokencharp((unsigned char) * p)) {
             tokenp = p;
         } else if (whitespacep(p)) {
             ;
@@ -2122,6 +2171,76 @@ gcry_sexp_canon_len(const unsigned char *buffer, size_t length,
 /* Parameter extraction                                                */
 /* ------------------------------------------------------------------ */
 
+/* Find the first sublist in [START, END) whose first element is TOK and
+ * return a pointer to its ST_OPEN byte, or NULL.  END may be NULL to scan
+ * up to the ST_STOP marker.  Same search as gcry_sexp_find_token, without
+ * copying the result. */
+static const unsigned char *
+find_token_in(const unsigned char *start, const unsigned char *end,
+              const char *tok, size_t toklen)
+{
+    const unsigned char *p = start;
+
+    while ((!end || p < end) && *p != ST_STOP) {
+        if (*p == ST_OPEN && p[1] == ST_DATA) {
+            DATALEN n = get_len(p + 2);
+            const unsigned char *data = p + 2 + sizeof(DATALEN);
+
+            if (n == toklen && !memcmp(data, tok, toklen)) {
+                return p;
+            }
+
+            p = data + n;
+        } else if (*p == ST_DATA) {
+            p += 1 + sizeof(DATALEN) + get_len(p + 1);
+        } else {
+            p++;
+        }
+    }
+
+    return NULL;
+}
+
+/* The data element following the token of the sublist at HEAD, or NULL
+ * when there is none or it is itself a list. */
+static const unsigned char *
+list_value_at(const unsigned char *head, size_t *r_len)
+{
+    const unsigned char *p = skip_item(head + 1);
+
+    *r_len = 0;
+
+    if (*p != ST_DATA) {
+        return NULL;
+    }
+
+    *r_len = get_len(p + 1);
+    return p + 1 + sizeof(DATALEN);
+}
+
+/* Copy N bytes into a fresh buffer with an extra NUL, NULL if N is 0. */
+static char *
+copy_value_string(const unsigned char *s, size_t n, int secure)
+{
+    char *buf;
+
+    if (!s || n < 1) {
+        return NULL;
+    }
+
+    buf = secure ? _gcry_malloc_secure(n + 1) : _gcry_malloc(n + 1);
+
+    if (!buf) {
+        return NULL;
+    }
+
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    return buf;
+}
+
+static const unsigned char empty_list[1] = { ST_STOP };
+
 gcry_err_code_t
 _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                           const char *list, va_list arg_ptr)
@@ -2132,12 +2251,13 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
     void **array[20];
     char arrayisdesc[20];
     int idx;
-    int i;
-    gcry_sexp_t l1 = NULL;
     int mode = '+';
     int submode = 0;
-    gcry_sexp_t freethis = NULL;
     char *tmpstr = NULL;
+    const unsigned char *scope;      /* Where to look for list tokens. */
+    const unsigned char *scope_end;  /* NULL: up to ST_STOP. */
+    const unsigned char *head;       /* The matching sublist. */
+    int secure;
 
     /* arrayisdesc: 0 MPI, 1 caller buffer, 2 our buffer, 's' string,
      * 'x' plain integer (nothing to free). */
@@ -2192,7 +2312,13 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         return GPG_ERR_INV_ARG;
     }
 
-    /* Follow PATH. */
+    /* A NULL list simply contains nothing, as gcry_sexp_find_token has it. */
+    secure = sexp ? _gcry_is_secure(sexp) : 0;
+    scope = sexp ? sexp->d : empty_list;
+    scope_end = NULL;
+
+    /* Follow PATH, narrowing the scope to the matching sublist each time
+     * instead of copying it. */
     while (path && *path) {
         size_t n;
 
@@ -2204,17 +2330,15 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         }
 
         n = s ? (size_t)(s - path) : 0;
-        l1 = gcry_sexp_find_token(sexp, path, n);
+        head = find_token_in(scope, scope_end, path, n ? n : strlen(path));
 
-        if (!l1) {
+        if (!head) {
             rc = GPG_ERR_NOT_FOUND;
             goto cleanup;
         }
 
-        sexp = l1;
-        l1 = NULL;
-        gcry_sexp_release(freethis);
-        freethis = sexp;
+        scope = head;
+        scope_end = skip_item(head);
 
         if (n) {
             path += n + 1;
@@ -2256,6 +2380,9 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         } else if (*s == '?') {
             ;
         } else {
+            const unsigned char *val;
+            size_t vlen;
+
             if (*s == '\'') {
                 s++;
                 s2 = strchr(s, '\'');
@@ -2265,13 +2392,13 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     goto cleanup;
                 }
 
-                l1 = gcry_sexp_find_token(sexp, s, (size_t)(s2 - s));
+                head = find_token_in(scope, scope_end, s, (size_t)(s2 - s));
                 s = s2;
             } else {
-                l1 = gcry_sexp_find_token(sexp, s, 1);
+                head = find_token_in(scope, scope_end, s, 1);
             }
 
-            if (!l1 && s[1] == '?') {
+            if (!head && s[1] == '?') {
                 /* Optional element missing: leave a well defined value. */
                 if (mode == '&') {
                     gcry_buffer_t *spec = (gcry_buffer_t *)array[idx];
@@ -2306,59 +2433,56 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                 } else {
                     *array[idx] = NULL;
                 }
-            } else if (!l1) {
+            } else if (!head) {
                 rc = GPG_ERR_NO_OBJ;
                 goto cleanup;
             } else {
+                val = list_value_at(head, &vlen);
+
                 if (mode == '&') {
                     gcry_buffer_t *spec = (gcry_buffer_t *)array[idx];
 
+                    if (!val || !vlen) {
+                        rc = GPG_ERR_INV_OBJ;
+                        goto cleanup;
+                    }
+
                     if (spec->data) {
-                        const char *pbuf;
-                        size_t nbuf;
-
-                        pbuf = gcry_sexp_nth_data(l1, 1, &nbuf);
-
-                        if (!pbuf || !nbuf) {
-                            rc = GPG_ERR_INV_OBJ;
-                            goto cleanup;
-                        }
-
-                        if (spec->off + nbuf > spec->size) {
+                        if (spec->off + vlen > spec->size) {
                             rc = GPG_ERR_BUFFER_TOO_SHORT;
                             goto cleanup;
                         }
 
-                        memcpy((char *)spec->data + spec->off, pbuf, nbuf);
-                        spec->len = nbuf;
+                        memcpy((char *)spec->data + spec->off, val, vlen);
+                        spec->len = vlen;
                         arrayisdesc[idx] = 1;
                     } else {
-                        spec->data = gcry_sexp_nth_buffer(l1, 1, &spec->size);
+                        spec->data = secure ? _gcry_malloc_secure(vlen)
+                                     : _gcry_malloc(vlen);
 
                         if (!spec->data) {
                             rc = GPG_ERR_INV_OBJ;
                             goto cleanup;
                         }
 
-                        spec->len = spec->size;
+                        memcpy(spec->data, val, vlen);
+                        spec->size = vlen;
+                        spec->len = vlen;
                         spec->off = 0;
                         arrayisdesc[idx] = 2;
                     }
                 } else if (mode == 's') {
                     if (submode == '#') {
+                        /* All values of the list, space separated. */
                         size_t needed = 0;
-                        size_t n;
-                        int l1len = gcry_sexp_length(l1);
+                        const unsigned char *q;
                         char *p;
 
-                        for (i = 1; i < l1len; i++) {
-                            s2 = gcry_sexp_nth_data(l1, i, &n);
-
-                            if (!s2) {
-                                n = 2; /* A sublist is rendered as "()". */
-                            }
-
-                            needed += n + 1;
+                        for (q = skip_item(head + 1);
+                             *q != ST_CLOSE && *q != ST_STOP;
+                             q = skip_item(q)) {
+                            needed += (*q == ST_DATA ? get_len(q + 1) : 2u)
+                                      + 1;
                         }
 
                         if (!needed) {
@@ -2368,13 +2492,16 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                                 *p = 0;
                             }
                         } else if ((*array[idx] = p = _gcry_malloc(needed))) {
-                            for (i = 1; i < l1len; i++) {
-                                s2 = gcry_sexp_nth_data(l1, i, &n);
+                            for (q = skip_item(head + 1);
+                                 *q != ST_CLOSE && *q != ST_STOP;
+                                 q = skip_item(q)) {
+                                size_t n;
 
-                                if (!s2) {
-                                    memcpy(p, "()", (n = 2));
+                                if (*q == ST_DATA) {
+                                    n = get_len(q + 1);
+                                    memcpy(p, q + 1 + sizeof(DATALEN), n);
                                 } else {
-                                    memcpy(p, s2, n);
+                                    memcpy(p, "()", (n = 2));
                                 }
 
                                 p[n] = ' ';
@@ -2386,7 +2513,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                             }
                         }
                     } else {
-                        *array[idx] = gcry_sexp_nth_string(l1, 1);
+                        *array[idx] = copy_value_string(val, vlen, secure);
                     }
 
                     if (!*array[idx]) {
@@ -2399,7 +2526,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     long along;
 
                     _gcry_free(tmpstr);
-                    tmpstr = gcry_sexp_nth_string(l1, 1);
+                    tmpstr = copy_value_string(val, vlen, secure);
 
                     if (!tmpstr) {
                         rc = _gcry_err_code_from_syserror();
@@ -2419,7 +2546,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     unsigned long aulong;
 
                     _gcry_free(tmpstr);
-                    tmpstr = gcry_sexp_nth_string(l1, 1);
+                    tmpstr = copy_value_string(val, vlen, secure);
 
                     if (!tmpstr) {
                         rc = _gcry_err_code_from_syserror();
@@ -2437,26 +2564,50 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     }
 
                     arrayisdesc[idx] = 'x';
-                } else {
-                    if (mode == '/') {
-                        *array[idx] = gcry_sexp_nth_mpi(l1, 1,
-                                                        GCRYMPI_FMT_OPAQUE);
-                    } else if (mode == '-') {
-                        *array[idx] = gcry_sexp_nth_mpi(l1, 1,
-                                                        GCRYMPI_FMT_STD);
-                    } else {
-                        *array[idx] = gcry_sexp_nth_mpi(l1, 1,
-                                                        GCRYMPI_FMT_USG);
+                } else if (mode == '/') {
+                    /* Opaque: a private copy of the raw bytes. */
+                    void *buf = NULL;
+                    gcry_mpi_t a = NULL;
+
+                    if (val && vlen) {
+                        buf = secure ? _gcry_malloc_secure(vlen)
+                              : _gcry_malloc(vlen);
                     }
 
-                    if (!*array[idx]) {
+                    if (buf) {
+                        memcpy(buf, val, vlen);
+                        a = secure ? gcry_mpi_snew(0) : gcry_mpi_new(0);
+
+                        if (a) {
+                            gcry_mpi_set_opaque(a, buf,
+                                                (unsigned int)(vlen * 8));
+                        } else {
+                            _gcry_free(buf);
+                        }
+                    }
+
+                    *array[idx] = a;
+
+                    if (!a) {
+                        rc = GPG_ERR_INV_OBJ;
+                        goto cleanup;
+                    }
+                } else {
+                    gcry_mpi_t a = NULL;
+                    enum gcry_mpi_format fmt = mode == '-' ? GCRYMPI_FMT_STD
+                                               : GCRYMPI_FMT_USG;
+
+                    if (!val || _gcry_mpi_scan(&a, fmt, val, vlen, NULL)) {
+                        a = NULL;
+                    }
+
+                    *array[idx] = a;
+
+                    if (!a) {
                         rc = GPG_ERR_INV_OBJ;
                         goto cleanup;
                     }
                 }
-
-                gcry_sexp_release(l1);
-                l1 = NULL;
             }
 
             idx++;
@@ -2464,13 +2615,10 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
     }
 
     _gcry_free(tmpstr);
-    gcry_sexp_release(freethis);
     return 0;
 
 cleanup:
     _gcry_free(tmpstr);
-    gcry_sexp_release(freethis);
-    gcry_sexp_release(l1);
 
     while (idx--) {
         if (!arrayisdesc[idx]) {
