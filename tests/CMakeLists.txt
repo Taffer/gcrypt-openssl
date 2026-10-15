@@ -11,6 +11,10 @@ set(GCRYPT_OPENSSL_TESTS
     test_mpi
 )
 
+# Tests of internal helpers link the static library so that symbols hidden
+# from the shared library's export list are reachable.
+set(GCRYPT_OPENSSL_INTERNAL_TESTS test_curves)
+
 foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
     add_executable(${test} ${test}.c)
     target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -19,6 +23,18 @@ foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
     )
     add_test(NAME ${test} COMMAND ${test})
 endforeach()
+
+if(GCRYPT_OPENSSL_BUILD_STATIC)
+    foreach(test IN LISTS GCRYPT_OPENSSL_INTERNAL_TESTS)
+        add_executable(${test} ${test}.c)
+        target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(${test} PRIVATE _POSIX_C_SOURCE=200809L)
+        target_link_libraries(
+            ${test} PRIVATE gcrypt-openssl::static gcrypt-openssl::warnings
+        )
+        add_test(NAME ${test} COMMAND ${test})
+    endforeach()
+endif()
 
 # Also exercise the static library if it was built, so both flavours are
 # known to link and run.

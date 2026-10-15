@@ -172,6 +172,49 @@ void _gcry_mpi_set_buffer(gcry_mpi_t a, const void *buffer,
                           unsigned int nbytes, int sign);
 void _gcry_mpi_immutable_failed(void);
 
+/* ---- ecc-curves.c ------------------------------------------------ */
+
+#include <openssl/ec.h>
+
+enum gcry_ecc_models {
+    GCRY_ECC_MODEL_WEIERSTRASS = 0,
+    GCRY_ECC_MODEL_MONTGOMERY,
+    GCRY_ECC_MODEL_EDWARDS
+};
+
+enum gcry_ecc_dialects {
+    GCRY_ECC_DIALECT_STANDARD = 0,
+    GCRY_ECC_DIALECT_ED25519,
+    GCRY_ECC_DIALECT_SAFECURVE
+};
+
+struct gcry_ecc_curve {
+    const char *name;        /* Canonical gcrypt name, e.g. "NIST P-256". */
+    unsigned int nbits;      /* Size of the field in bits. */
+    int fips;                /* Allowed in FIPS mode. */
+    enum gcry_ecc_models model;
+    enum gcry_ecc_dialects dialect;
+    int nid;                 /* OpenSSL NID, or NID_undef. */
+    const char *keytype;     /* OpenSSL EVP_PKEY type name for non-Weierstrass
+                              * curves ("X25519", "ED25519", ...), else NULL. */
+    const char *p;           /* Domain parameters as hex strings. */
+    const char *a;
+    const char *b;
+    const char *n;
+    const char *gx;
+    const char *gy;
+    unsigned int h;          /* Cofactor. */
+};
+
+size_t _gcry_ecc_curve_count(void);
+const struct gcry_ecc_curve *_gcry_ecc_curve_by_index(size_t idx);
+const struct gcry_ecc_curve *_gcry_ecc_curve_find(const char *name);
+const struct gcry_ecc_curve *_gcry_ecc_curve_by_nbits(unsigned int nbits);
+const struct gcry_ecc_curve *_gcry_ecc_curve_from_group(const EC_GROUP *g);
+gcry_mpi_t _gcry_ecc_curve_param(const struct gcry_ecc_curve *curve,
+                                 const char *name);
+EC_GROUP *_gcry_ecc_curve_group(const struct gcry_ecc_curve *curve);
+
 /* ---- mpi-ec.c ---------------------------------------------------- */
 
 void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,

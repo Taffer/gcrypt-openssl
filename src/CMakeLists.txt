@@ -2,6 +2,7 @@
 # Library sources. Everything that goes into libgcrypt-openssl lives here.
 # ---------------------------------------------------------------------------
 set(GCRYPT_OPENSSL_SOURCES
+    ecc-curves.c
     error.c
     global.c
     memory.c
