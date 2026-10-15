@@ -10,6 +10,7 @@
 # Linker output
 *.ilk
 *.map
+!src/libgcrypt.map
 *.exp
 
 # Precompiled Headers
