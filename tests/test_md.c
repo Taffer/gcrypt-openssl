@@ -307,6 +307,54 @@ TEST(crc)
     CHECK(GCRY_MD_CRC24_RFC2440, "123456789", "21cf02");
     ASSERT_TRUE(check_million_a(GCRY_MD_CRC24_RFC2440, "a5cb6b"));
     ASSERT_TRUE(check_million_a(GCRY_MD_CRC32_RFC1510, "ce5c7422"));
+
+    /* Chunked and unaligned writes must agree with a single write, which
+     * exercises the head, wide and tail loops of the table-driven CRCs. */
+    {
+        static const int algos[] = { GCRY_MD_CRC32, GCRY_MD_CRC32_RFC1510,
+                                     GCRY_MD_CRC24_RFC2440
+                                   };
+        static const size_t chunks[] = { 1, 3, 7, 8, 13, 64, 1000 };
+        unsigned char data[1000 + 8];
+        size_t i;
+        size_t j;
+
+        for (i = 0; i < sizeof data; i++) {
+            data[i] = (unsigned char)(i * 131 + 7);
+        }
+
+        for (i = 0; i < sizeof algos / sizeof algos[0]; i++) {
+            unsigned char want[4];
+            gcry_md_hd_t hd;
+            unsigned int dlen = gcry_md_get_algo_dlen(algos[i]);
+
+            gcry_md_hash_buffer(algos[i], want, data, 1000);
+
+            for (j = 0; j < sizeof chunks / sizeof chunks[0]; j++) {
+                size_t off;
+                size_t start;
+
+                /* Both an aligned and an unaligned start offset. */
+                for (start = 0; start < 2; start++) {
+                    gcry_md_hash_buffer(algos[i], want, data + start, 1000);
+                    ASSERT_OK(gcry_md_open(&hd, algos[i], 0));
+
+                    for (off = 0; off < 1000; off += chunks[j]) {
+                        size_t n = chunks[j];
+
+                        if (n > 1000 - off) {
+                            n = 1000 - off;
+                        }
+
+                        gcry_md_write(hd, data + start + off, n);
+                    }
+
+                    ASSERT_MEM_EQ(want, gcry_md_read(hd, algos[i]), dlen);
+                    gcry_md_close(hd);
+                }
+            }
+        }
+    }
     ASSERT_TRUE(check_million_a(GCRY_MD_SHA1,
                                 "34aa973cd4c4daa4f61eeb2bdbad27316534016f"));
 }

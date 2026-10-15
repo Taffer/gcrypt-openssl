@@ -9,6 +9,7 @@
 #include "gcrypt-int.h"
 
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -40,14 +41,16 @@ hmac_digest_name(int macalgo)
     return mdalgo ? _gcry_md_openssl_name(mdalgo) : NULL;
 }
 
+/* The output size of the digest behind a gcrypt digest id, 0 if OpenSSL
+ * does not provide it.  Goes through the digest module's cache rather
+ * than fetching by name. */
 static int
-digest_size(const char *name)
+digest_size(int mdalgo)
 {
-    EVP_MD *md = EVP_MD_fetch(_gcry_libctx(), name, _gcry_propq());
+    EVP_MD *md = mdalgo ? _gcry_md_fetch(mdalgo) : NULL;
     int size;
 
     if (!md) {
-        ERR_clear_error();
         return 0;
     }
 
@@ -177,16 +180,78 @@ leave:
 /* --- EVP_KDF helpers -------------------------------------------------- */
 
 /* Run the named KDF with PARAMS and write OUTLEN bytes to OUT. */
+/* The EVP_KDF algorithms used below, fetched once each on first use and
+ * kept for the lifetime of the process, like the digest module does with
+ * its EVP_MD objects.  A name missing from this list is fetched directly. */
+static struct kdf_cache_entry {
+    const char *name;
+    EVP_KDF *kdf;
+} kdf_cache[] = {
+    { "PBKDF2", NULL },  { "SCRYPT", NULL },   { "ARGON2D", NULL },
+    { "ARGON2I", NULL }, { "ARGON2ID", NULL }, { "SSKDF", NULL },
+    { "HKDF", NULL },    { "X963KDF", NULL }
+};
+static pthread_mutex_t kdf_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A reference to the named KDF, released by the caller with EVP_KDF_free. */
+static EVP_KDF *
+fetch_kdf(const char *kdfname)
+{
+    OSSL_LIB_CTX *libctx = _gcry_libctx();
+    const char *propq = _gcry_propq();
+    struct kdf_cache_entry *entry = NULL;
+    EVP_KDF *kdf;
+    size_t i;
+
+    for (i = 0; i < DIM(kdf_cache); i++) {
+        if (!strcmp(kdf_cache[i].name, kdfname)) {
+            entry = &kdf_cache[i];
+            break;
+        }
+    }
+
+    if (!entry) {
+        kdf = EVP_KDF_fetch(libctx, kdfname, propq);
+
+        if (!kdf) {
+            ERR_clear_error();
+        }
+
+        return kdf;
+    }
+
+    pthread_mutex_lock(&kdf_cache_lock);
+    kdf = entry->kdf;
+
+    if (!kdf) {
+        kdf = EVP_KDF_fetch(libctx, kdfname, propq);
+
+        if (!kdf) {
+            ERR_clear_error();
+        }
+
+        entry->kdf = kdf;
+    }
+
+    if (kdf && !EVP_KDF_up_ref(kdf)) {
+        ERR_clear_error();
+        kdf = NULL;
+    }
+
+    pthread_mutex_unlock(&kdf_cache_lock);
+    return kdf;
+}
+
 static gcry_err_code_t
 run_kdf(const char *kdfname, OSSL_PARAM *params, void *out, size_t outlen,
         gcry_err_code_t fallback)
 {
-    EVP_KDF *kdf = EVP_KDF_fetch(_gcry_libctx(), kdfname, _gcry_propq());
+    EVP_KDF *kdf = fetch_kdf(kdfname);
     EVP_KDF_CTX *kctx;
     int ok;
 
     if (!kdf) {
-        return _gcry_err_from_openssl(GPG_ERR_UNSUPPORTED_ALGORITHM);
+        return GPG_ERR_UNSUPPORTED_ALGORITHM;
     }
 
     kctx = EVP_KDF_CTX_new(kdf);
@@ -247,7 +312,7 @@ pbkdf2(const void *passphrase, size_t passphraselen, int hashalgo,
         return GPG_ERR_INV_VALUE;
     }
 
-    if (!digest || !digest_size(digest)) {
+    if (!digest || !digest_size(hashalgo)) {
         return GPG_ERR_DIGEST_ALGO;
     }
 
@@ -598,7 +663,7 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
             h->digest = _gcry_md_openssl_name(
                             subalgo);
 
-            if (!h->digest || !digest_size(h->digest)) {
+            if (!h->digest || !digest_size(subalgo)) {
                 ec = GPG_ERR_DIGEST_ALGO;
             } else {
                 h->outlen = param[0];
@@ -615,7 +680,8 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else {
             h->digest = hmac_digest_name(subalgo);
 
-            if (!h->digest || !digest_size(h->digest)) {
+            if (!h->digest
+                || !digest_size(_gcry_mac_hmac_digest_algo(subalgo))) {
                 ec = GPG_ERR_MAC_ALGO;
             } else {
                 h->outlen = param[0];
@@ -633,7 +699,8 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
             int dsize;
 
             h->digest = hmac_digest_name(subalgo);
-            dsize = h->digest ? digest_size(h->digest) : 0;
+            dsize = h->digest
+                    ? digest_size(_gcry_mac_hmac_digest_algo(subalgo)) : 0;
 
             if (!dsize) {
                 ec = GPG_ERR_MAC_ALGO;
@@ -655,7 +722,7 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
             h->digest = _gcry_md_openssl_name(
                             subalgo);
 
-            if (!h->digest || !digest_size(h->digest)) {
+            if (!h->digest || !digest_size(subalgo)) {
                 ec = GPG_ERR_DIGEST_ALGO;
             } else {
                 h->outlen = param[0];

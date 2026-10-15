@@ -8,6 +8,7 @@
  */
 #include "gcrypt-int.h"
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -305,22 +306,54 @@ _gcry_md_reduced_size(int algo)
     return spec->mdlen;
 }
 
+/* Fetched EVP_MD objects, one slot per table entry.  EVP_MD_fetch walks
+ * OpenSSL's method store by name, which is far more expensive than the
+ * digest setup it precedes, so each algorithm is fetched once and the
+ * object is kept for the lifetime of the process: the private library
+ * context it belongs to is never torn down either. */
+static EVP_MD *md_cache[DIM(md_specs)];
+static pthread_mutex_t md_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A reference to the digest behind ALGO, or NULL if OpenSSL has none.  The
+ * caller releases it with EVP_MD_free. */
 EVP_MD *
 _gcry_md_fetch(int algo)
 {
-    const char *name = _gcry_md_openssl_name(algo);
+    const struct md_spec *spec = spec_from_algo(algo);
+    OSSL_LIB_CTX *libctx;
+    const char *propq;
     EVP_MD *md;
+    size_t idx;
 
-    if (!name) {
+    if (!spec || !spec->ossl) {
         return NULL;
     }
 
-    md = EVP_MD_fetch(_gcry_libctx(), name, _gcry_propq());
+    /* Finish global initialisation before taking the lock: it may use
+     * this function itself. */
+    libctx = _gcry_libctx();
+    propq = _gcry_propq();
+    idx = (size_t)(spec - md_specs);
+
+    pthread_mutex_lock(&md_cache_lock);
+    md = md_cache[idx];
 
     if (!md) {
-        ERR_clear_error();
+        md = EVP_MD_fetch(libctx, spec->ossl, propq);
+
+        if (!md) {
+            ERR_clear_error();
+        }
+
+        md_cache[idx] = md;
     }
 
+    if (md && !EVP_MD_up_ref(md)) {
+        ERR_clear_error();
+        md = NULL;
+    }
+
+    pthread_mutex_unlock(&md_cache_lock);
     return md;
 }
 
@@ -353,42 +386,100 @@ check_digest_algo(int algo)
 /* CRC checksums                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Reflected CRC-32 (ISO 3309, polynomial 0xEDB88320), one byte at a
- * time.  Shared by GCRY_MD_CRC32 and the RFC 1510 variant, which differ
- * only in their initial value and final inversion. */
+/* CRC tables, built on first use.  CRC-32 (ISO 3309, reflected polynomial
+ * 0xEDB88320) is computed eight bytes at a time with the "slicing by 8"
+ * tables; CRC-24 (OpenPGP, RFC 4880, polynomial 0x1864CFB, MSB first) with
+ * a single byte table.  Shared by GCRY_MD_CRC32 and the RFC 1510 variant,
+ * which differ only in their initial value and final inversion. */
+static uint32_t crc32_table[8][256];
+static uint32_t crc24_table[256];
+static pthread_once_t crc_tables_once = PTHREAD_ONCE_INIT;
+
+static void
+crc_tables_init(void)
+{
+    unsigned int i;
+    unsigned int k;
+
+    for (i = 0; i < 256; i++) {
+        uint32_t c = i;
+
+        for (k = 0; k < 8; k++) {
+            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+        }
+
+        crc32_table[0][i] = c;
+    }
+
+    for (i = 0; i < 256; i++) {
+        uint32_t c = crc32_table[0][i];
+
+        for (k = 1; k < 8; k++) {
+            c = crc32_table[0][c & 0xffu] ^ (c >> 8);
+            crc32_table[k][i] = c;
+        }
+    }
+
+    for (i = 0; i < 256; i++) {
+        uint32_t c = (uint32_t)i << 16;
+
+        for (k = 0; k < 8; k++) {
+            c <<= 1;
+
+            if (c & 0x1000000u) {
+                c ^= 0x1864cfbu;
+            }
+        }
+
+        crc24_table[i] = c & 0xffffffu;
+    }
+}
+
 static uint32_t
 crc32_update(uint32_t crc, const unsigned char *buf, size_t len)
 {
+    pthread_once(&crc_tables_once, crc_tables_init);
+
+    /* Align to eight bytes so the wide loop reads naturally aligned words
+     * (through memcpy, so no alignment is actually assumed). */
+    while (len && ((uintptr_t)buf & 7u)) {
+        crc = crc32_table[0][(crc ^ *buf++) & 0xffu] ^ (crc >> 8);
+        len--;
+    }
+
+    while (len >= 8) {
+        uint32_t lo;
+        uint32_t hi;
+
+        memcpy(&lo, buf, 4);
+        memcpy(&hi, buf + 4, 4);
+        lo ^= crc;
+        crc = crc32_table[7][lo & 0xffu]
+              ^ crc32_table[6][(lo >> 8) & 0xffu]
+              ^ crc32_table[5][(lo >> 16) & 0xffu]
+              ^ crc32_table[4][lo >> 24]
+              ^ crc32_table[3][hi & 0xffu]
+              ^ crc32_table[2][(hi >> 8) & 0xffu]
+              ^ crc32_table[1][(hi >> 16) & 0xffu]
+              ^ crc32_table[0][hi >> 24];
+        buf += 8;
+        len -= 8;
+    }
+
     while (len--) {
-        unsigned int k;
-
-        crc ^= *buf++;
-
-        for (k = 0; k < 8; k++) {
-            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-        }
+        crc = crc32_table[0][(crc ^ *buf++) & 0xffu] ^ (crc >> 8);
     }
 
     return crc;
 }
 
-/* CRC-24 as used by OpenPGP (RFC 4880, polynomial 0x1864CFB, initial value
- * 0xB704CE), MSB first. */
 static uint32_t
 crc24_update(uint32_t crc, const unsigned char *buf, size_t len)
 {
+    pthread_once(&crc_tables_once, crc_tables_init);
+
     while (len--) {
-        unsigned int k;
-
-        crc ^= (uint32_t) * buf++ << 16;
-
-        for (k = 0; k < 8; k++) {
-            crc <<= 1;
-
-            if (crc & 0x1000000u) {
-                crc ^= 0x1864cfbu;
-            }
-        }
+        crc = (crc << 8) ^ crc24_table[((crc >> 16) ^ *buf++) & 0xffu];
     }
 
     return crc & 0xffffffu;
@@ -956,7 +1047,10 @@ md_close(gcry_md_hd_t hd)
         _gcry_free(ctx->key);
     }
 
-    _gcry_wipememory(hd, ctx->actual_handle_size);
+    /* Only the part of the buffer that was written holds caller data. */
+    _gcry_wipememory(hd, offsetof(struct gcry_md_handle, buf)
+                     + (size_t)hd->bufpos);
+    _gcry_wipememory(ctx, sizeof * ctx);
     _gcry_free(hd);
 }
 
