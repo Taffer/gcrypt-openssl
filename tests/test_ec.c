@@ -480,6 +480,411 @@ TEST(curve_table_access)
     ASSERT_NULL(gcry_pk_get_curve(NULL, -1, NULL));
 }
 
+static gcry_sexp_t
+sexp_of(const char *text)
+{
+    gcry_sexp_t s = NULL;
+
+    gcry_sexp_sscan(&s, NULL, text, strlen(text));
+    return s;
+}
+
+/* Points, parameters and contexts outside the normal key flow. */
+TEST(context_edge_cases)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t Q;
+    gcry_mpi_point_t R;
+    gcry_mpi_point_t inf;
+    gcry_mpi_t m;
+    gcry_mpi_t x;
+    gcry_mpi_t y;
+    gcry_mpi_t h;
+    gcry_mpi_t enc;
+    gcry_sexp_t sx = NULL;
+
+    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_mpi_ec_new(&ctx, NULL, "bogus"));
+    ASSERT_NULL(ctx);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "NIST P-256"));
+
+    /* Cofactor, unknown names, and values a bare context does not have. */
+    h = gcry_mpi_ec_get_mpi("h", ctx, 1);
+    ASSERT_NOT_NULL(h);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(h, 1));
+    gcry_mpi_release(h);
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("zz", ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("q", ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("d", ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_point("q", ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_point("zz", ctx, 1));
+    ASSERT_ERR(GPG_ERR_NO_SECKEY, gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_SECKEY,
+                                                       ctx));
+
+    /* Setting the public point by point and by encoded MPI. */
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    ASSERT_NOT_NULL(G);
+    ASSERT_OK(gcry_mpi_ec_set_point("q", G, ctx));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_NAME, gcry_mpi_ec_set_point("zz", G, ctx));
+    m = gcry_mpi_ec_get_mpi("q", ctx, 1);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(520, gcry_mpi_get_nbits(m)); /* 0x04 || x || y */
+    gcry_mpi_release(m);
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    gcry_mpi_point_release(Q);
+    ASSERT_OK(gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_PUBKEY, ctx));
+    gcry_sexp_release(sx);
+    sx = NULL;
+
+    m = gcry_mpi_set_ui(NULL, 5);
+    ASSERT_OK(gcry_mpi_ec_set_mpi("d", m, ctx));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_NAME, gcry_mpi_ec_set_mpi("zz", m, ctx));
+    ASSERT_OK(gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_SECKEY, ctx));
+    {
+        gcry_sexp_t l = gcry_sexp_find_token(sx, "d", 0);
+        gcry_mpi_t d = gcry_sexp_nth_mpi(l, 1, GCRYMPI_FMT_USG);
+
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(d, 5));
+        gcry_mpi_release(d);
+        gcry_sexp_release(l);
+    }
+    gcry_sexp_release(sx);
+    sx = NULL;
+    /* A plain integer is not a point encoding; the old q is kept. */
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_ec_set_mpi("q", m, ctx));
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    gcry_mpi_point_release(Q);
+    enc = hex_mpi("046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"
+                  "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", enc, ctx));
+    gcry_mpi_release(enc);
+    enc = hex_mpi("036B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296");
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", enc, ctx));
+    gcry_mpi_release(enc);
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    x = gcry_mpi_new(0);
+    y = gcry_mpi_new(0);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, Q, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x,
+                           "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"));
+    ASSERT_TRUE(mpi_eq_hex(y,
+                           "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5"));
+    gcry_mpi_point_release(Q);
+    enc = hex_opaque("0401");
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_ec_set_mpi("q", enc, ctx));
+    gcry_mpi_release(enc);
+
+    /* Re-setting the curve parameters to their own values keeps the
+     * context usable. */
+    {
+        const char *names[4] = { "p", "a", "b", "n" };
+        int i;
+
+        for (i = 0; i < 4; i++) {
+            gcry_mpi_t v = gcry_mpi_ec_get_mpi(names[i], ctx, 1);
+
+            ASSERT_NOT_NULL(v);
+            ASSERT_OK(gcry_mpi_ec_set_mpi(names[i], v, ctx));
+            gcry_mpi_release(v);
+        }
+    }
+    ASSERT_OK(gcry_mpi_ec_set_point("g", G, ctx));
+    R = gcry_mpi_point_new(0);
+    gcry_mpi_ec_mul(R, m, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x,
+                           "51590B7A515140D2D784C85608668FDFEF8C82FD1F5BE52421554A0DC3D033ED"));
+
+    /* The point at infinity as an operand. */
+    inf = gcry_mpi_point_new(0);
+    gcry_mpi_ec_add(R, G, inf, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x,
+                           "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"));
+    gcry_mpi_ec_add(R, inf, inf, ctx);
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    gcry_mpi_ec_dup(R, inf, ctx);
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    gcry_mpi_set_ui(m, 0);
+    gcry_mpi_ec_mul(R, m, G, ctx);
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(G, ctx));
+
+    /* A Jacobian representation with z != 1 is understood. */
+    {
+        gcry_mpi_t gx = gcry_mpi_new(0);
+        gcry_mpi_t gy = gcry_mpi_new(0);
+        gcry_mpi_t gz = gcry_mpi_new(0);
+        gcry_mpi_t p = gcry_mpi_ec_get_mpi("p", ctx, 1);
+        gcry_mpi_t two = gcry_mpi_set_ui(NULL, 2);
+        gcry_mpi_t four = gcry_mpi_set_ui(NULL, 4);
+        gcry_mpi_t eight = gcry_mpi_set_ui(NULL, 8);
+        gcry_mpi_t ex = gcry_mpi_new(0);
+
+        gcry_mpi_point_get(gx, gy, gz, G);
+        gcry_mpi_mulm(gx, gx, four, p);   /* X = x * z^2 */
+        gcry_mpi_mulm(gy, gy, eight, p);  /* Y = y * z^3 */
+        gcry_mpi_point_set(R, gx, gy, two);
+        ASSERT_EQ(1, gcry_mpi_ec_curve_point(R, ctx));
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, R, ctx));
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(ex, NULL, G, ctx));
+        ASSERT_EQ(0, gcry_mpi_cmp(ex, x));
+        gcry_mpi_ec_add(R, R, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        gcry_mpi_set_ui(m, 2);
+        gcry_mpi_ec_mul(R, m, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(ex, NULL, R, ctx));
+        ASSERT_EQ(0, gcry_mpi_cmp(ex, x));
+        gcry_mpi_release(gx);
+        gcry_mpi_release(gy);
+        gcry_mpi_release(gz);
+        gcry_mpi_release(p);
+        gcry_mpi_release(two);
+        gcry_mpi_release(four);
+        gcry_mpi_release(eight);
+        gcry_mpi_release(ex);
+    }
+
+    gcry_mpi_point_release(inf);
+    gcry_mpi_point_release(R);
+    gcry_mpi_point_release(G);
+    gcry_mpi_release(m);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+    gcry_ctx_release(ctx);
+}
+
+TEST(montgomery_context_queries)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t R;
+    gcry_mpi_t m = gcry_mpi_set_ui(NULL, 3);
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t h;
+
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    ASSERT_NOT_NULL(G);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, G, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 9));
+    R = gcry_mpi_point_new(0);
+    gcry_mpi_ec_mul(R, m, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(G, ctx));
+    h = gcry_mpi_ec_get_mpi("h", ctx, 1);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(h, 8));
+    gcry_mpi_release(h);
+    gcry_mpi_point_release(R);
+    gcry_mpi_point_release(G);
+    gcry_mpi_release(m);
+    gcry_mpi_release(x);
+    gcry_ctx_release(ctx);
+}
+
+TEST(context_from_odd_keys)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_sexp_t key;
+    gcry_mpi_point_t Q;
+    unsigned char out[64];
+    unsigned char scalar[32] = { 9 };
+    unsigned char point[32] = { 9 };
+
+    /* A truncated q is accepted when the context is built; the error
+     * surfaces later when the point is used. */
+    key = NULL;
+    key = sexp_of("(public-key (ecc (curve \"NIST P-256\") (q #04#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+    gcry_sexp_release(key);
+
+    key = NULL;
+    key = sexp_of("(public-key (ecc (curve bogus) (q #04#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_mpi_ec_new(&ctx, key, NULL));
+    ASSERT_NULL(ctx);
+    gcry_sexp_release(key);
+
+    /* "param" together with a curve name: the name wins. */
+    key = NULL;
+    key = sexp_of(
+              "(public-key (ecc (curve \"NIST P-256\") (flags param) (p #0b#)))"
+          );
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+    gcry_sexp_release(key);
+
+    /* Ed25519 secret scalars of unusual length still yield the public
+     * point. */
+    key = NULL;
+    key = sexp_of(
+              "(private-key (ecc (curve Ed25519) (flags eddsa) (d #01#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    gcry_mpi_point_release(Q);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+    gcry_sexp_release(key);
+    key = NULL;
+    key = sexp_of(
+              "(private-key (ecc (curve Ed25519) (flags eddsa) (d #00"
+              "0102030405060708091011121314151617181920212223242526272829303132#)))"
+          );
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+    gcry_sexp_release(key);
+    key = NULL;
+    key = sexp_of(
+              "(private-key (ecc (curve Curve25519) (flags djb-tweak) (d #"
+              "0102030405060708091011121314151617181920212223242526272829303132#)))"
+          );
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+    gcry_sexp_release(key);
+
+    /* Raw scalar multiplication helpers. */
+    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, point));
+    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE448, out, scalar, point));
+    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, NULL));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_ecc_mul_point(999, out, scalar, point));
+    ASSERT_EQ(32, gcry_ecc_get_algo_keylen(GCRY_ECC_CURVE25519));
+    ASSERT_EQ(56, gcry_ecc_get_algo_keylen(GCRY_ECC_CURVE448));
+    ASSERT_EQ(0, gcry_ecc_get_algo_keylen(999));
+}
+
+TEST(edwards_context_and_explicit_params)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_sexp_t key;
+    gcry_sexp_t sx = NULL;
+    gcry_mpi_point_t Q;
+    gcry_mpi_point_t G;
+    gcry_mpi_t q;
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+
+    /* Broken key material is rejected when the context is built. */
+    key = sexp_of("(public-key (ecc (curve \"NIST P-256\") (q)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_sexp_release(key);
+    key = sexp_of("(private-key (ecc (curve Ed25519) (flags eddsa) (d #0000"
+                  "0102030405060708091011121314151617181920212223242526272829303132"
+                  "#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_sexp_release(key);
+    ASSERT_NULL(ctx);
+
+    /* A bare Edwards context: nothing to export until q or d is set. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Ed25519"));
+    ASSERT_ERR(GPG_ERR_NO_SECKEY, gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_SECKEY,
+                                                       ctx));
+    ASSERT_ERR(GPG_ERR_BAD_CRYPT_CTX, gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_PUBKEY,
+                                                           ctx));
+    ASSERT_NULL(sx);
+    /* The public key as the plain 32-byte encoding or with a 0x40 prefix
+     * in an opaque MPI. */
+    q = hex_mpi("1FA2E99AB1F89DB74F47B649B8C280659E25E4DA32B87BCF8BB5EF7AB6007D87");
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", q, ctx));
+    gcry_mpi_release(q);
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, Q, ctx));
+    gcry_mpi_point_release(Q);
+    q = hex_opaque("401FA2E99AB1F89DB74F47B649B8C280659E25E4DA32B87BCF8BB5EF7AB6007D87");
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", q, ctx));
+    gcry_mpi_release(q);
+    ASSERT_OK(gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_PUBKEY, ctx));
+    {
+        gcry_sexp_t l = gcry_sexp_find_token(sx, "q", 0);
+        size_t n = 0;
+        const unsigned char *d = (const unsigned char *)gcry_sexp_nth_data(l, 1, &n);
+
+        ASSERT_EQ(32, n);
+        ASSERT_EQ(0x1F, d[0]);
+        ASSERT_EQ(0x87, d[31]);
+        gcry_sexp_release(l);
+    }
+    gcry_sexp_release(sx);
+    sx = NULL;
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* Explicit parameters without a curve name are recognised. */
+    key = sexp_of("(public-key (ecc"
+                  " (p #00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF#)"
+                  " (a #00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC#)"
+                  " (b #5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B#)"
+                  " (g #046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"
+                  "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5#)"
+                  " (n #00FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551#)"
+                  " (h #01#)"
+                  " (q #04" P256_QX P256_QY "#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_sexp_release(key);
+    q = gcry_mpi_ec_get_mpi("p", ctx, 1);
+    ASSERT_EQ(256, gcry_mpi_get_nbits(q));
+    gcry_mpi_release(q);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* A public point that is not on the curve is still exported. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "NIST P-256"));
+    Q = gcry_mpi_point_new(0);
+    gcry_mpi_set_ui(x, 1);
+    gcry_mpi_set_ui(y, 1);
+    gcry_mpi_point_set(Q, x, y, y);
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(Q, ctx));
+    ASSERT_OK(gcry_mpi_ec_set_point("q", Q, ctx));
+    ASSERT_OK(gcry_pubkey_get_sexp(&sx, GCRY_PK_GET_PUBKEY, ctx));
+    gcry_sexp_release(sx);
+    sx = NULL;
+    gcry_mpi_point_release(Q);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* The public key is computed from d on demand. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "NIST P-256"));
+    gcry_mpi_set_ui(x, 5);
+    ASSERT_OK(gcry_mpi_ec_set_mpi("d", x, ctx));
+    q = gcry_mpi_ec_get_mpi("q", ctx, 1);
+    ASSERT_NOT_NULL(q);
+    gcry_mpi_release(q);
+    Q = gcry_mpi_ec_get_point("q", ctx, 1);
+    ASSERT_NOT_NULL(Q);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, Q, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x,
+                           "51590B7A515140D2D784C85608668FDFEF8C82FD1F5BE52421554A0DC3D033ED"));
+    gcry_mpi_point_release(Q);
+
+    /* Debug output of points must cope with and without a context. */
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    gcry_log_debugpnt("G", G, ctx);
+    gcry_log_debugpnt("G", G, NULL);
+    gcry_log_debugpnt("none", NULL, ctx);
+    gcry_mpi_point_release(G);
+    gcry_ctx_release(ctx);
+
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+}
+
 int
 main(void)
 {
@@ -491,5 +896,9 @@ main(void)
     RUN_TEST(ed25519_context);
     RUN_TEST(curve25519_context);
     RUN_TEST(curve_table_access);
+    RUN_TEST(context_edge_cases);
+    RUN_TEST(montgomery_context_queries);
+    RUN_TEST(context_from_odd_keys);
+    RUN_TEST(edwards_context_and_explicit_params);
     return TEST_RESULT();
 }
