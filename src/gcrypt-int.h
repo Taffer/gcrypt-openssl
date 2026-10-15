@@ -57,6 +57,7 @@ const char *_gcry_propq(void);
 int _gcry_fips_mode(void);
 unsigned int _gcry_get_debug_flags(void);
 int _gcry_get_rng_type(void);
+unsigned int _gcry_fips_reject_flags(void);
 
 /* Generic context object (gcry_ctx_t). */
 enum gcry_ctx_types {
