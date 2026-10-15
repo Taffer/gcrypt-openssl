@@ -16,6 +16,8 @@ set(GCRYPT_OPENSSL_TESTS
     test_random
     test_prime
     test_cipher
+    test_pk
+    test_ec
 )
 
 # Tests of internal helpers link the static library so that symbols hidden

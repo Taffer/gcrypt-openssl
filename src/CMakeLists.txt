@@ -14,6 +14,12 @@ set(GCRYPT_OPENSSL_SOURCES
     misc.c
     mpi.c
     mpi-ec.c
+    pk-dsa.c
+    pk-ecc.c
+    pk-elg.c
+    pk-rsa.c
+    pk-util.c
+    pk.c
     prime.c
     random.c
     sexp.c

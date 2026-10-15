@@ -3,4 +3,4 @@ skip = .git,build,build-*,*.sublime-*
 check-filenames =
 check-hidden =
 # Words codespell flags that are intentional in this project.
-ignore-words-list = crypted,ahd,gost
+ignore-words-list = crypted,ahd,gost,parms,ciph
