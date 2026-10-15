@@ -1,6 +1,7 @@
 #include <gcrypt.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "test_common.h"
 
@@ -614,6 +615,9 @@ TEST(aes_gcm_siv_rfc8452)
     ASSERT_MEM_EQ(expect_ct, out, 8);
     ASSERT_MEM_EQ(expect_tag, tag, 16);
 
+    /* A finished message must be reset before a new nonce is accepted. */
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_reset(hd));
     ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
     ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, sizeof tag));
     ASSERT_OK(gcry_cipher_decrypt(hd, out, sizeof out, expect_ct, 8));
@@ -1594,6 +1598,648 @@ TEST(controls_and_misc)
 }
 
 /* Disabling an algorithm is process wide, so this runs last. */
+/* Behaviour checked against the reference library (libgcrypt 1.12.2) with
+ * probe programs: the expected bytes and error codes below are what it
+ * produces for key = 00 01 02 .., IV = 10 11 12 .., AAD = 30 31 32 .. and
+ * plaintext = a0 a1 a2 ...
+ */
+static unsigned char cmp_key[64];
+static unsigned char cmp_iv[32];
+static unsigned char cmp_pt[64];
+static unsigned char cmp_aad[16];
+
+static void
+compat_fill(void)
+{
+    size_t i;
+
+    for (i = 0; i < 64; i++) {
+        cmp_key[i] = (unsigned char)i;
+        cmp_pt[i] = (unsigned char)(0xa0 + i);
+    }
+
+    for (i = 0; i < 32; i++) {
+        cmp_iv[i] = (unsigned char)(0x10 + i);
+    }
+
+    for (i = 0; i < 16; i++) {
+        cmp_aad[i] = (unsigned char)(0x30 + i);
+    }
+}
+
+static int
+hex_eq(const unsigned char *buf, const char *hex)
+{
+    unsigned char expect[80];
+    size_t n = unhex(hex, expect, sizeof expect);
+
+    return memcmp(buf, expect, n) == 0;
+}
+
+TEST(upstream_gcm_tags)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char out[32];
+    unsigned char tag[16];
+    unsigned char tag2[17];
+    const char *tag_hex = "6483275bdb74a33f55392be0fa49e958";
+
+    compat_fill();
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, tag_hex));
+
+    /* The encryption side can check its own tag. */
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 12));
+    memcpy(tag2, tag, 16);
+    tag2[0] ^= 1;
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag2, 16));
+
+    /* A decryption handle yields the computed tag, before and after a
+     * check, and checks may be repeated with any allowed length. */
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+    memset(tag2, 0, sizeof tag2);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, tag_hex));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 12));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 15));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_checktag(hd, tag, 3));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_checktag(hd, tag, 11));
+    memcpy(tag2, tag, 16);
+    tag2[16] = 0;
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag2, 17));
+    memset(tag2, 0, sizeof tag2);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, tag_hex));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+
+    /* gettag copies a prefix for the allowed short lengths. */
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    memset(tag2, 0xee, sizeof tag2);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 15));
+    ASSERT_TRUE(hex_eq(tag2, "28505a54e2655f378557b48bb01d99"));
+    ASSERT_EQ(0xee, tag2[15]);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 17));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_gettag(hd, tag2, 5));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 4));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 8));
+
+    /* IVs of any non-zero length, including ones longer than a block. */
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_setiv(hd, cmp_iv, 0));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 32));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, "7f8923f7d0245f6ebd46bd5498d62450"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 32));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 1));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, "a89c0f41a40d04df2e9256a1a6350caa"));
+
+    /* The tag of an empty message is available without any data call. */
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, "0ed7259add1011e159d00e61b1925410"));
+    gcry_cipher_close(hd);
+}
+
+TEST(upstream_siv_states)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char out[64];
+    unsigned char tag[16];
+    unsigned char tag2[16];
+    const char *ct_hex = "4de06d4ec7c0c4895d745153a063f144"
+                         "60962d618731bf5350235a151c041004";
+    const char *tag_hex = "08348491cf6aa22075b4bdadf2d6738e";
+
+    compat_fill();
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+
+    /* Associated data first, the nonce last, then the single data call. */
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(ct, ct_hex));
+    ASSERT_TRUE(hex_eq(tag, tag_hex));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 15));
+    memset(tag2, 0xee, 16);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 15));
+    ASSERT_MEM_EQ(tag, tag2, 15);
+    ASSERT_EQ(0xee, tag2[15]);
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, cmp_iv, 12));
+
+    /* A nonce set first makes later associated data an error, and the
+     * message proceeds with the nonce alone. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, "afafb98fbdb235160f964cdd30eabe22"));
+
+    /* Decryption: the tag may be set before or after the components. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    memcpy(tag2, tag, 16);
+    tag2[0] ^= 1;
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag2, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 15));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_set_decryption_tag(hd, tag, 16));
+
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+
+    /* A wrong tag is reported by the data call, the output is cleared
+     * and every later check fails. */
+    memcpy(tag2, tag, 16);
+    tag2[0] ^= 1;
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag2, 16));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    memset(out, 0x11, sizeof out);
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_decrypt(hd, out, 64, ct, 32));
+    {
+        unsigned char zeros[32] = { 0 };
+
+        ASSERT_MEM_EQ(zeros, out, 32);
+        ASSERT_EQ(0x11, out[32]);
+    }
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag2, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+
+    /* No tag: the state is kept until one is set. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+
+    /* Tag lengths; a tag turns the handle into a decryption handle. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_set_decryption_tag(hd, tag, 15));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_set_decryption_tag(hd, tag, 17));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+
+    /* Nothing at all is a valid message; asking for the tag closes it. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, "a56a7fa513c4b1b97596bf328f70dfa3"));
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, "6890e5685ed0253753a2121dab850fdf"));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, cmp_iv, 12));
+
+    /* Two AES-192 or AES-256 keys are fine on the AES id, singles not. */
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 48));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 64));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, cmp_key, 24));
+    gcry_cipher_close(hd);
+}
+
+TEST(upstream_gcm_siv_states)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char out[64];
+    unsigned char tag[16];
+    unsigned char tag2[16];
+    const char *tag_hex = "49ea9de2bd470ea3fbe567d7cb22e2bf";
+
+    compat_fill();
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+
+    /* Nonce, associated data, data. */
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_setiv(hd, cmp_iv, 11));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_setiv(hd, cmp_iv, 13));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_setiv(hd, cmp_iv, 0));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(ct, "b7d70b02a652f82e509e5f5def98f55c"
+                       "a33f7428f7064a5aff789d47e980470a"));
+    ASSERT_TRUE(hex_eq(tag, tag_hex));
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 15));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, cmp_iv, 12));
+
+    /* Decryption: nonce, associated data, then the tag closes the AAD. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, out, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+    ASSERT_MEM_EQ(cmp_pt, out, 32);
+    ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+    memset(tag2, 0, 16);
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_MEM_EQ(tag, tag2, 16);
+
+    /* The tag may also come before the nonce. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+
+    /* A wrong tag: reported by the data call, output cleared, and the
+     * handle keeps answering for the tag it was given. */
+    memcpy(tag2, tag, 16);
+    tag2[3] ^= 1;
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_set_decryption_tag(hd, tag2, 16));
+    memset(out, 0x11, sizeof out);
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_decrypt(hd, out, 64, ct, 32));
+    {
+        unsigned char zeros[32] = { 0 };
+
+        ASSERT_MEM_EQ(zeros, out, 32);
+        ASSERT_EQ(0x11, out[32]);
+    }
+    ASSERT_OK(gcry_cipher_checktag(hd, tag2, 16));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 16));
+    memset(out, 0, 16);
+    ASSERT_OK(gcry_cipher_gettag(hd, out, 16));
+    ASSERT_MEM_EQ(tag2, out, 16);
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_set_decryption_tag(hd, tag, 15));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_decrypt(hd, out, 32, ct, 32));
+
+    /* Empty message tag without a data call. */
+    ASSERT_OK(gcry_cipher_reset(hd));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 12));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag2, 16));
+    ASSERT_TRUE(hex_eq(tag2, "fdec3e54464cc76e7a8130f928589f50"));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_encrypt(hd, ct, 0, cmp_pt, 0));
+
+    /* Key lengths: 128 and 256 bit keys on any AES id. */
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, cmp_key, 24));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+    gcry_cipher_close(hd);
+}
+
+TEST(upstream_key_lengths)
+{
+    static const int ids[3] = {
+        GCRY_CIPHER_AES, GCRY_CIPHER_AES192, GCRY_CIPHER_AES256
+    };
+    static const char *const first4[3] = { "67896c75", "98a9222e", "965fe30b" };
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char out[32];
+    int i;
+    int k;
+
+    compat_fill();
+
+    /* The key length selects the AES variant, whatever the id says. */
+    for (i = 0; i < 3; i++) {
+        for (k = 0; k < 3; k++) {
+            ASSERT_OK(gcry_cipher_open(&hd, ids[i], GCRY_CIPHER_MODE_CBC, 0));
+            ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16 + 8 * (size_t)k));
+            ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+            ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+            ASSERT_TRUE(hex_eq(ct, first4[k]));
+            gcry_cipher_close(hd);
+        }
+
+        ASSERT_OK(gcry_cipher_open(&hd, ids[i], GCRY_CIPHER_MODE_XTS, 0));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, cmp_key, 16));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, cmp_key, 24));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 64));
+        /* AES-192 XTS has no OpenSSL cipher; it is composed from ECB. */
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 48));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, "f6c96d1df29d43c7c43cd640f549f706"
+                           "cba1ed0fcff99dbe0945071539d1a065"));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+        ASSERT_OK(gcry_cipher_decrypt(hd, out, 32, ct, 32));
+        ASSERT_MEM_EQ(cmp_pt, out, 32);
+        gcry_cipher_close(hd);
+    }
+
+    if (algo_available(GCRY_CIPHER_CAMELLIA128)) {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CAMELLIA128,
+                                   GCRY_CIPHER_MODE_CBC, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 24));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+        gcry_cipher_close(hd);
+    }
+
+    /* DES: the 64 weak, semi-weak and possibly weak keys are refused in
+     * every position of a 3DES key; parity bits do not matter. */
+    {
+        static const unsigned char weak[][8] = {
+            { 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01 },
+            { 0x01, 0xfe, 0x01, 0xfe, 0x01, 0xfe, 0x01, 0xfe },
+            { 0xfe, 0x01, 0xfe, 0x01, 0xfe, 0x01, 0xfe, 0x01 },
+            { 0x01, 0xe0, 0x01, 0xe0, 0x01, 0xf1, 0x01, 0xf1 },
+            { 0x1f, 0x01, 0xfe, 0xe0, 0x0e, 0x01, 0xfe, 0xf1 },
+            { 0xe0, 0x1f, 0x01, 0xfe, 0xf1, 0x0e, 0x01, 0xfe },
+            { 0xfe, 0x01, 0x1f, 0xe0, 0xfe, 0x01, 0x0e, 0xf1 },
+            { 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe },
+        };
+        unsigned char k3[24];
+        size_t w;
+
+        for (w = 0; w < sizeof weak / sizeof weak[0]; w++) {
+            ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_DES, GCRY_CIPHER_MODE_ECB,
+                                       0));
+            ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_cipher_setkey(hd, weak[w], 8));
+            memcpy(k3, weak[w], 8);
+            k3[0] ^= 1; /* Parity bit. */
+            ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_cipher_setkey(hd, k3, 8));
+            k3[3] ^= 0x20;
+            ASSERT_OK(gcry_cipher_setkey(hd, k3, 8));
+            gcry_cipher_close(hd);
+        }
+
+        memset(k3, 0x23, sizeof k3);
+        memcpy(k3 + 8, weak[1], 8);
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_ECB,
+                                   0));
+        ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_cipher_setkey(hd, k3, 24));
+        memset(k3, 0x23, sizeof k3);
+        ASSERT_OK(gcry_cipher_setkey(hd, k3, 24));
+        gcry_cipher_close(hd);
+    }
+}
+
+TEST(upstream_iv_conventions)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char tag[16];
+    unsigned char zero[16] = { 0 };
+    const char *zero_nonce = "b819e09209430076bbc8f6ca03eee088"
+                             "480041465518edeb544146a99688cbe3";
+
+    compat_fill();
+
+    /* ChaCha20: 8, 12 and 16 byte IVs select the variant; anything else
+     * is a warning and an all zero IV. */
+    if (algo_available(GCRY_CIPHER_CHACHA20)) {
+        const char *other = "995c89de7d60bfcd2514a9dc1471e4e6"
+                            "3a846adc086bdc7b0a75c7f764579a2d";
+
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                   GCRY_CIPHER_MODE_STREAM, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, "2a49ef411d0782d6989e4c43a8a80235"
+                           "58a60f0e71bbc8c359f3f7a31266a8dd"));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 7));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, other));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 13));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, other));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 17));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, other));
+        gcry_cipher_close(hd);
+
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                   GCRY_CIPHER_MODE_POLY1305, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 7));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+        ASSERT_TRUE(hex_eq(ct, zero_nonce));
+        ASSERT_TRUE(hex_eq(tag, "740287ca3494214808b3f69e9dac9eb8"));
+        /* A 16 byte IV is counter||nonce; with a zero counter it equals
+         * the 12 byte nonce. */
+        memcpy(zero + 4, cmp_iv + 4, 12);
+        ASSERT_OK(gcry_cipher_setiv(hd, zero, 16));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, "8a5b214119a5c0164898affa173ea2c6"
+                           "1de09bf9138507ce20d2740c84612c51"));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv + 4, 12));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+        ASSERT_TRUE(hex_eq(ct, "8a5b214119a5c0164898affa173ea2c6"
+                           "1de09bf9138507ce20d2740c84612c51"));
+        /* Tag lengths. */
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT, gcry_cipher_gettag(hd, tag, 15));
+        ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT, gcry_cipher_checktag(hd, tag, 15));
+        ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 17));
+        ASSERT_OK(gcry_cipher_checktag(hd, tag, 16));
+        gcry_cipher_close(hd);
+    }
+
+    /* XTS: the tweak is zero padded or truncated to a block. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_XTS, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 15));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "730955487b54dd6bc39f3fef19ec4f11"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 0));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "f9d68ea4b1e397c918297aa9c8098abf"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 17));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "b6c63bc43c01d673a51e45a59c8e5c5d"));
+    gcry_cipher_close(hd);
+
+    /* ARCFOUR takes and ignores an IV. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR, GCRY_CIPHER_MODE_STREAM,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "493de25ae347bf6bae723d6da27084e0"));
+    gcry_cipher_close(hd);
+
+    /* CBC-MAC handles decrypt as plain CBC. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC,
+                               GCRY_CIPHER_CBC_MAC));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+    ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT, gcry_cipher_decrypt(hd, ct, 16, cmp_pt,
+                                                             32));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+    ASSERT_OK(gcry_cipher_decrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_TRUE(hex_eq(ct, "3cd93f0477dc098aaef64a27300ab412"
+                       "abe10fb4914bfd322142c03a25305087"));
+    gcry_cipher_close(hd);
+}
+
+TEST(upstream_keywrap_and_ccm)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char ct[32];
+    unsigned char out[32];
+    unsigned char tag[16];
+    unsigned long long lengths[3];
+
+    compat_fill();
+
+    /* Plain wrap: the IV is zero padded or truncated to 8 bytes; a NULL
+     * IV means the default, an empty one eight zero bytes. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_AESWRAP,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "7c98f3e4d60636d4aef4977d12dbfe75611dbd03e54dffef"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 4));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "9fe10555c714baf27cc2b06abf1006d39c963ccc9f1da250"));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 16, ct, 24));
+    ASSERT_MEM_EQ(cmp_pt, out, 16);
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 9));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "59b3f9a6a987e26a64232a35dfa8b27f7bc43d6131bc97b9"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "59b3f9a6a987e26a64232a35dfa8b27f7bc43d6131bc97b9"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 0));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "bd9b64172b7b2c69058fe980deb217d26cc8161adae210c2"));
+    ASSERT_OK(gcry_cipher_setiv(hd, NULL, 0));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_TRUE(hex_eq(ct, "7c98f3e4d60636d4aef4977d12dbfe75611dbd03e54dffef"));
+    gcry_cipher_close(hd);
+
+    /* Padded wrap ignores the IV altogether. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_AESWRAP,
+                               GCRY_CIPHER_EXTENDED));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 9));
+    ASSERT_TRUE(hex_eq(ct, "e6e76afcf1f71f43634b96919c1e36a95bf7b0260f519b4b"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 4));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 9));
+    ASSERT_TRUE(hex_eq(ct, "e6e76afcf1f71f43634b96919c1e36a95bf7b0260f519b4b"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 7));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 16));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, 24, ct, 24));
+    ASSERT_MEM_EQ(cmp_pt, out, 9);
+    gcry_cipher_close(hd);
+
+    /* Other 128 bit block ciphers wrap through the generic driver; 64 bit
+     * block ciphers open but cannot wrap. */
+    if (algo_available(GCRY_CIPHER_CAMELLIA128)) {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CAMELLIA128,
+                                   GCRY_CIPHER_MODE_AESWRAP, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+        ASSERT_TRUE(hex_eq(ct, "63e43993864ae54fa16e1732452cbe55072bd05e95776062"));
+        ASSERT_OK(gcry_cipher_decrypt(hd, out, 16, ct, 24));
+        ASSERT_MEM_EQ(cmp_pt, out, 16);
+        gcry_cipher_close(hd);
+    }
+
+    if (algo_available(GCRY_CIPHER_SEED)) {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_SEED, GCRY_CIPHER_MODE_AESWRAP,
+                                   GCRY_CIPHER_EXTENDED));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 9));
+        ASSERT_TRUE(hex_eq(ct, "20ba8665bf09ab8c13f82772f9da9c65517a9a13119a78db"));
+        ASSERT_OK(gcry_cipher_decrypt(hd, out, 24, ct, 24));
+        ASSERT_MEM_EQ(cmp_pt, out, 9);
+        gcry_cipher_close(hd);
+    }
+
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_AESWRAP,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 24));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_decrypt(hd, out, 16, ct, 24));
+    gcry_cipher_close(hd);
+
+    /* CCM: lengths are not checked against the L field, and the tag calls
+     * before the lengths are set report a length problem. */
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CCM, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_checktag(hd, tag, 16));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 13));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_authenticate(hd, cmp_aad, 16));
+    lengths[0] = 1ULL << 20;
+    lengths[1] = 0;
+    lengths[2] = 16;
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS,
+                                                  lengths, sizeof lengths));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 13));
+    lengths[0] = 32;
+    lengths[1] = 16;
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_authenticate(hd, cmp_aad, 16));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, "4d6ea00fcf4a3d53495435a0bc86df56"));
+    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 7));
+    lengths[1] = 0;
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 32, cmp_pt, 32));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, 16));
+    ASSERT_TRUE(hex_eq(tag, "3e4053728b63bfe765fdbafbffc4d82d"));
+    gcry_cipher_close(hd);
+}
+
 TEST(disable_algo)
 {
     gcry_cipher_hd_t hd = NULL;
@@ -1650,6 +2296,12 @@ main(void)
     RUN_TEST(xts_and_keywrap_lengths);
     RUN_TEST(ocb_generic_block_ciphers);
     RUN_TEST(controls_and_misc);
+    RUN_TEST(upstream_gcm_tags);
+    RUN_TEST(upstream_siv_states);
+    RUN_TEST(upstream_gcm_siv_states);
+    RUN_TEST(upstream_key_lengths);
+    RUN_TEST(upstream_iv_conventions);
+    RUN_TEST(upstream_keywrap_and_ccm);
     RUN_TEST(disable_algo);
     return TEST_RESULT();
 }

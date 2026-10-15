@@ -529,6 +529,9 @@ struct gcry_cipher_handle {
      * CTX_KEYED tells whether CTX still holds the key schedule for the
      * current key in direction CTX_ENC, so that the next message only
      * needs an IV re-initialisation. */
+    const struct algo_spec *ospec; /* Variant OpenSSL implements for the
+                                    * current key length (AES-192 for a 24
+                                    * byte key on the AES id, and so on). */
     const EVP_CIPHER *cipher;    /* Borrowed from the cache. */
     EVP_CIPHER_CTX *ctx;
     int ctx_ready;
@@ -551,6 +554,8 @@ struct gcry_cipher_handle {
     unsigned char iv[MAX_BLOCKSIZE];
     size_t ivlen;
     int have_iv;
+    unsigned char *longiv;       /* GCM and SIV nonces longer than IV. */
+    size_t longivcap;
 
     unsigned char ctr[MAX_BLOCKSIZE];     /* Counter block for CTR mode. */
     unsigned char keystream[MAX_BLOCKSIZE];
@@ -601,7 +606,24 @@ struct gcry_cipher_handle {
     int ocb_native;
     int ocb_nonce_applied;        /* Nonce applied for this message. */
 
-    /* Key wrap. */
+    /* GCM decryption runs through OpenSSL's GCM128 driver so that the
+     * computed tag is available to gcry_cipher_gettag(), as it is in the
+     * reference library; the counter stream comes from an EVP CTR
+     * context.  Encryption keeps the fused EVP cipher. */
+    GCM128_CONTEXT *gcm;
+    int gcm_keyed;
+    int gcm_started;
+    EVP_CIPHER_CTX *gcm_ctr;
+    int gcm_ctr_keyed;
+
+    /* XTS for variants OpenSSL has no native cipher for (AES-192, other
+     * 128 bit block ciphers): the XTS128 driver over two ECB contexts. */
+    int xts_generic;
+    EVP_CIPHER_CTX *ecb2_enc;     /* Keyed with the tweak key. */
+    int ecb2_enc_keyed;
+
+    /* Key wrap for block ciphers without a native wrap cipher. */
+    int wrap_generic;
     unsigned char wrap_plen[4];
 
     /* IV generation for AEAD modes. */
@@ -776,6 +798,7 @@ reset_message_state(gcry_cipher_hd_t h)
     h->ccm_mac_started = 0;
     h->ccm_mac_buflen = 0;
     h->ocb_nonce_applied = 0;
+    h->gcm_started = 0;
     memset(h->wrap_plen, 0, sizeof h->wrap_plen);
 
     if (h->mode == GCRY_CIPHER_MODE_OCB) {
@@ -890,26 +913,42 @@ fetch_mode_ciphers(gcry_cipher_hd_t h)
         return GPG_ERR_INV_CIPHER_MODE;
     }
 
+    h->xts_generic = 0;
+    h->wrap_generic = 0;
+
     if (h->mode == GCRY_CIPHER_MODE_OCB) {
         /* OpenSSL only has a native OCB for AES; the OCB128 driver over
          * ECB covers the other 128 bit block ciphers. */
         if (is_aes_algo(h->algo)) {
-            h->cipher = cached_cipher(h->spec, SLOT_OCB);
+            h->cipher = cached_cipher(h->ospec, SLOT_OCB);
             h->ocb_native = h->cipher != NULL;
         }
 
         return 0;
     }
 
-    h->cipher = cached_cipher(h->spec, (enum cipher_slot)slot);
+    h->cipher = cached_cipher(h->ospec, (enum cipher_slot)slot);
 
     if (!h->cipher) {
-        if (h->mode == GCRY_CIPHER_MODE_CTR || h->mode == GCRY_CIPHER_MODE_CCM) {
+        switch (h->mode) {
+        case GCRY_CIPHER_MODE_CTR:
+        case GCRY_CIPHER_MODE_CCM:
             h->generic_ctr = 1; /* Compose CTR from ECB below. */
             return 0;
-        }
 
-        return GPG_ERR_NOT_SUPPORTED;
+        case GCRY_CIPHER_MODE_XTS:
+            h->xts_generic = 1; /* XTS128 driver over ECB. */
+            return 0;
+
+        case GCRY_CIPHER_MODE_AESWRAP:
+            /* The key wrap driver over ECB; 64 bit block ciphers open
+             * but fail at the first data call, as in the reference. */
+            h->wrap_generic = 1;
+            return 0;
+
+        default:
+            return GPG_ERR_NOT_SUPPORTED;
+        }
     }
 
     return 0;
@@ -922,7 +961,7 @@ ensure_ecb_cipher(gcry_cipher_hd_t h)
         return 0;
     }
 
-    h->ecb = cached_cipher(h->spec, SLOT_ECB);
+    h->ecb = cached_cipher(h->ospec, SLOT_ECB);
     return h->ecb ? 0 : GPG_ERR_NOT_SUPPORTED;
 }
 
@@ -931,10 +970,10 @@ static gcry_err_code_t ocb_native_keyinit(gcry_cipher_hd_t h);
 /* Set up one ECB context with the current key in direction ENC.  ECB has
  * no per-message state, so a context keyed once (*KEYED) is left alone. */
 static gcry_err_code_t
-init_ecb_ctx(gcry_cipher_hd_t h, EVP_CIPHER_CTX **ctxp, int *keyed, int enc)
+init_ecb_ctx_key(gcry_cipher_hd_t h, EVP_CIPHER_CTX **ctxp, int *keyed,
+                 int enc, const unsigned char *key, size_t keylen)
 {
     gcry_err_code_t rc = ensure_ecb_cipher(h);
-    size_t keylen = h->keylen;
 
     if (rc) {
         return rc;
@@ -974,13 +1013,19 @@ init_ecb_ctx(gcry_cipher_hd_t h, EVP_CIPHER_CTX **ctxp, int *keyed, int enc)
         }
     }
 
-    if (!EVP_CipherInit_ex2(*ctxp, NULL, h->key, NULL, enc, NULL)) {
+    if (!EVP_CipherInit_ex2(*ctxp, NULL, key, NULL, enc, NULL)) {
         return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
     }
 
     EVP_CIPHER_CTX_set_padding(*ctxp, 0);
     *keyed = 1;
     return 0;
+}
+
+static gcry_err_code_t
+init_ecb_ctx(gcry_cipher_hd_t h, EVP_CIPHER_CTX **ctxp, int *keyed, int enc)
+{
+    return init_ecb_ctx_key(h, ctxp, keyed, enc, h->key, h->keylen);
 }
 
 /* Block functions for OpenSSL's OCB128 driver, backed by EVP ECB. */
@@ -1010,25 +1055,73 @@ ecb_block_decrypt(const unsigned char in[16], unsigned char out[16],
     }
 }
 
-/* Translate the Libgcrypt IV conventions into what OpenSSL expects. */
+/* Keep IV of IVLEN bytes in the handle; GCM and SIV nonces may be longer
+ * than a block and go to a heap buffer. */
 static gcry_err_code_t
-effective_iv(gcry_cipher_hd_t h, unsigned char *iv, size_t *ivlen)
+store_iv(gcry_cipher_hd_t h, const unsigned char *iv, size_t ivlen)
 {
+    if (ivlen > MAX_BLOCKSIZE) {
+        if (ivlen > h->longivcap) {
+            unsigned char *p = handle_alloc(h, ivlen);
+
+            if (!p) {
+                return _gcry_err_code_from_syserror();
+            }
+
+            _gcry_free(h->longiv);
+            h->longiv = p;
+            h->longivcap = ivlen;
+        }
+
+        memcpy(h->longiv, iv, ivlen);
+    } else {
+        memset(h->iv, 0, sizeof h->iv);
+
+        if (ivlen) {
+            memcpy(h->iv, iv, ivlen);
+        }
+    }
+
+    h->ivlen = ivlen;
+    h->have_iv = 1;
+    return 0;
+}
+
+static const unsigned char *
+iv_ptr(gcry_cipher_hd_t h)
+{
+    return h->ivlen > MAX_BLOCKSIZE ? h->longiv : h->iv;
+}
+
+/* Translate the Libgcrypt IV conventions into what OpenSSL expects.
+ * On return *IVP points at the IV (BUF or the handle's own storage). */
+static gcry_err_code_t
+effective_iv(gcry_cipher_hd_t h, unsigned char *buf,
+             const unsigned char **ivp, size_t *ivlen)
+{
+    *ivp = buf;
     *ivlen = 0;
 
     switch (h->mode) {
     case GCRY_CIPHER_MODE_ECB:
+        return 0;
+
     case GCRY_CIPHER_MODE_AESWRAP:
-        if (h->mode == GCRY_CIPHER_MODE_AESWRAP && h->have_iv) {
-            memcpy(iv, h->iv, h->ivlen);
-            *ivlen = h->ivlen;
+
+        /* RFC 3394 takes an 8 byte integrity check value; the reference
+         * zero pads a shorter one and ignores the rest of a longer one.
+         * The padded variant (RFC 5649) always uses its default. */
+        if (h->have_iv && !(h->flags & GCRY_CIPHER_EXTENDED)) {
+            memset(buf, 0, 8);
+            memcpy(buf, h->iv, h->ivlen < 8 ? h->ivlen : 8);
+            *ivlen = 8;
         }
 
         return 0;
 
     case GCRY_CIPHER_MODE_CTR:
     case GCRY_CIPHER_MODE_CCM:
-        memcpy(iv, h->ctr, h->spec->blocksize);
+        memcpy(buf, h->ctr, h->spec->blocksize);
         *ivlen = h->spec->blocksize;
         return 0;
 
@@ -1039,47 +1132,69 @@ effective_iv(gcry_cipher_hd_t h, unsigned char *iv, size_t *ivlen)
 
         /* ChaCha20 takes a 16 byte counter||nonce.  An 8 byte nonce means
          * the original 64 bit counter variant, a 12 byte nonce the IETF
-         * variant; both start at counter zero. */
-        memset(iv, 0, 16);
+         * variant; both start at counter zero.  Other lengths were turned
+         * into an all zero IV by setiv, as the reference does. */
+        memset(buf, 0, 16);
 
         if (h->have_iv) {
-            memcpy(iv + 16 - h->ivlen, h->iv, h->ivlen);
+            memcpy(buf + 16 - h->ivlen, h->iv, h->ivlen);
         }
 
         *ivlen = 16;
         return 0;
 
     case GCRY_CIPHER_MODE_POLY1305:
-        memset(iv, 0, 12);
-
         if (!h->have_iv) {
             return GPG_ERR_INV_STATE;
         }
 
-        memcpy(iv + 12 - h->ivlen, h->iv, h->ivlen);
+        memset(buf, 0, 12);
+
+        if (h->ivlen == 16) {
+            /* Counter||nonce: OpenSSL's AEAD cipher cannot start at a
+             * non-zero block counter. */
+            if (h->iv[0] || h->iv[1] || h->iv[2] || h->iv[3]) {
+                return GPG_ERR_NOT_SUPPORTED;
+            }
+
+            memcpy(buf, h->iv + 4, 12);
+        } else if (h->ivlen) {
+            memcpy(buf + 12 - h->ivlen, h->iv, h->ivlen);
+        }
+
         *ivlen = 12;
         return 0;
 
     case GCRY_CIPHER_MODE_GCM:
         if (!h->have_iv) {
             /* Libgcrypt uses an all zero 16 byte IV in that case. */
-            memset(iv, 0, 16);
+            memset(buf, 0, 16);
             *ivlen = 16;
         } else {
-            memcpy(iv, h->iv, h->ivlen);
+            *ivp = iv_ptr(h);
             *ivlen = h->ivlen;
         }
 
         return 0;
 
     case GCRY_CIPHER_MODE_GCM_SIV:
-    case GCRY_CIPHER_MODE_XTS:
         if (!h->have_iv) {
             return GPG_ERR_INV_STATE;
         }
 
-        memcpy(iv, h->iv, h->ivlen);
+        memcpy(buf, h->iv, h->ivlen);
         *ivlen = h->ivlen;
+        return 0;
+
+    case GCRY_CIPHER_MODE_XTS:
+        /* The tweak is one block; short ones are zero padded. */
+        memset(buf, 0, 16);
+
+        if (h->have_iv) {
+            memcpy(buf, h->iv, h->ivlen < 16 ? h->ivlen : 16);
+        }
+
+        *ivlen = 16;
         return 0;
 
     case GCRY_CIPHER_MODE_SIV:
@@ -1088,10 +1203,10 @@ effective_iv(gcry_cipher_hd_t h, unsigned char *iv, size_t *ivlen)
     default:
         /* Block chaining modes: the IV is one block; Libgcrypt zero
          * pads short IVs and truncates long ones. */
-        memset(iv, 0, h->spec->blocksize);
+        memset(buf, 0, h->spec->blocksize);
 
         if (h->have_iv) {
-            memcpy(iv, h->iv, h->ivlen < h->spec->blocksize
+            memcpy(buf, h->iv, h->ivlen < h->spec->blocksize
                    ? h->ivlen : h->spec->blocksize);
         }
 
@@ -1123,7 +1238,7 @@ flush_aad(gcry_cipher_hd_t h, EVP_CIPHER_CTX *ctx)
         }
 
         if (h->have_iv) {
-            return evp_update(ctx, NULL, h->iv, h->ivlen);
+            return evp_update(ctx, NULL, iv_ptr(h), h->ivlen);
         }
 
         return 0;
@@ -1142,7 +1257,8 @@ static gcry_err_code_t
 ensure_ctx(gcry_cipher_hd_t h, int enc)
 {
     gcry_err_code_t rc;
-    unsigned char iv[MAX_BLOCKSIZE];
+    unsigned char ivbuf[MAX_BLOCKSIZE];
+    const unsigned char *iv;
     size_t ivlen;
     int chained = h->mode == GCRY_CIPHER_MODE_CBC
                   || h->mode == GCRY_CIPHER_MODE_CFB
@@ -1189,7 +1305,7 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
         }
     }
 
-    rc = effective_iv(h, iv, &ivlen);
+    rc = effective_iv(h, ivbuf, &iv, &ivlen);
 
     if (rc) {
         return rc;
@@ -1397,6 +1513,7 @@ cipher_open(gcry_cipher_hd_t *handle, int algo, int mode, unsigned int flags)
 
     h->magic = secure ? CTX_MAGIC_SECURE : CTX_MAGIC_NORMAL;
     h->spec = spec;
+    h->ospec = spec;
     h->algo = algo;
     h->mode = mode;
     h->flags = flags;
@@ -1410,8 +1527,18 @@ cipher_open(gcry_cipher_hd_t *handle, int algo, int mode, unsigned int flags)
     rc = fetch_mode_ciphers(h);
 
     if (!rc && ((mode == GCRY_CIPHER_MODE_OCB && !h->ocb_native)
-                || h->generic_ctr)) {
+                || h->generic_ctr || h->xts_generic
+                || (h->wrap_generic && spec->blocksize == 16))) {
         rc = ensure_ecb_cipher(h);
+    }
+
+    if (!rc && mode == GCRY_CIPHER_MODE_GCM) {
+        /* Decryption needs the block function and a CTR stream. */
+        rc = ensure_ecb_cipher(h);
+
+        if (!rc && !cached_cipher(spec, SLOT_CTR)) {
+            rc = GPG_ERR_NOT_SUPPORTED;
+        }
     }
 
     if (!rc && mode == GCRY_CIPHER_MODE_CCM) {
@@ -1459,7 +1586,13 @@ gcry_cipher_close(gcry_cipher_hd_t h)
     EVP_CIPHER_CTX_free(h->ctx);
     EVP_CIPHER_CTX_free(h->ecb_enc);
     EVP_CIPHER_CTX_free(h->ecb_dec);
+    EVP_CIPHER_CTX_free(h->ecb2_enc);
     EVP_CIPHER_CTX_free(h->ccm_mac);
+    EVP_CIPHER_CTX_free(h->gcm_ctr);
+
+    if (h->gcm) {
+        CRYPTO_gcm128_release(h->gcm);
+    }
 
     if (h->ocb) {
         CRYPTO_ocb128_cleanup(h->ocb);
@@ -1467,6 +1600,7 @@ gcry_cipher_close(gcry_cipher_hd_t h)
     }
 
     aad_reset(h);
+    _gcry_free(h->longiv);
 
     /* The key material; the rest of the handle holds nothing secret. */
     _gcry_wipememory(h->key, sizeof h->key);
@@ -1479,20 +1613,71 @@ gcry_cipher_close(gcry_cipher_hd_t h)
 /* Key and IV                                                          */
 /* ------------------------------------------------------------------ */
 
-/* The weak and semi-weak DES keys (FIPS 74), parity bits cleared. */
-static const unsigned char des_weak_keys[16][8] = {
+/* The 64 DES keys the reference library rejects: the four weak and
+ * twelve semi-weak keys of FIPS 74 plus the 48 possibly weak keys, that is
+ * every key whose two 28 bit key schedule registers both follow a pattern
+ * of period four or less.  Parity bits are cleared for the comparison. */
+static const unsigned char des_weak_keys[64][8] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
     { 0x00, 0x00, 0x1e, 0x1e, 0x00, 0x00, 0x0e, 0x0e },
     { 0x00, 0x00, 0xe0, 0xe0, 0x00, 0x00, 0xf0, 0xf0 },
     { 0x00, 0x00, 0xfe, 0xfe, 0x00, 0x00, 0xfe, 0xfe },
+    { 0x00, 0x1e, 0x00, 0x1e, 0x00, 0x0e, 0x00, 0x0e },
+    { 0x00, 0x1e, 0x1e, 0x00, 0x00, 0x0e, 0x0e, 0x00 },
+    { 0x00, 0x1e, 0xe0, 0xfe, 0x00, 0x0e, 0xf0, 0xfe },
+    { 0x00, 0x1e, 0xfe, 0xe0, 0x00, 0x0e, 0xfe, 0xf0 },
+    { 0x00, 0xe0, 0x00, 0xe0, 0x00, 0xf0, 0x00, 0xf0 },
+    { 0x00, 0xe0, 0x1e, 0xfe, 0x00, 0xf0, 0x0e, 0xfe },
+    { 0x00, 0xe0, 0xe0, 0x00, 0x00, 0xf0, 0xf0, 0x00 },
+    { 0x00, 0xe0, 0xfe, 0x1e, 0x00, 0xf0, 0xfe, 0x0e },
+    { 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe },
+    { 0x00, 0xfe, 0x1e, 0xe0, 0x00, 0xfe, 0x0e, 0xf0 },
+    { 0x00, 0xfe, 0xe0, 0x1e, 0x00, 0xfe, 0xf0, 0x0e },
+    { 0x00, 0xfe, 0xfe, 0x00, 0x00, 0xfe, 0xfe, 0x00 },
+    { 0x1e, 0x00, 0x00, 0x1e, 0x0e, 0x00, 0x00, 0x0e },
+    { 0x1e, 0x00, 0x1e, 0x00, 0x0e, 0x00, 0x0e, 0x00 },
+    { 0x1e, 0x00, 0xe0, 0xfe, 0x0e, 0x00, 0xf0, 0xfe },
+    { 0x1e, 0x00, 0xfe, 0xe0, 0x0e, 0x00, 0xfe, 0xf0 },
     { 0x1e, 0x1e, 0x00, 0x00, 0x0e, 0x0e, 0x00, 0x00 },
     { 0x1e, 0x1e, 0x1e, 0x1e, 0x0e, 0x0e, 0x0e, 0x0e },
     { 0x1e, 0x1e, 0xe0, 0xe0, 0x0e, 0x0e, 0xf0, 0xf0 },
     { 0x1e, 0x1e, 0xfe, 0xfe, 0x0e, 0x0e, 0xfe, 0xfe },
+    { 0x1e, 0xe0, 0x00, 0xfe, 0x0e, 0xf0, 0x00, 0xfe },
+    { 0x1e, 0xe0, 0x1e, 0xe0, 0x0e, 0xf0, 0x0e, 0xf0 },
+    { 0x1e, 0xe0, 0xe0, 0x1e, 0x0e, 0xf0, 0xf0, 0x0e },
+    { 0x1e, 0xe0, 0xfe, 0x00, 0x0e, 0xf0, 0xfe, 0x00 },
+    { 0x1e, 0xfe, 0x00, 0xe0, 0x0e, 0xfe, 0x00, 0xf0 },
+    { 0x1e, 0xfe, 0x1e, 0xfe, 0x0e, 0xfe, 0x0e, 0xfe },
+    { 0x1e, 0xfe, 0xe0, 0x00, 0x0e, 0xfe, 0xf0, 0x00 },
+    { 0x1e, 0xfe, 0xfe, 0x1e, 0x0e, 0xfe, 0xfe, 0x0e },
+    { 0xe0, 0x00, 0x00, 0xe0, 0xf0, 0x00, 0x00, 0xf0 },
+    { 0xe0, 0x00, 0x1e, 0xfe, 0xf0, 0x00, 0x0e, 0xfe },
+    { 0xe0, 0x00, 0xe0, 0x00, 0xf0, 0x00, 0xf0, 0x00 },
+    { 0xe0, 0x00, 0xfe, 0x1e, 0xf0, 0x00, 0xfe, 0x0e },
+    { 0xe0, 0x1e, 0x00, 0xfe, 0xf0, 0x0e, 0x00, 0xfe },
+    { 0xe0, 0x1e, 0x1e, 0xe0, 0xf0, 0x0e, 0x0e, 0xf0 },
+    { 0xe0, 0x1e, 0xe0, 0x1e, 0xf0, 0x0e, 0xf0, 0x0e },
+    { 0xe0, 0x1e, 0xfe, 0x00, 0xf0, 0x0e, 0xfe, 0x00 },
     { 0xe0, 0xe0, 0x00, 0x00, 0xf0, 0xf0, 0x00, 0x00 },
     { 0xe0, 0xe0, 0x1e, 0x1e, 0xf0, 0xf0, 0x0e, 0x0e },
     { 0xe0, 0xe0, 0xe0, 0xe0, 0xf0, 0xf0, 0xf0, 0xf0 },
     { 0xe0, 0xe0, 0xfe, 0xfe, 0xf0, 0xf0, 0xfe, 0xfe },
+    { 0xe0, 0xfe, 0x00, 0x1e, 0xf0, 0xfe, 0x00, 0x0e },
+    { 0xe0, 0xfe, 0x1e, 0x00, 0xf0, 0xfe, 0x0e, 0x00 },
+    { 0xe0, 0xfe, 0xe0, 0xfe, 0xf0, 0xfe, 0xf0, 0xfe },
+    { 0xe0, 0xfe, 0xfe, 0xe0, 0xf0, 0xfe, 0xfe, 0xf0 },
+    { 0xfe, 0x00, 0x00, 0xfe, 0xfe, 0x00, 0x00, 0xfe },
+    { 0xfe, 0x00, 0x1e, 0xe0, 0xfe, 0x00, 0x0e, 0xf0 },
+    { 0xfe, 0x00, 0xe0, 0x1e, 0xfe, 0x00, 0xf0, 0x0e },
+    { 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00 },
+    { 0xfe, 0x1e, 0x00, 0xe0, 0xfe, 0x0e, 0x00, 0xf0 },
+    { 0xfe, 0x1e, 0x1e, 0xfe, 0xfe, 0x0e, 0x0e, 0xfe },
+    { 0xfe, 0x1e, 0xe0, 0x00, 0xfe, 0x0e, 0xf0, 0x00 },
+    { 0xfe, 0x1e, 0xfe, 0x1e, 0xfe, 0x0e, 0xfe, 0x0e },
+    { 0xfe, 0xe0, 0x00, 0x1e, 0xfe, 0xf0, 0x00, 0x0e },
+    { 0xfe, 0xe0, 0x1e, 0x00, 0xfe, 0xf0, 0x0e, 0x00 },
+    { 0xfe, 0xe0, 0xe0, 0xfe, 0xfe, 0xf0, 0xf0, 0xfe },
+    { 0xfe, 0xe0, 0xfe, 0xe0, 0xfe, 0xf0, 0xfe, 0xf0 },
     { 0xfe, 0xfe, 0x00, 0x00, 0xfe, 0xfe, 0x00, 0x00 },
     { 0xfe, 0xfe, 0x1e, 0x1e, 0xfe, 0xfe, 0x0e, 0x0e },
     { 0xfe, 0xfe, 0xe0, 0xe0, 0xfe, 0xfe, 0xf0, 0xf0 },
@@ -1519,10 +1704,53 @@ des_is_weak_key(const unsigned char *key)
     return 0;
 }
 
-static gcry_err_code_t
-check_keylen(gcry_cipher_hd_t h, size_t keylen)
+/* The reference library lets any member of a cipher family take any of
+ * the family's key lengths: a 32 byte key on the AES id selects AES-256.
+ * Return the variant that implements KEYLEN, or NULL if none does. */
+static const struct algo_spec *
+family_spec(const struct algo_spec *spec, size_t keylen)
 {
-    const struct algo_spec *spec = h->spec;
+    static const int families[][3] = {
+        { GCRY_CIPHER_AES, GCRY_CIPHER_AES192, GCRY_CIPHER_AES256 },
+        {
+            GCRY_CIPHER_CAMELLIA128, GCRY_CIPHER_CAMELLIA192,
+            GCRY_CIPHER_CAMELLIA256
+        },
+        {
+            GCRY_CIPHER_SERPENT128, GCRY_CIPHER_SERPENT192,
+            GCRY_CIPHER_SERPENT256
+        },
+    };
+    size_t f;
+    int i;
+
+    for (f = 0; f < DIM(families); f++) {
+        for (i = 0; i < 3; i++) {
+            if (families[f][i] == spec->algo) {
+                for (i = 0; i < 3; i++) {
+                    const struct algo_spec *m = spec_from_algo(families[f][i]);
+
+                    if (m && keylen >= m->min_keylen
+                        && keylen <= m->max_keylen) {
+                        return m;
+                    }
+                }
+
+                return NULL;
+            }
+        }
+    }
+
+    return keylen >= spec->min_keylen && keylen <= spec->max_keylen ? spec
+           : NULL;
+}
+
+/* Validate KEYLEN and pick the OpenSSL variant for it. */
+static gcry_err_code_t
+check_keylen(gcry_cipher_hd_t h, size_t keylen,
+             const struct algo_spec **r_ospec)
+{
+    const struct algo_spec *fam;
     size_t single = keylen;
 
     if (h->mode == GCRY_CIPHER_MODE_XTS || h->mode == GCRY_CIPHER_MODE_SIV) {
@@ -1533,21 +1761,25 @@ check_keylen(gcry_cipher_hd_t h, size_t keylen)
         single = keylen / 2;
     }
 
-    if (single < spec->min_keylen || single > spec->max_keylen) {
-        return GPG_ERR_INV_KEYLEN;
-    }
-
     if (keylen > MAX_KEYLEN) {
         return GPG_ERR_INV_KEYLEN;
     }
 
+    fam = family_spec(h->spec, single);
+
+    if (!fam) {
+        return GPG_ERR_INV_KEYLEN;
+    }
+
+    *r_ospec = fam;
     return 0;
 }
 
 static gcry_err_code_t
 cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
 {
-    gcry_err_code_t rc = check_keylen(h, keylen);
+    const struct algo_spec *ospec = h->ospec;
+    gcry_err_code_t rc = check_keylen(h, keylen, &ospec);
     int weak = 0;
 
     if (rc) {
@@ -1557,6 +1789,17 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
     /* RFC 8452 defines AES-GCM-SIV for 128 and 256 bit keys only. */
     if (h->mode == GCRY_CIPHER_MODE_GCM_SIV && keylen != 16 && keylen != 32) {
         return GPG_ERR_INV_KEYLEN;
+    }
+
+    if (ospec != h->ospec) {
+        /* Another variant of the family: look its ciphers up anew. */
+        h->ospec = ospec;
+        h->ecb = NULL;
+        rc = fetch_mode_ciphers(h);
+
+        if (rc) {
+            return rc;
+        }
     }
 
     if (h->algo == GCRY_CIPHER_DES || h->algo == GCRY_CIPHER_3DES) {
@@ -1591,7 +1834,10 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
     h->ctx_keyed = 0;
     h->ecb_enc_keyed = 0;
     h->ecb_dec_keyed = 0;
+    h->ecb2_enc_keyed = 0;
     h->ccm_mac_keyed = 0;
+    h->gcm_keyed = 0;
+    h->gcm_ctr_keyed = 0;
 
     /* Validate the key with OpenSSL right away so that errors surface here
      * instead of at the first encryption. */
@@ -1620,6 +1866,23 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
         }
     } else if (h->generic_ctr) {
         rc = init_ecb_ctx(h, &h->ecb_enc, &h->ecb_enc_keyed, 1);
+    } else if (h->wrap_generic) {
+        if (h->spec->blocksize == 16) {
+            rc = init_ecb_ctx(h, &h->ecb_enc, &h->ecb_enc_keyed, 1);
+        }
+    } else if (h->xts_generic) {
+        rc = init_ecb_ctx_key(h, &h->ecb_enc, &h->ecb_enc_keyed, 1, h->key,
+                              keylen / 2);
+
+        if (!rc) {
+            rc = init_ecb_ctx_key(h, &h->ecb_dec, &h->ecb_dec_keyed, 0,
+                                  h->key, keylen / 2);
+        }
+
+        if (!rc) {
+            rc = init_ecb_ctx_key(h, &h->ecb2_enc, &h->ecb2_enc_keyed, 1,
+                                  h->key + keylen / 2, keylen / 2);
+        }
     } else if (!is_aead_mode(h->mode) && h->mode != GCRY_CIPHER_MODE_XTS
                && h->mode != GCRY_CIPHER_MODE_AESWRAP) {
         rc = ensure_ctx(h, 1);
@@ -1662,16 +1925,16 @@ static gcry_err_code_t
 cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
 {
     size_t bs = h->spec->blocksize;
+    const unsigned char *ivb = iv;
+    int keep_dectag = 0;
+    int allow;
+    size_t taglen;
+    unsigned char dectag[16];
+    int dectag_set;
 
     switch (h->mode) {
     case GCRY_CIPHER_MODE_GCM:
         if (!iv || !ivlen) {
-            return GPG_ERR_INV_LENGTH;
-        }
-
-        if (ivlen > MAX_BLOCKSIZE) {
-            /* OpenSSL accepts longer IVs but the handle only keeps 16
-             * bytes; GHASH based IV derivation beyond that is rare. */
             return GPG_ERR_INV_LENGTH;
         }
 
@@ -1700,47 +1963,81 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
         break;
 
     case GCRY_CIPHER_MODE_POLY1305:
-        if (!iv || (ivlen != 12 && ivlen != 8)) {
+        if (!iv) {
             return GPG_ERR_INV_ARG;
+        }
+
+        if (ivlen != 8 && ivlen != 12 && ivlen != 16) {
+            /* The reference warns and continues with an all zero nonce. */
+            log_info("WARNING: cipher_setiv: bad ivlen=%u for Poly1305\n",
+                     (unsigned int)ivlen);
+            ivlen = 0;
         }
 
         break;
 
     case GCRY_CIPHER_MODE_GCM_SIV:
         if (!iv || ivlen != 12) {
-            return GPG_ERR_INV_LENGTH;
+            return GPG_ERR_INV_ARG;
         }
 
+        if (h->data_started || h->data_done || h->tag_ready) {
+            return GPG_ERR_INV_STATE; /* Finished: reset first. */
+        }
+
+        keep_dectag = 1; /* A tag set before the nonce stays valid. */
         break;
 
     case GCRY_CIPHER_MODE_XTS:
-        if (!iv || ivlen != 16) {
-            return GPG_ERR_INV_LENGTH;
+        if (!iv) {
+            return GPG_ERR_INV_ARG;
+        }
+
+        if (ivlen != 16) {
+            log_info("WARNING: cipher_setiv: ivlen=%u blklen=16\n",
+                     (unsigned int)ivlen);
+        }
+
+        if (ivlen > 16) {
+            ivlen = 16;
         }
 
         break;
 
     case GCRY_CIPHER_MODE_AESWRAP:
-        if (iv && ivlen != ((h->flags & GCRY_CIPHER_EXTENDED) ? 4u : 8u)) {
-            return GPG_ERR_INV_LENGTH;
+
+        /* Any length is taken; what is used of it is decided when the
+         * data comes (see effective_iv).  A NULL IV means the default. */
+        if (ivlen > MAX_BLOCKSIZE) {
+            ivlen = MAX_BLOCKSIZE;
         }
 
         break;
 
     case GCRY_CIPHER_MODE_SIV:
-        if (!iv || !ivlen || ivlen > MAX_BLOCKSIZE) {
-            return GPG_ERR_INV_LENGTH;
+
+        /* The nonce is the last S2V component: it comes after all the
+         * associated data and only once per message, and it does not
+         * disturb the message state built so far. */
+        if (!iv) {
+            return GPG_ERR_INV_ARG;
         }
 
-        break;
+        if (h->have_iv || h->data_started || h->data_done || h->tag_ready) {
+            return GPG_ERR_INV_STATE;
+        }
+
+        return store_iv(h, ivb, ivlen);
 
     case GCRY_CIPHER_MODE_STREAM:
         if (h->algo == GCRY_CIPHER_CHACHA20) {
             if (iv && ivlen != 8 && ivlen != 12 && ivlen != 16) {
-                return GPG_ERR_INV_ARG;
+                log_info("WARNING: cipher_setiv: bad ivlen=%u for "
+                         "ChaCha20\n", (unsigned int)ivlen);
+                ivlen = 0;
             }
-        } else if (iv && ivlen) {
-            return GPG_ERR_INV_ARG; /* ARCFOUR has no IV. */
+        } else {
+            ivlen = 0; /* ARCFOUR has no IV; the call is a no-op. */
         }
 
         break;
@@ -1759,22 +2056,28 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
     }
 
     /* A new IV starts a new message; the key and settings stay. */
-    {
-        int allow = h->allow_weak_key;
-        size_t taglen = h->taglen;
+    allow = h->allow_weak_key;
+    taglen = h->taglen;
+    dectag_set = h->dectag_set;
+    memcpy(dectag, h->dectag, sizeof dectag);
+    reset_message_state(h);
+    h->allow_weak_key = allow;
 
-        reset_message_state(h);
-        h->allow_weak_key = allow;
+    if (h->mode == GCRY_CIPHER_MODE_OCB) {
+        h->taglen = taglen;
+    }
 
-        if (h->mode == GCRY_CIPHER_MODE_OCB) {
-            h->taglen = taglen;
-        }
+    if (keep_dectag && dectag_set) {
+        h->dectag_set = 1;
+        memcpy(h->dectag, dectag, sizeof dectag);
     }
 
     if (iv) {
-        memcpy(h->iv, iv, ivlen);
-        h->ivlen = ivlen;
-        h->have_iv = 1;
+        gcry_err_code_t rc = store_iv(h, ivb, ivlen);
+
+        if (rc) {
+            return rc;
+        }
     }
 
     if (h->mode == GCRY_CIPHER_MODE_CCM && iv) {
@@ -1988,6 +2291,146 @@ do_cts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
     return rc;
 }
 
+/* XTS (IEEE 1619) composed from the ECB contexts for the variants OpenSSL
+ * has no native cipher for: the tweak is encrypted with the second key,
+ * each block is masked with the running tweak before and after the block
+ * cipher, the tweak is multiplied by alpha between blocks, and a final
+ * partial block uses ciphertext stealing.  Blocks go to OpenSSL in
+ * batches. */
+static void
+xts_next_tweak(unsigned char t[16])
+{
+    unsigned int carry = 0;
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        unsigned int b = t[i];
+
+        t[i] = (unsigned char)((b << 1) | carry);
+        carry = b >> 7;
+    }
+
+    if (carry) {
+        t[0] ^= 0x87;
+    }
+}
+
+static gcry_err_code_t
+generic_xts_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out,
+                  const unsigned char *in, size_t inlen)
+{
+    EVP_CIPHER_CTX *data_ctx = enc ? h->ecb_enc : h->ecb_dec;
+    unsigned char tweakbuf[16];
+    unsigned char t[16];
+    unsigned char tweaks[64 * 16];
+    unsigned char work[64 * 16];
+    const unsigned char *ivp;
+    size_t ivlen;
+    size_t nfull = inlen / 16;
+    size_t tail = inlen % 16;
+    gcry_err_code_t rc;
+    int outl = 0;
+
+    rc = effective_iv(h, tweakbuf, &ivp, &ivlen);
+
+    if (rc) {
+        return rc;
+    }
+
+    if (!EVP_EncryptUpdate(h->ecb2_enc, t, &outl, tweakbuf, 16)) {
+        return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+    }
+
+    /* With ciphertext stealing the last full block is handled together
+     * with the partial one below. */
+    if (tail) {
+        nfull--;
+    }
+
+    while (nfull) {
+        size_t n = nfull > 64 ? 64 : nfull;
+        size_t i;
+
+        for (i = 0; i < n; i++) {
+            size_t j;
+
+            memcpy(tweaks + i * 16, t, 16);
+
+            for (j = 0; j < 16; j++) {
+                work[i * 16 + j] = (unsigned char)(in[i * 16 + j] ^ t[j]);
+            }
+
+            xts_next_tweak(t);
+        }
+
+        if (!EVP_CipherUpdate(data_ctx, work, &outl, work, (int)(n * 16))) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+
+        for (i = 0; i < n * 16; i++) {
+            out[i] = (unsigned char)(work[i] ^ tweaks[i]);
+        }
+
+        in += n * 16;
+        out += n * 16;
+        nfull -= n;
+    }
+
+    if (tail) {
+        unsigned char t2[16];
+        unsigned char block[16];
+        size_t j;
+
+        memcpy(t2, t, 16);
+        xts_next_tweak(t2);
+
+        /* Decryption processes the stolen block with the later tweak. */
+        if (!enc) {
+            unsigned char tmp[16];
+
+            memcpy(tmp, t, 16);
+            memcpy(t, t2, 16);
+            memcpy(t2, tmp, 16);
+        }
+
+        for (j = 0; j < 16; j++) {
+            block[j] = (unsigned char)(in[j] ^ t[j]);
+        }
+
+        if (!EVP_CipherUpdate(data_ctx, block, &outl, block, 16)) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+
+        for (j = 0; j < 16; j++) {
+            block[j] ^= t[j];
+        }
+
+        /* The last partial output is the head of this block; the block is
+         * completed with the partial input and processed with the other
+         * tweak to become the full output block. */
+        memcpy(out + 16, block, tail);
+
+        for (j = 0; j < tail; j++) {
+            block[j] = in[16 + j];
+        }
+
+        for (j = 0; j < 16; j++) {
+            block[j] = (unsigned char)(block[j] ^ t2[j]);
+        }
+
+        if (!EVP_CipherUpdate(data_ctx, block, &outl, block, 16)) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+
+        for (j = 0; j < 16; j++) {
+            out[j] = (unsigned char)(block[j] ^ t2[j]);
+        }
+    }
+
+    _gcry_wipememory(work, sizeof work);
+    return 0;
+}
+
 static gcry_err_code_t
 do_xts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
        const unsigned char *in, size_t inlen)
@@ -2000,6 +2443,10 @@ do_xts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 
     if (inlen > ((size_t)16 << 20)) {
         return GPG_ERR_INV_LENGTH;
+    }
+
+    if (h->xts_generic) {
+        return generic_xts_crypt(h, enc, out, in, inlen);
     }
 
     h->ctx_ready = 0; /* One data unit per call, always from the tweak. */
@@ -2063,20 +2510,63 @@ do_wrap(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
         }
     }
 
-    h->ctx_ready = 0;
-    rc = ensure_ctx(h, enc);
+    if (h->wrap_generic) {
+        unsigned char ivbuf[MAX_BLOCKSIZE];
+        const unsigned char *iv;
+        size_t ivlen;
+        size_t n;
 
-    if (rc) {
-        return rc;
-    }
+        /* The driver works on 128 bit block ciphers only. */
+        if (h->spec->blocksize != 16) {
+            return GPG_ERR_INV_LENGTH;
+        }
 
-    if (!EVP_CipherUpdate(h->ctx, out, &outl, in, (int)inlen)) {
-        ERR_clear_error();
+        rc = effective_iv(h, ivbuf, &iv, &ivlen);
+
+        if (!rc) {
+            rc = init_ecb_ctx(h, enc ? &h->ecb_enc : &h->ecb_dec,
+                              enc ? &h->ecb_enc_keyed : &h->ecb_dec_keyed,
+                              enc);
+        }
+
+        if (rc) {
+            return rc;
+        }
+
+        if (extended) {
+            n = enc ? CRYPTO_128_wrap_pad(h->ecb_enc, NULL, out, in, inlen,
+                                          ecb_block_encrypt)
+                : CRYPTO_128_unwrap_pad(h->ecb_dec, NULL, out, in, inlen,
+                                        ecb_block_decrypt);
+        } else {
+            n = enc ? CRYPTO_128_wrap(h->ecb_enc, ivlen ? iv : NULL, out, in,
+                                      inlen, ecb_block_encrypt)
+                : CRYPTO_128_unwrap(h->ecb_dec, ivlen ? iv : NULL, out, in,
+                                    inlen, ecb_block_decrypt);
+        }
+
+        if (!n) {
+            ERR_clear_error();
+            return enc ? GPG_ERR_INTERNAL : GPG_ERR_CHECKSUM;
+        }
+
+        outl = (int)n;
+    } else {
         h->ctx_ready = 0;
-        return enc ? GPG_ERR_INTERNAL : GPG_ERR_CHECKSUM;
-    }
+        rc = ensure_ctx(h, enc);
 
-    h->ctx_ready = 0;
+        if (rc) {
+            return rc;
+        }
+
+        if (!EVP_CipherUpdate(h->ctx, out, &outl, in, (int)inlen)) {
+            ERR_clear_error();
+            h->ctx_ready = 0;
+            return enc ? GPG_ERR_INTERNAL : GPG_ERR_CHECKSUM;
+        }
+
+        h->ctx_ready = 0;
+    }
 
     if (!enc) {
         size_t plen = (size_t)outl;
@@ -2101,6 +2591,141 @@ do_wrap(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 }
 
 /* GCM, ChaCha20-Poly1305, SIV and GCM-SIV data processing. */
+static gcry_err_code_t evp_finish_encrypt(gcry_cipher_hd_t h);
+
+/* Block and counter stream callbacks for the GCM128 driver. */
+static void
+gcm_block(const unsigned char in[16], unsigned char out[16],
+          const void *key)
+{
+    gcry_cipher_hd_t h = (gcry_cipher_hd_t)(uintptr_t)key;
+
+    ecb_block_encrypt(in, out, h->ecb_enc);
+}
+
+static void
+gcm_ctr_stream(const unsigned char *in, unsigned char *out, size_t blocks,
+               const void *key, const unsigned char ivec[16])
+{
+    gcry_cipher_hd_t h = (gcry_cipher_hd_t)(uintptr_t)key;
+    int outl = 0;
+
+    if (!EVP_CipherInit_ex2(h->gcm_ctr, NULL, NULL, ivec, 1, NULL)
+        || !EVP_EncryptUpdate(h->gcm_ctr, out, &outl, in,
+                              (int)(blocks * 16))) {
+        ERR_clear_error();
+        memset(out, 0, blocks * 16);
+        h->verify_failed = 1; /* Poisons the message; the tag will fail. */
+    }
+}
+
+/* Start a GCM decryption: key the driver and the counter stream, apply
+ * the IV and any associated data given so far. */
+static gcry_err_code_t
+gcm_dec_start(gcry_cipher_hd_t h)
+{
+    gcry_err_code_t rc;
+    unsigned char ivbuf[MAX_BLOCKSIZE];
+    const unsigned char *iv;
+    size_t ivlen;
+
+    if (h->gcm_started) {
+        return 0;
+    }
+
+    if (!h->have_key) {
+        return GPG_ERR_MISSING_KEY;
+    }
+
+    rc = init_ecb_ctx(h, &h->ecb_enc, &h->ecb_enc_keyed, 1);
+
+    if (rc) {
+        return rc;
+    }
+
+    if (!h->gcm_ctr) {
+        h->gcm_ctr = EVP_CIPHER_CTX_new();
+
+        if (!h->gcm_ctr) {
+            return GPG_ERR_ENOMEM;
+        }
+    }
+
+    if (!h->gcm_ctr_keyed) {
+        const EVP_CIPHER *ctr = cached_cipher(h->ospec, SLOT_CTR);
+
+        if (!ctr) {
+            return GPG_ERR_NOT_SUPPORTED;
+        }
+
+        if (!EVP_CipherInit_ex2(h->gcm_ctr, ctr, h->key, NULL, 1, NULL)) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+
+        EVP_CIPHER_CTX_set_padding(h->gcm_ctr, 0);
+        h->gcm_ctr_keyed = 1;
+    }
+
+    if (!h->gcm) {
+        h->gcm = CRYPTO_gcm128_new(h, gcm_block);
+
+        if (!h->gcm) {
+            return GPG_ERR_ENOMEM;
+        }
+
+        h->gcm_keyed = 1;
+    } else if (!h->gcm_keyed) {
+        CRYPTO_gcm128_init(h->gcm, h, gcm_block);
+        h->gcm_keyed = 1;
+    }
+
+    rc = effective_iv(h, ivbuf, &iv, &ivlen);
+
+    if (rc) {
+        return rc;
+    }
+
+    CRYPTO_gcm128_setiv(h->gcm, iv, ivlen);
+
+    if (h->aadlen && CRYPTO_gcm128_aad(h->gcm, h->aad, h->aadlen) != 0) {
+        return GPG_ERR_INTERNAL;
+    }
+
+    buffer_free(&h->aad, &h->aadlen, &h->aadcap);
+    h->gcm_started = 1;
+    h->enc = 0;
+    return 0;
+}
+
+/* Compute the tag of a GCM message: from the driver when decrypting,
+ * from the EVP context otherwise. */
+static gcry_err_code_t
+gcm_finish(gcry_cipher_hd_t h)
+{
+    gcry_err_code_t rc;
+
+    if (h->tag_ready) {
+        return 0;
+    }
+
+    if (h->gcm_started || (h->data_started && !h->enc)) {
+        rc = gcm_dec_start(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        CRYPTO_gcm128_tag(h->gcm, h->tag, 16);
+        h->aad_done = 1;
+        h->tag_ready = 1;
+        h->data_done = 1;
+        return h->verify_failed ? GPG_ERR_INTERNAL : 0;
+    }
+
+    return evp_finish_encrypt(h);
+}
+
+/* GCM, ChaCha20-Poly1305, SIV and GCM-SIV data processing. */
 static gcry_err_code_t
 do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
             const unsigned char *in, size_t inlen)
@@ -2115,8 +2740,37 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
         return GPG_ERR_INV_STATE;
     }
 
-    if (h->ctx_ready && h->enc != enc && h->data_started) {
+    if (h->data_started && h->enc != enc) {
         return GPG_ERR_INV_STATE; /* Cannot turn around mid-message. */
+    }
+
+    if (h->mode == GCRY_CIPHER_MODE_GCM && !enc) {
+        rc = gcm_dec_start(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        h->aad_done = 1;
+        h->data_started = 1;
+
+        if (inlen && CRYPTO_gcm128_decrypt_ctr32(h->gcm, in, out, inlen,
+                                                 gcm_ctr_stream) != 0) {
+            return GPG_ERR_INV_LENGTH;
+        }
+
+        return 0;
+    }
+
+    if (is_single_shot_mode(h->mode)) {
+        /* A handle given a decryption tag is a decryption handle. */
+        if (enc && h->dectag_set) {
+            return GPG_ERR_INV_STATE;
+        }
+
+        if (inlen > (size_t)INT_MAX) {
+            return GPG_ERR_INV_LENGTH;
+        }
     }
 
     rc = ensure_ctx(h, enc);
@@ -2130,16 +2784,27 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 
     if (is_single_shot_mode(h->mode)) {
         int outl = 0;
+        unsigned char dummy[16];
 
-        if (inlen > (size_t)INT_MAX) {
-            return GPG_ERR_INV_LENGTH;
+        /* SIV verifies the tag while it decrypts, so either call may
+         * report the mismatch.  Wrong tag: the reference discards the
+         * plaintext and the message is over. */
+        if (!EVP_CipherUpdate(h->ctx, inlen ? out : dummy, &outl,
+                              inlen ? in : dummy, (int)inlen)) {
+            if (enc) {
+                return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+            }
+
+            ERR_clear_error();
+            h->data_done = 1;
+            h->verify_failed = 1;
+            memset(out, 0, inlen);
+            return GPG_ERR_CHECKSUM;
         }
 
-        if (!EVP_CipherUpdate(h->ctx, out, &outl, in, (int)inlen)) {
-            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
-        }
+        h->data_done = 1;
 
-        if (!EVP_CipherFinal_ex(h->ctx, out + outl, &outl)) {
+        if (!EVP_CipherFinal_ex(h->ctx, dummy, &outl)) {
             ERR_clear_error();
 
             if (enc) {
@@ -2147,9 +2812,10 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
             }
 
             h->verify_failed = 1;
+            memset(out, 0, inlen);
+            return GPG_ERR_CHECKSUM;
         }
 
-        h->data_done = 1;
         return 0;
     }
 
@@ -2258,7 +2924,7 @@ ccm_mac_start(gcry_cipher_hd_t h)
             return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
         }
     } else {
-        const EVP_CIPHER *cbc = cached_cipher(h->spec, SLOT_CBC);
+        const EVP_CIPHER *cbc = cached_cipher(h->ospec, SLOT_CBC);
 
         if (!cbc) {
             return GPG_ERR_NOT_SUPPORTED;
@@ -2758,11 +3424,10 @@ cipher_crypt(gcry_cipher_hd_t h, int enc, void *outbuf, size_t outsize,
     switch (h->mode) {
     case GCRY_CIPHER_MODE_ECB:
     case GCRY_CIPHER_MODE_CBC:
-        if (h->mode == GCRY_CIPHER_MODE_CBC && (h->flags & GCRY_CIPHER_CBC_MAC)) {
-            if (!enc) {
-                return GPG_ERR_INV_CIPHER_MODE;
-            }
 
+        /* The MAC flag only changes encryption; decryption is plain CBC. */
+        if (h->mode == GCRY_CIPHER_MODE_CBC && (h->flags & GCRY_CIPHER_CBC_MAC)
+            && enc) {
             return do_cbc_mac(h, out, outsize, in, inlen);
         }
 
@@ -2898,8 +3563,23 @@ cipher_authenticate(gcry_cipher_hd_t h, const void *abuf, size_t abuflen)
 
     switch (h->mode) {
     case GCRY_CIPHER_MODE_GCM:
+        if (h->aad_done || h->tag_ready) {
+            return GPG_ERR_INV_STATE;
+        }
+
+        if (h->gcm_started) {
+            return CRYPTO_gcm128_aad(h->gcm, abuf, abuflen) == 0
+                   ? 0 : GPG_ERR_INV_STATE;
+        }
+
+        if (h->ctx_ready) {
+            return evp_update(h->ctx, NULL, abuf, abuflen);
+        }
+
+        return buffer_append(h, &h->aad, &h->aadlen, &h->aadcap, abuf,
+                             abuflen);
+
     case GCRY_CIPHER_MODE_POLY1305:
-    case GCRY_CIPHER_MODE_GCM_SIV:
         if (h->aad_done || h->tag_ready) {
             return GPG_ERR_INV_STATE;
         }
@@ -2911,8 +3591,21 @@ cipher_authenticate(gcry_cipher_hd_t h, const void *abuf, size_t abuflen)
         return buffer_append(h, &h->aad, &h->aadlen, &h->aadcap, abuf,
                              abuflen);
 
+    case GCRY_CIPHER_MODE_GCM_SIV:
+
+        /* The nonce comes first, the decryption tag closes the AAD. */
+        if (!h->have_iv || h->dectag_set || h->aad_done || h->tag_ready
+            || h->data_done) {
+            return GPG_ERR_INV_STATE;
+        }
+
+        return buffer_append(h, &h->aad, &h->aadlen, &h->aadcap, abuf,
+                             abuflen);
+
     case GCRY_CIPHER_MODE_SIV:
-        if (h->data_started || h->tag_ready) {
+
+        /* Components come before the nonce (the last S2V input). */
+        if (h->have_iv || h->data_started || h->data_done || h->tag_ready) {
             return GPG_ERR_INV_STATE;
         }
 
@@ -2979,22 +3672,11 @@ gcry_cipher_authenticate(gcry_cipher_hd_t hd, const void *abuf,
     return GCRY_ERR(cipher_authenticate(hd, abuf, abuflen));
 }
 
+/* The GCM tag lengths NIST allows; the reference accepts exactly these. */
 static int
 gcm_tag_length_valid(size_t taglen)
 {
-    switch (taglen) {
-    case 16:
-    case 15:
-    case 14:
-    case 13:
-    case 12:
-    case 8:
-    case 4:
-        return 1;
-
-    default:
-        return 0;
-    }
+    return taglen == 4 || taglen == 8 || (taglen >= 12 && taglen <= 16);
 }
 
 /* Finish an EVP AEAD encryption and fetch the full tag. */
@@ -3083,6 +3765,67 @@ evp_finish_decrypt(gcry_cipher_hd_t h, const unsigned char *intag,
     return h->verify_failed ? GPG_ERR_CHECKSUM : 0;
 }
 
+/* The tag of a single shot (SIV, GCM-SIV) message on the encryption side;
+ * asking for it before any data closes an empty message, as the reference
+ * does. */
+static gcry_err_code_t
+siv_encrypt_tag(gcry_cipher_hd_t h)
+{
+    gcry_err_code_t rc;
+
+    if (h->tag_ready) {
+        return 0;
+    }
+
+    if (!h->data_done) {
+        rc = do_evp_aead(h, 1, NULL, 0, NULL, 0);
+
+        if (rc) {
+            return rc;
+        }
+    }
+
+    return evp_finish_encrypt(h);
+}
+
+static gcry_err_code_t
+ccm_tag(gcry_cipher_hd_t h, size_t taglen)
+{
+    gcry_err_code_t rc;
+
+    if (!taglen) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    if (!h->ccm_lengths_set) {
+        return GPG_ERR_INV_LENGTH;
+    }
+
+    if (!h->have_iv || h->aadlen != h->ccm_aadlen) {
+        return GPG_ERR_INV_STATE;
+    }
+
+    if (taglen != h->taglen) {
+        return GPG_ERR_INV_LENGTH;
+    }
+
+    if (h->ccm_processed != h->ccm_encryptlen) {
+        return GPG_ERR_UNFINISHED;
+    }
+
+    if (!h->tag_ready) {
+        rc = ccm_compute_tag(h, h->tag);
+
+        if (rc) {
+            return rc;
+        }
+
+        h->tag_ready = 1;
+    }
+
+    return 0;
+}
+
 static gcry_err_code_t
 cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
 {
@@ -3094,11 +3837,11 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
 
     switch (h->mode) {
     case GCRY_CIPHER_MODE_GCM:
-        if (!gcm_tag_length_valid(taglen) && taglen < 16) {
+        if (taglen < 16 && !gcm_tag_length_valid(taglen)) {
             return GPG_ERR_INV_LENGTH;
         }
 
-        rc = evp_finish_encrypt(h);
+        rc = gcm_finish(h);
 
         if (rc) {
             return rc;
@@ -3108,10 +3851,14 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
         return 0;
 
     case GCRY_CIPHER_MODE_POLY1305:
-    case GCRY_CIPHER_MODE_GCM_SIV:
-    case GCRY_CIPHER_MODE_SIV:
         if (taglen < 16) {
-            return GPG_ERR_INV_LENGTH;
+            return GPG_ERR_BUFFER_TOO_SHORT;
+        }
+
+        if (h->data_started && !h->enc) {
+            /* The reference returns the computed tag of a decryption;
+             * OpenSSL's AEAD cipher only verifies it. */
+            return GPG_ERR_INV_STATE;
         }
 
         rc = evp_finish_encrypt(h);
@@ -3123,31 +3870,41 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
         memcpy(outtag, h->tag, 16);
         return 0;
 
+    case GCRY_CIPHER_MODE_SIV:
+        if (h->dectag_set) {
+            return GPG_ERR_INV_STATE; /* A decryption handle has no tag. */
+        }
+
+        rc = siv_encrypt_tag(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        memcpy(outtag, h->tag, taglen > 16 ? 16 : taglen);
+        return 0;
+
+    case GCRY_CIPHER_MODE_GCM_SIV:
+        if (h->dectag_set) {
+            /* The reference hands back the tag it was given. */
+            memcpy(outtag, h->dectag, taglen > 16 ? 16 : taglen);
+            return 0;
+        }
+
+        rc = siv_encrypt_tag(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        memcpy(outtag, h->tag, taglen > 16 ? 16 : taglen);
+        return 0;
+
     case GCRY_CIPHER_MODE_CCM:
-        if (!taglen) {
-            return GPG_ERR_INV_ARG;
-        }
+        rc = ccm_tag(h, taglen);
 
-        if (!h->have_iv || !h->ccm_lengths_set || h->aadlen != h->ccm_aadlen) {
-            return GPG_ERR_INV_STATE;
-        }
-
-        if (taglen != h->taglen) {
-            return GPG_ERR_INV_LENGTH;
-        }
-
-        if (h->ccm_processed != h->ccm_encryptlen) {
-            return GPG_ERR_UNFINISHED;
-        }
-
-        if (!h->tag_ready) {
-            rc = ccm_compute_tag(h, h->tag);
-
-            if (rc) {
-                return rc;
-            }
-
-            h->tag_ready = 1;
+        if (rc) {
+            return rc;
         }
 
         memcpy(outtag, h->tag, taglen);
@@ -3223,59 +3980,92 @@ cipher_checktag(gcry_cipher_hd_t h, const void *intag, size_t taglen)
     switch (h->mode) {
     case GCRY_CIPHER_MODE_GCM:
         if (!gcm_tag_length_valid(taglen)) {
+            return taglen > 16 ? GPG_ERR_CHECKSUM : GPG_ERR_INV_LENGTH;
+        }
+
+        rc = gcm_finish(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        if (h->verify_failed) {
             return GPG_ERR_CHECKSUM;
         }
 
-        return evp_finish_decrypt(h, intag, taglen);
+        return CRYPTO_memcmp(intag, h->tag, taglen) ? GPG_ERR_CHECKSUM : 0;
 
     case GCRY_CIPHER_MODE_POLY1305:
-    case GCRY_CIPHER_MODE_GCM_SIV:
-        if (taglen != 16) {
-            return GPG_ERR_INV_LENGTH;
+        if (taglen < 16) {
+            return GPG_ERR_BUFFER_TOO_SHORT;
+        }
+
+        if (taglen > 16) {
+            return GPG_ERR_CHECKSUM;
+        }
+
+        if (h->enc && (h->data_started || h->tag_ready)) {
+            rc = evp_finish_encrypt(h);
+
+            if (rc) {
+                return rc;
+            }
+
+            return CRYPTO_memcmp(intag, h->tag, 16) ? GPG_ERR_CHECKSUM : 0;
         }
 
         return evp_finish_decrypt(h, intag, taglen);
 
     case GCRY_CIPHER_MODE_SIV:
         if (taglen != 16) {
-            return GPG_ERR_INV_LENGTH;
-        }
-
-        if (!h->dectag_set || !h->data_done) {
-            return GPG_ERR_INV_STATE;
-        }
-
-        if (h->verify_failed || CRYPTO_memcmp(intag, h->dectag, 16)) {
             return GPG_ERR_CHECKSUM;
         }
 
-        return 0;
-
-    case GCRY_CIPHER_MODE_CCM:
-        if (!taglen) {
-            return GPG_ERR_INV_ARG;
-        }
-
-        if (!h->have_iv || !h->ccm_lengths_set || h->aadlen != h->ccm_aadlen) {
-            return GPG_ERR_INV_STATE;
-        }
-
-        if (taglen != h->taglen) {
-            return GPG_ERR_INV_LENGTH;
-        }
-
-        if (h->ccm_processed != h->ccm_encryptlen) {
-            return GPG_ERR_UNFINISHED;
-        }
-
-        if (!h->tag_ready) {
-            rc = ccm_compute_tag(h, h->tag);
-
-            if (rc) {
-                return rc;
+        if (h->dectag_set) {
+            if (!h->data_done) {
+                return GPG_ERR_INV_STATE;
             }
 
-            h->tag_ready = 1;
+            if (h->verify_failed || CRYPTO_memcmp(intag, h->dectag, 16)) {
+                return GPG_ERR_CHECKSUM;
+            }
+
+            return 0;
+        }
+
+        rc = siv_encrypt_tag(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        return CRYPTO_memcmp(intag, h->tag, 16) ? GPG_ERR_CHECKSUM : 0;
+
+    case GCRY_CIPHER_MODE_GCM_SIV:
+        if (taglen != 16) {
+            return GPG_ERR_CHECKSUM;
+        }
+
+        if (h->dectag_set) {
+            /* Compared against the tag that was set, as the reference
+             * does, so it also answers after a failed decryption. */
+            return CRYPTO_memcmp(intag, h->dectag, 16) ? GPG_ERR_CHECKSUM
+                   : 0;
+        }
+
+        rc = siv_encrypt_tag(h);
+
+        if (rc) {
+            return rc;
+        }
+
+        return CRYPTO_memcmp(intag, h->tag, 16) ? GPG_ERR_CHECKSUM : 0;
+
+    case GCRY_CIPHER_MODE_CCM:
+        rc = ccm_tag(h, taglen);
+
+        if (rc) {
+            return rc;
         }
 
         return CRYPTO_memcmp(intag, h->tag, taglen) ? GPG_ERR_CHECKSUM : 0;
@@ -3459,10 +4249,9 @@ ccm_set_lengths(gcry_cipher_hd_t h, unsigned long long encryptlen,
         return GPG_ERR_INV_STATE;
     }
 
-    /* The message length must fit into the L byte length field. */
-    if (lfield < 8 && (encryptlen >> (8 * lfield)) != 0) {
-        return GPG_ERR_INV_LENGTH;
-    }
+    /* A message longer than the L byte length field can encode is taken
+     * as the reference library takes it: the length is truncated in B_0. */
+    (void)lfield;
 
     h->taglen = (size_t)taglen;
     h->ccm_encryptlen = encryptlen;
@@ -3596,7 +4385,15 @@ cipher_ctl(gcry_cipher_hd_t h, int cmd, void *buffer, size_t buflen)
         }
 
         if (buflen != 16) {
-            return GPG_ERR_INV_LENGTH;
+            return GPG_ERR_INV_ARG;
+        }
+
+        if (h->data_started || h->data_done || h->tag_ready) {
+            return GPG_ERR_INV_STATE;
+        }
+
+        if (h->mode == GCRY_CIPHER_MODE_GCM_SIV && h->dectag_set) {
+            return GPG_ERR_INV_STATE; /* Only once per message. */
         }
 
         memcpy(h->dectag, buffer, 16);
