@@ -61,3 +61,6 @@ dkms.conf
 build/
 build-*/
 CMakeUserPresets.json
+
+# Agent worktrees
+.claude/worktrees/

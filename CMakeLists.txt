@@ -55,6 +55,9 @@ option(GCRYPT_OPENSSL_BUILD_BENCHMARKS "Build the benchmarks"
 option(GCRYPT_OPENSSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"
        OFF
 )
+option(GCRYPT_OPENSSL_DROP_IN
+       "Also build libgcrypt.so.20 plus libgcrypt.pc and libgcrypt-config" OFF
+)
 
 if(NOT GCRYPT_OPENSSL_BUILD_SHARED AND NOT GCRYPT_OPENSSL_BUILD_STATIC)
     message(FATAL_ERROR "At least one of GCRYPT_OPENSSL_BUILD_SHARED or "

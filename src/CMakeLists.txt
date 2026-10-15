@@ -103,3 +103,6 @@ install(
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     PUBLIC_HEADER DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
+
+# pkg-config files and the optional libgcrypt.so.20 drop-in target.
+include("${PROJECT_SOURCE_DIR}/cmake/drop-in.cmake")

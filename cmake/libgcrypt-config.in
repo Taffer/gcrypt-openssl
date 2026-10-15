@@ -1,0 +1,89 @@
+#!/bin/sh
+# libgcrypt-config - compatibility script provided by gcrypt-openssl.
+# Reports the same information as the script shipped with Libgcrypt so that
+# configure scripts using AM_PATH_LIBGCRYPT keep working.
+
+prefix="@CMAKE_INSTALL_PREFIX@"
+exec_prefix="${prefix}"
+includedir="@PC_INCLUDEDIR@"
+libdir="@PC_LIBDIR@"
+host="@LIBGCRYPT_CONFIG_HOST@"
+api_version="1"
+version="@GCRYPT_API_VERSION@"
+symmetric_ciphers="@GCRYPT_CONFIG_CIPHERS@"
+asymmetric_ciphers="@GCRYPT_CONFIG_PUBKEYS@"
+digests="@GCRYPT_CONFIG_DIGESTS@"
+
+usage() {
+    cat <<USAGE
+Usage: libgcrypt-config [OPTIONS]
+Options:
+    [--prefix]
+    [--exec-prefix]
+    [--version]
+    [--api-version]
+    [--libs]
+    [--cflags]
+    [--algorithms]
+    [--host]
+USAGE
+    exit "$1"
+}
+
+if [ $# -eq 0 ]; then
+    usage 1 1>&2
+fi
+
+echo_prefix=no
+echo_exec_prefix=no
+echo_version=no
+echo_api_version=no
+echo_libs=no
+echo_cflags=no
+echo_algorithms=no
+echo_host=no
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --prefix) echo_prefix=yes ;;
+    --exec-prefix) echo_exec_prefix=yes ;;
+    --version) echo_version=yes ;;
+    --api-version) echo_api_version=yes ;;
+    --libs) echo_libs=yes ;;
+    --cflags) echo_cflags=yes ;;
+    --algorithms) echo_algorithms=yes ;;
+    --host) echo_host=yes ;;
+    *) usage 1 1>&2 ;;
+    esac
+    shift
+done
+
+[ "$echo_prefix" = yes ] && echo "$prefix"
+[ "$echo_exec_prefix" = yes ] && echo "$exec_prefix"
+[ "$echo_version" = yes ] && echo "$version"
+[ "$echo_api_version" = yes ] && echo "$api_version"
+[ "$echo_host" = yes ] && echo "$host"
+
+if [ "$echo_cflags" = yes ]; then
+    if [ "$includedir" != "/usr/include" ]; then
+        echo "-I$includedir"
+    else
+        echo ""
+    fi
+fi
+
+if [ "$echo_libs" = yes ]; then
+    if [ "$libdir" != "/usr/lib" ] && [ "$libdir" != "/usr/lib64" ]; then
+        echo "-L$libdir -lgcrypt"
+    else
+        echo "-lgcrypt"
+    fi
+fi
+
+if [ "$echo_algorithms" = yes ]; then
+    echo "Symmetric cipher algorithms: $symmetric_ciphers"
+    echo "Public-key cipher algorithms: $asymmetric_ciphers"
+    echo "Message digest algorithms: $digests"
+fi
+
+exit 0
