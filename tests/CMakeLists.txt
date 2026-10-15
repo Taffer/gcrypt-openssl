@@ -58,3 +58,17 @@ if(GCRYPT_OPENSSL_BUILD_SHARED AND GCRYPT_OPENSSL_BUILD_STATIC)
     )
     add_test(NAME test_version_static COMMAND test_version_static)
 endif()
+
+# The shared library must export exactly the reference library's symbols.
+if(GCRYPT_OPENSSL_BUILD_SHARED
+   AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+   AND NOT APPLE
+)
+    add_test(
+        NAME check_exports
+        COMMAND
+            sh "${PROJECT_SOURCE_DIR}/scripts/check-exports.sh"
+            $<TARGET_FILE:gcrypt_openssl_shared>
+            "${CMAKE_CURRENT_SOURCE_DIR}/expected-exports.txt"
+    )
+endif()

@@ -17,6 +17,11 @@
 /* Candidates whose bit count misses the target this often get a new q. */
 #define MAX_MISSES 20
 
+/* Consecutive composite candidates before the pool of small primes is
+ * replaced.  Without this a pool whose subset products are all composite
+ * would make the generator loop forever. */
+#define MAX_COMPOSITES 64
+
 static void
 progress(int c)
 {
@@ -166,6 +171,7 @@ prime_generate_internal(int need_q_factor, gcry_mpi_t *r_prime,
     unsigned int i;
     unsigned int count1 = 0;
     unsigned int count2 = 0;
+    unsigned int composites = 0;
     unsigned int nprime;
     gcry_mpi_t q = NULL;
     gcry_mpi_t q_factor = NULL;
@@ -317,6 +323,21 @@ prime_generate_internal(int need_q_factor, gcry_mpi_t *r_prime,
 
         if (check_prime(prime, ctx, cb_func, cb_arg)) {
             break;
+        }
+
+        if (++composites > MAX_COMPOSITES) {
+            composites = 0;
+            progress('/');
+
+            for (i = 0; i < m; i++) {
+                gcry_mpi_release(pool[i]);
+                pool[i] = gen_prime(fbits, 0, ctx);
+
+                if (!pool[i]) {
+                    err = GPG_ERR_INTERNAL;
+                    goto leave;
+                }
+            }
         }
     }
 
