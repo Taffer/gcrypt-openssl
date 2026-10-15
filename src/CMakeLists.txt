@@ -5,10 +5,13 @@ set(GCRYPT_OPENSSL_SOURCES
     ecc-curves.c
     error.c
     global.c
+    kdf.c
     memory.c
     misc.c
     mpi.c
     mpi-ec.c
+    prime.c
+    random.c
     sexp.c
 )
 

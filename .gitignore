@@ -11,6 +11,8 @@
 *.ilk
 *.map
 *.exp
+# ... but our symbol version script is source, not output.
+!src/libgcrypt.map
 
 # Precompiled Headers
 *.gch

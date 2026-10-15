@@ -215,6 +215,11 @@ gcry_mpi_t _gcry_ecc_curve_param(const struct gcry_ecc_curve *curve,
                                  const char *name);
 EC_GROUP *_gcry_ecc_curve_group(const struct gcry_ecc_curve *curve);
 
+/* ---- random.c ---------------------------------------------------- */
+
+gcry_err_code_t _gcry_random_bytes_into(void *buffer, size_t length,
+                                        enum gcry_random_level level);
+
 /* ---- mpi-ec.c ---------------------------------------------------- */
 
 void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,
