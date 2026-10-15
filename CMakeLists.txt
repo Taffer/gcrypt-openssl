@@ -65,7 +65,13 @@ endif()
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+# OpenSSL 4.x is required. If your distribution only ships OpenSSL 3, build
+# it with scripts/build-openssl.sh and point CMake at the result with
+# -DOPENSSL_ROOT_DIR=<prefix> (or set it in CMakeUserPresets.json).
+find_package(OpenSSL 4.0 REQUIRED COMPONENTS Crypto)
+message(
+    STATUS "Using OpenSSL ${OPENSSL_VERSION} from ${OPENSSL_CRYPTO_LIBRARY}"
+)
 
 # Needed before add_subdirectory(src) so CMAKE_INSTALL_INCLUDEDIR is defined
 # when the library's INSTALL_INTERFACE include path is set.

@@ -18,13 +18,42 @@ This project was extruded by Claude. Use at your own risk.
 
 ## Building
 
-Requires CMake 3.21+, a C99 compiler, and OpenSSL 3.x development files.
+Requires CMake 3.21+, a C99 compiler, and OpenSSL 4.x development files.
 
 ```sh
 cmake --preset default
 cmake --build --preset default
 ctest --preset default
 ./build/benchmarks/bench_version
+```
+
+### OpenSSL 4
+
+Most distributions still ship OpenSSL 3. `scripts/build-openssl.sh` downloads
+a pinned OpenSSL 4 release, verifies its checksum, and installs it under
+`~/.local/opt/openssl-<version>` (pass a different prefix as the first
+argument if you prefer):
+
+```sh
+scripts/build-openssl.sh
+cmake --preset default -DOPENSSL_ROOT_DIR="$HOME/.local/opt/openssl-4.0.3"
+```
+
+To avoid repeating the option, put it in an untracked `CMakeUserPresets.json`:
+
+```json
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "local",
+      "inherits": "default",
+      "cacheVariables": {
+        "OPENSSL_ROOT_DIR": "$env{HOME}/.local/opt/openssl-4.0.3"
+      }
+    }
+  ]
+}
 ```
 
 Both `libgcrypt-openssl.so` and `libgcrypt-openssl.a` are built by default.
