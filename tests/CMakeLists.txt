@@ -18,11 +18,13 @@ set(GCRYPT_OPENSSL_TESTS
     test_cipher
     test_pk
     test_ec
+    test_global
+    test_secmem
 )
 
 # Tests of internal helpers link the static library so that symbols hidden
 # from the shared library's export list are reachable.
-set(GCRYPT_OPENSSL_INTERNAL_TESTS test_curves)
+set(GCRYPT_OPENSSL_INTERNAL_TESTS test_curves test_internal)
 
 foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
     add_executable(${test} ${test}.c)
