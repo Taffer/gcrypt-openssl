@@ -421,13 +421,16 @@ b64_value(int c)
     return -1;
 }
 
-/* Decode base64 text (no whitespace) in place of OUT; returns the number
- * of bytes produced or (size_t)-1 on malformed input. */
+/* Decode base64 text (no whitespace) into OUT and return the number of
+ * bytes produced.  The scanner has already rejected characters outside
+ * the alphabet, so this only has to reproduce upstream's decoder: input
+ * stops at the first '=', a pad after a single sextet still emits the
+ * partial byte, and whatever follows the pad is ignored. */
 static size_t
 b64_decode(const char *in, size_t inlen, unsigned char *out)
 {
-    unsigned int acc = 0;
-    int bits = 0;
+    unsigned char rad[3] = { 0, 0, 0 };
+    int quad = 0;
     size_t n = 0;
     size_t i;
 
@@ -435,27 +438,41 @@ b64_decode(const char *in, size_t inlen, unsigned char *out)
         int v;
 
         if (in[i] == '=') {
+            if (quad == 1) {
+                out[n++] = rad[0];
+            }
+
             break;
         }
 
         v = b64_value(in[i]);
 
         if (v < 0) {
-            return (size_t) -1;
+            continue;
         }
 
-        acc = (acc << 6) | (unsigned int)v;
-        bits += 6;
+        switch (quad++) {
+        case 0:
+            rad[0] = (unsigned char)(v << 2);
+            break;
 
-        if (bits >= 8) {
-            bits -= 8;
-            out[n++] = (unsigned char)((acc >> bits) & 0xff);
-        }
-    }
+        case 1:
+            rad[0] |= (unsigned char)(v >> 4);
+            rad[1] = (unsigned char)(v << 4);
+            out[n++] = rad[0];
+            break;
 
-    for (; i < inlen; i++) {
-        if (in[i] != '=') {
-            return (size_t) -1;
+        case 2:
+            rad[1] |= (unsigned char)(v >> 2);
+            rad[2] = (unsigned char)(v << 6);
+            out[n++] = rad[1];
+            break;
+
+        default:
+            rad[2] |= (unsigned char)v;
+            out[n++] = rad[2];
+            quad = 0;
+            break;
         }
     }
 
@@ -697,7 +714,15 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
                 b64count++;
             } else if (*p == '|') {
                 size_t maxlen = (b64count / 4 + 1) * 3;
-                unsigned char *tmp = _gcry_malloc(maxlen);
+                unsigned char *tmp;
+
+                if (!b64count) {
+                    /* "||": upstream fails without an error offset. */
+                    err = GPG_ERR_INV_ARG;
+                    goto leave;
+                }
+
+                tmp = _gcry_malloc(maxlen);
 
                 if (!tmp) {
                     err = _gcry_err_code_from_syserror();
@@ -705,11 +730,6 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
                 }
 
                 datalen = b64_decode(base64 + 1, b64count, tmp);
-
-                if (datalen == (size_t) -1) {
-                    _gcry_free(tmp);
-                    FAIL(GPG_ERR_SEXP_BAD_CHARACTER);
-                }
 
                 if (datalen > MAX_DATALEN) {
                     _gcry_free(tmp);
@@ -1006,18 +1026,10 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
         }
     }
 
-    /* A token may run until the end of the input. */
-    if (tokenp && !hexfmt) {
-        datalen = (size_t)(p - tokenp);
-
-        if (datalen > MAX_DATALEN) {
-            FAIL(GPG_ERR_INV_ARG);
-        }
-
-        MAKE_SPACE(datalen);
-        store_data(&c, tokenp, datalen);
-        tokenp = NULL;
-    }
+    /* A token that runs until the end of the input is never stored:
+     * upstream only emits a token when a delimiter follows it, so "abc"
+     * scans to nothing and "(a) b" to "(a)". */
+    tokenp = NULL;
 
     MAKE_SPACE(0);
     *c.pos++ = ST_STOP;
@@ -1657,34 +1669,31 @@ gcry_sexp_nth_mpi(gcry_sexp_t list, int number, int mpifmt)
 gcry_sexp_t
 gcry_sexp_cdr(const gcry_sexp_t list)
 {
-    const unsigned char *p;
     const unsigned char *head;
     const unsigned char *end;
     size_t n;
     gcry_sexp_t newlist;
     unsigned char *d;
 
+    /* Upstream's cdr is not the list tail: it returns the second element
+     * alone (a datum or a whole sublist) wrapped in a new list. */
     if (!list || list->d[0] != ST_OPEN) {
         return NULL;
     }
 
-    p = list->d + 1;
+    head = list->d + 1;
 
-    if (*p == ST_STOP || *p == ST_CLOSE) {
+    if (*head == ST_STOP || *head == ST_CLOSE) {
         return NULL;
     }
 
-    head = skip_item(p); /* Skip the car. */
-    end = head;
+    head = skip_item(head); /* Skip the car. */
 
-    while (*end != ST_CLOSE) {
-        if (*end == ST_STOP) {
-            return NULL;
-        }
-
-        end = skip_item(end);
+    if (*head == ST_STOP || *head == ST_CLOSE) {
+        return NULL;
     }
 
+    end = skip_item(head);
     n = (size_t)(end - head);
     newlist = alloc_sexp(sizeof * newlist + n + 2, _gcry_is_secure(list));
 
@@ -2513,6 +2522,11 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                             }
                         }
                     } else {
+                        if (!val || !vlen) {
+                            rc = GPG_ERR_INV_ARG;
+                            goto cleanup;
+                        }
+
                         *array[idx] = copy_value_string(val, vlen, secure);
                     }
 
@@ -2524,6 +2538,11 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     arrayisdesc[idx] = 's';
                 } else if (mode == 'd') {
                     long along;
+
+                    if (!val || !vlen) {
+                        rc = GPG_ERR_INV_ARG;
+                        goto cleanup;
+                    }
 
                     _gcry_free(tmpstr);
                     tmpstr = copy_value_string(val, vlen, secure);
@@ -2544,6 +2563,11 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                     arrayisdesc[idx] = 'x';
                 } else if (mode == 'u') {
                     unsigned long aulong;
+
+                    if (!val || !vlen) {
+                        rc = GPG_ERR_INV_ARG;
+                        goto cleanup;
+                    }
 
                     _gcry_free(tmpstr);
                     tmpstr = copy_value_string(val, vlen, secure);

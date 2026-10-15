@@ -227,10 +227,12 @@ TEST(navigation)
     free(c);
     gcry_sexp_release(l2);
 
+    /* cdr is upstream's oddity: the second element alone, wrapped. */
     l2 = gcry_sexp_cdr(l);
-    ASSERT_EQ(2, gcry_sexp_length(l2));
-    /* "((1:n2:..)(1:e3:...))" is 21 bytes plus the terminating NUL. */
-    ASSERT_EQ(22, gcry_sexp_sprint(l2, GCRYSEXP_FMT_CANON, NULL, 0));
+    ASSERT_EQ(1, gcry_sexp_length(l2));
+    c = canon(l2);
+    ASSERT_MEM_EQ("((1:n2:\x00\xab))", c, 11);
+    free(c);
     gcry_sexp_release(l2);
 
     l2 = gcry_sexp_cadr(l);
@@ -544,6 +546,116 @@ TEST(base64_tokens)
     ASSERT_ERR(GPG_ERR_SEXP_BAD_CHARACTER,
                gcry_sexp_sscan(&s, &erroff, "(a |YQ-|)", 9));
     ASSERT_EQ(6, erroff);
+}
+
+/* Behaviour shared with upstream that looks like bugs but is relied on:
+ * a bare token terminated by the end of the input is dropped, data after
+ * the closing parenthesis is kept, cdr wraps sublists, and base64 decoding
+ * stops at the first pad while still emitting a lone partial sextet. */
+TEST(upstream_scanner_quirks)
+{
+    gcry_sexp_t s = (gcry_sexp_t)1;
+    gcry_sexp_t t;
+    size_t erroff = 999;
+    char *c;
+
+    /* A trailing token is not stored; "abc" alone scans to nothing. */
+    ASSERT_OK(gcry_sexp_sscan(&s, &erroff, "abc", 3));
+    ASSERT_NULL(s);
+    ASSERT_TRUE(canon_equals("(a) b", 0, "(1:a)", 5));
+    ASSERT_TRUE(canon_equals("(a)b", 0, "(1:a)", 5));
+    /* The hint's content is just a token; the hint itself is not kept. */
+    ASSERT_TRUE(canon_equals("(a) [h]x", 0, "(1:a)1:h", 8));
+    /* ... but a delimiter after the token keeps it. */
+    ASSERT_TRUE(canon_equals("abc (a)", 0, "3:abc(1:a)", 10));
+    ASSERT_TRUE(canon_equals("(a) x(b)", 0, "(1:a)1:x(1:b)", 13));
+    /* Other data after the closing parenthesis is kept as well. */
+    ASSERT_TRUE(canon_equals("(a) 2:xy", 0, "(1:a)2:xy", 9));
+    ASSERT_TRUE(canon_equals("(a) (b)", 0, "(1:a)(1:b)", 10));
+
+    /* cdr of a list whose second element is a sublist. */
+    ASSERT_OK(gcry_sexp_new(&s, "(a (b c) (d e) f)", 0, 1));
+    t = gcry_sexp_cdr(s);
+    ASSERT_NOT_NULL(t);
+    ASSERT_EQ(1, gcry_sexp_length(t));
+    c = canon(t);
+    ASSERT_STR_EQ("((1:b1:c))", c);
+    free(c);
+    gcry_sexp_release(t);
+    gcry_sexp_release(s);
+    ASSERT_OK(gcry_sexp_new(&s, "((a b) c)", 0, 1));
+    t = gcry_sexp_cdr(s);
+    c = canon(t);
+    ASSERT_STR_EQ("(1:c)", c);
+    free(c);
+    gcry_sexp_release(t);
+    gcry_sexp_release(s);
+
+    /* Base64: decoding stops at the first '=', what follows is ignored,
+     * a pad after one sextet still yields a byte, "||" is refused. */
+    ASSERT_TRUE(canon_equals("(a |YQ=X|)", 0, "(1:a1:a)", 8));
+    ASSERT_TRUE(canon_equals("(a |YQ=Xz|)", 0, "(1:a1:a)", 8));
+    ASSERT_TRUE(canon_equals("(a |YQ==YQ==|)", 0, "(1:a1:a)", 8));
+    ASSERT_TRUE(canon_equals("(a |YQ|)", 0, "(1:a1:a)", 8));
+    ASSERT_TRUE(canon_equals("(a |YWJ=|)", 0, "(1:a2:ab)", 9));
+    ASSERT_TRUE(canon_equals("(a |YWJjZ|)", 0, "(1:a3:abc)", 10));
+    ASSERT_TRUE(canon_equals("(a |Y|)", 0, "(1:a0:)", 7));
+    ASSERT_TRUE(canon_equals("(a |=|)", 0, "(1:a0:)", 7));
+    ASSERT_TRUE(canon_equals("(a |====|)", 0, "(1:a0:)", 7));
+    ASSERT_TRUE(canon_equals("(a |Y=Q=|)", 0, "(1:a1:`)", 8));
+    s = (gcry_sexp_t)1;
+    erroff = 999;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, "(a ||)", 6));
+    ASSERT_NULL(s);
+    ASSERT_EQ(999, erroff); /* No offset is reported for this one. */
+}
+
+TEST(extract_param_string_errors)
+{
+    gcry_sexp_t s = NULL;
+    char *str = NULL;
+    int iv = -5;
+    unsigned int uv = 5;
+    gcry_mpi_t m = NULL;
+    gcry_buffer_t buf;
+
+    ASSERT_OK(gcry_sexp_new(&s, "(x (a) (b ()) (c (d e)) (f \"\"))", 0, 1));
+
+    /* %s, %d and %u want a non-empty string value. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%s a", &str, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%s b", &str, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%s c", &str, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%s f", &str, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%d a", &iv, NULL));
+    ASSERT_EQ(-5, iv);
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%d c", &iv, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%d f", &iv, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_sexp_extract_param(s, NULL, "%u a", &uv, NULL));
+    ASSERT_EQ(5, uv);
+
+    /* MPIs and buffers report INV_OBJ, except that an empty string is a
+     * perfectly good zero MPI. */
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_sexp_extract_param(s, NULL, "a", &m,
+                                                        NULL));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_sexp_extract_param(s, NULL, "/a", &m,
+                                                        NULL));
+    ASSERT_OK(gcry_sexp_extract_param(s, NULL, "f", &m, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    memset(&buf, 0, sizeof buf);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_sexp_extract_param(s, NULL, "&f", &buf,
+                                                        NULL));
+    ASSERT_NULL(buf.data);
+
+    gcry_sexp_release(s);
 }
 
 TEST(length_prefix_variants)
@@ -1158,6 +1270,8 @@ main(void)
     RUN_TEST(secure_memory_propagation);
     RUN_TEST(quoted_string_escapes);
     RUN_TEST(base64_tokens);
+    RUN_TEST(upstream_scanner_quirks);
+    RUN_TEST(extract_param_string_errors);
     RUN_TEST(length_prefix_variants);
     RUN_TEST(display_hints_and_punctuation);
     RUN_TEST(canon_len_errors);

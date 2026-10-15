@@ -450,6 +450,13 @@ TEST(points)
     gcry_mpi_point_get(NULL, t, NULL, p);
     ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 2));
 
+    /* Copying a NULL point yields a new point at the origin. */
+    q = gcry_mpi_point_copy(NULL);
+    ASSERT_NOT_NULL(q);
+    gcry_mpi_point_get(t, NULL, NULL, q);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_release(q);
+
     q = gcry_mpi_point_copy(p);
     gcry_mpi_point_get(NULL, NULL, t, q);
     ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 3));
@@ -649,6 +656,13 @@ TEST(opaque_comparisons)
     ASSERT_TRUE(gcry_mpi_set(b, b) == b);
     ASSERT_EQ(0, gcry_mpi_cmp_ui(b, 5));
 
+    /* An opaque value sorts below every number, even a negative one, and
+     * compares equal to the word zero only. */
+    ASSERT_EQ(1, gcry_mpi_cmp(a, o1));
+    ASSERT_EQ(-1, gcry_mpi_cmp(o1, a));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(o1, 0));
+    ASSERT_EQ(-1, gcry_mpi_cmp_ui(o1, 5));
+
     /* Opaque values order by bit length first, then by content. */
     ASSERT_TRUE(gcry_mpi_cmp(o1, o2) < 0);
     ASSERT_TRUE(gcry_mpi_cmp(o2, o1) > 0);
@@ -668,12 +682,135 @@ TEST(opaque_comparisons)
     ASSERT_TRUE(gcry_mpi_cmp(b, a) < 0);
     ASSERT_TRUE(gcry_mpi_cmp(a, b) > 0);
     ASSERT_TRUE(gcry_mpi_cmp_ui(b, 0) < 0);
+    ASSERT_EQ(1, gcry_mpi_cmp(b, o1)); /* -5 is still above an opaque. */
+    ASSERT_EQ(-1, gcry_mpi_cmp(o1, b));
 
     gcry_mpi_release(a);
     gcry_mpi_release(b);
     gcry_mpi_release(o1);
     gcry_mpi_release(o2);
     gcry_mpi_release(o3);
+}
+
+/* Opaque values print as their raw bytes in every format. */
+TEST(opaque_printing)
+{
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x01\x02\x03", 24);
+    gcry_mpi_t small = gcry_mpi_set_opaque_copy(NULL, "\x0f\xff", 12);
+    gcry_mpi_t empty = gcry_mpi_set_opaque(NULL, NULL, 0);
+    unsigned char buf[16];
+    unsigned char *abuf = NULL;
+    size_t nw = 0;
+
+    ASSERT_NOT_NULL(o);
+    ASSERT_NOT_NULL(small);
+    ASSERT_NOT_NULL(empty);
+
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, sizeof buf, &nw, o));
+    ASSERT_EQ(3, nw);
+    ASSERT_MEM_EQ("\x01\x02\x03", buf, 3);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_USG, buf, sizeof buf, &nw, o));
+    ASSERT_EQ(3, nw);
+    ASSERT_MEM_EQ("\x01\x02\x03", buf, 3);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_PGP, buf, sizeof buf, &nw, o));
+    ASSERT_EQ(5, nw);
+    ASSERT_MEM_EQ("\x00\x18\x01\x02\x03", buf, 5);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, sizeof buf, &nw, o));
+    ASSERT_EQ(7, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x03\x01\x02\x03", buf, 7);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, buf, sizeof buf, &nw, o));
+    ASSERT_EQ(7, nw);
+    ASSERT_STR_EQ("010203", (char *)buf);
+
+    /* Measuring and allocating work too. */
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, NULL, 0, &nw, o));
+    ASSERT_EQ(7, nw);
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_PGP, &abuf, &nw, o));
+    ASSERT_EQ(5, nw);
+    ASSERT_MEM_EQ("\x00\x18\x01\x02\x03", abuf, 5);
+    gcry_free(abuf);
+
+    /* The byte count comes from the bit length, and the buffer limit is
+     * checked. */
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_USG, buf, 2, &nw, small));
+    ASSERT_EQ(2, nw);
+    ASSERT_MEM_EQ("\x0f\xff", buf, 2);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, sizeof buf, &nw, small));
+    ASSERT_EQ(2, nw);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT,
+               gcry_mpi_print(GCRYMPI_FMT_USG, buf, 1, &nw, small));
+
+    /* An opaque value without bytes has nothing to print. */
+    ASSERT_ERR(GPG_ERR_ENOENT,
+               gcry_mpi_print(GCRYMPI_FMT_USG, buf, sizeof buf, &nw, empty));
+
+    gcry_mpi_release(o);
+    gcry_mpi_release(small);
+    gcry_mpi_release(empty);
+}
+
+/* Upstream checks GCRYMPI_FLAG_IMMUTABLE only in the assignment-like
+ * functions; the arithmetic ones overwrite the result regardless. */
+TEST(immutable_arithmetic)
+{
+    gcry_mpi_t w = gcry_mpi_set_ui(NULL, 10);
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 7);
+    gcry_mpi_t b = gcry_mpi_set_ui(NULL, 3);
+    gcry_mpi_t q = gcry_mpi_new(0);
+
+    ASSERT_NOT_NULL(w);
+    gcry_mpi_set_flag(w, GCRYMPI_FLAG_IMMUTABLE);
+
+    /* Refused, with a warning on the log. */
+    gcry_mpi_add(w, a, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 10));
+    gcry_mpi_rshift(w, a, 1);
+    gcry_mpi_lshift(w, a, 1);
+    gcry_mpi_set_bit(w, 0);
+    gcry_mpi_clear_bit(w, 1);
+    gcry_mpi_set_highbit(w, 5);
+    gcry_mpi_clear_highbit(w, 3);
+    gcry_mpi_randomize(w, 16, GCRY_WEAK_RANDOM);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 10));
+
+    /* Performed regardless of the flag. */
+    gcry_mpi_add_ui(w, a, 1);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 8));
+    gcry_mpi_sub(w, a, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 4));
+    gcry_mpi_sub_ui(w, a, 2);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 5));
+    gcry_mpi_mul(w, a, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 21));
+    gcry_mpi_mul_ui(w, a, 2);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 14));
+    gcry_mpi_mul_2exp(w, a, 2);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 28));
+    gcry_mpi_div(w, NULL, a, b, 0);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 2));
+    gcry_mpi_div(q, w, a, b, 0);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    gcry_mpi_mod(w, a, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    gcry_mpi_addm(w, a, b, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    gcry_mpi_subm(w, a, b, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    gcry_mpi_mulm(w, a, b, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 0));
+    gcry_mpi_powm(w, a, b, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    ASSERT_EQ(1, gcry_mpi_gcd(w, a, b));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    ASSERT_EQ(1, gcry_mpi_invm(w, a, b));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 1));
+    ASSERT_TRUE(gcry_mpi_get_flag(w, GCRYMPI_FLAG_IMMUTABLE));
+
+    gcry_mpi_clear_flag(w, GCRYMPI_FLAG_IMMUTABLE);
+    gcry_mpi_release(w);
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    gcry_mpi_release(q);
 }
 
 TEST(immutable_refusals)
@@ -915,6 +1052,8 @@ main(void)
     RUN_TEST(scan_edge_cases);
     RUN_TEST(print_edge_cases);
     RUN_TEST(opaque_comparisons);
+    RUN_TEST(opaque_printing);
+    RUN_TEST(immutable_arithmetic);
     RUN_TEST(immutable_refusals);
     RUN_TEST(arithmetic_edges);
     RUN_TEST(point_edges);

@@ -7,6 +7,8 @@
  */
 #include "gcrypt-int.h"
 
+#include <errno.h>
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -357,12 +359,13 @@ int
 gcry_mpi_cmp(const gcry_mpi_t u, const gcry_mpi_t v)
 {
     if (mpi_is_opaque(u) || mpi_is_opaque(v)) {
+        /* An opaque value sorts below every number, as upstream has it. */
         if (!mpi_is_opaque(u)) {
-            return -1;
+            return 1;
         }
 
         if (!mpi_is_opaque(v)) {
-            return 1;
+            return -1;
         }
 
         if (u->opaque_nbits < v->opaque_nbits) {
@@ -390,7 +393,8 @@ gcry_mpi_cmp_ui(const gcry_mpi_t u, unsigned long v)
     int rc;
 
     if (mpi_is_opaque(u)) {
-        return 1;
+        /* Upstream treats an opaque value as a zero-limb number here. */
+        return v ? -1 : 0;
     }
 
     tmp = BN_new();
@@ -418,6 +422,46 @@ _gcry_mpi_get_buffer(gcry_mpi_t a, unsigned int fill_le,
     unsigned int n;
     unsigned int alloc;
     unsigned char *buf;
+
+    if (mpi_is_opaque(a)) {
+        /* The raw bytes, exactly as stored, like upstream. */
+        n = (a->opaque_nbits + 7) / 8;
+
+        if (sign) {
+            *sign = 0;
+        }
+
+        if (!a->opaque || !n) {
+            gpg_err_set_errno(ENOENT);
+            return NULL;
+        }
+
+        alloc = n > fill_le ? n : fill_le;
+        buf = mpi_is_secure(a) ? _gcry_malloc_secure(alloc)
+              : _gcry_malloc(alloc);
+
+        if (!buf) {
+            return NULL;
+        }
+
+        memset(buf, 0, alloc);
+
+        if (fill_le) {
+            unsigned int i;
+
+            for (i = 0; i < n; i++) {
+                buf[i] = a->opaque[n - 1 - i];
+            }
+        } else {
+            memcpy(buf, a->opaque, n);
+        }
+
+        if (nbytes) {
+            *nbytes = n;
+        }
+
+        return buf;
+    }
 
     if (sign) {
         *sign = BN_is_negative(a->bn);
@@ -732,11 +776,10 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
 
     *nwritten = 0;
 
-    if (mpi_is_opaque(a)) {
-        return GPG_ERR_INV_OBJ;
-    }
-
-    negative = BN_is_negative(a->bn) && !BN_is_zero(a->bn);
+    /* An opaque value is printed as its raw bytes in every format, as
+     * upstream does (its buffer accessor returns them unchanged). */
+    negative = !mpi_is_opaque(a) && BN_is_negative(a->bn)
+               && !BN_is_zero(a->bn);
 
     switch (format) {
     case GCRYMPI_FMT_STD:
@@ -744,7 +787,7 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
         int extra = 0;
         size_t prefix = format == GCRYMPI_FMT_SSH ? 4 : 0;
 
-        if (!negative) {
+        if (!negative && !mpi_is_opaque(a)) {
             /* Common case: the magnitude is the encoding, with a leading
              * zero if the top bit is set; write it straight out. */
             n = (unsigned int)BN_num_bytes(a->bn);
@@ -828,6 +871,27 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
     }
 
     case GCRYMPI_FMT_USG:
+        if (mpi_is_opaque(a)) {
+            tmp = _gcry_mpi_get_buffer(a, 0, &n, NULL);
+
+            if (!tmp) {
+                return _gcry_err_code_from_syserror();
+            }
+
+            if (buffer && n > buflen) {
+                _gcry_free(tmp);
+                return GPG_ERR_TOO_SHORT;
+            }
+
+            if (buffer) {
+                memcpy(buffer, tmp, n);
+            }
+
+            _gcry_free(tmp);
+            *nwritten = n;
+            return 0;
+        }
+
         n = (unsigned int)BN_num_bytes(a->bn);
 
         if (buffer && n > buflen) {
@@ -842,7 +906,31 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
         return 0;
 
     case GCRYMPI_FMT_PGP: {
-        unsigned int nbits = (unsigned int)BN_num_bits(a->bn);
+        unsigned int nbits = mpi_is_opaque(a) ? a->opaque_nbits
+                             : (unsigned int)BN_num_bits(a->bn);
+
+        if (mpi_is_opaque(a)) {
+            tmp = _gcry_mpi_get_buffer(a, 0, &n, NULL);
+
+            if (!tmp) {
+                return _gcry_err_code_from_syserror();
+            }
+
+            if (buffer && (size_t)n + 2 > buflen) {
+                _gcry_free(tmp);
+                return GPG_ERR_TOO_SHORT;
+            }
+
+            if (buffer) {
+                buffer[0] = (unsigned char)(nbits >> 8);
+                buffer[1] = (unsigned char)nbits;
+                memcpy(buffer + 2, tmp, n);
+            }
+
+            _gcry_free(tmp);
+            *nwritten = (size_t)n + 2;
+            return 0;
+        }
 
         if (negative) {
             return GPG_ERR_INV_ARG;
@@ -1012,6 +1100,10 @@ gcry_mpi_dump(const gcry_mpi_t a)
 /* Arithmetic                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Upstream honours GCRYMPI_FLAG_IMMUTABLE only in the assignment-like
+ * operations (set, set_ui, add, the shifts, the bit operations, neg, abs,
+ * randomize, snatch and set_opaque); the other arithmetic functions
+ * overwrite an immutable result without complaint, and so do we. */
 #define CHECK_MUTABLE(w)                   \
     do {                                   \
         if (mpi_is_immutable(w)) {         \
@@ -1034,10 +1126,13 @@ gcry_mpi_add(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_add_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
-    CHECK_MUTABLE(w);
-
     if (w != u) {
-        gcry_mpi_set(w, u);
+        /* Not gcry_mpi_set(): that one honours the immutable flag. */
+        free_opaque(w);
+
+        if (!BN_copy(w->bn, _gcry_mpi_bn(u))) {
+            bn_fail("BN_copy failed");
+        }
     }
 
     free_opaque(w);
@@ -1052,7 +1147,6 @@ gcry_mpi_addm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
-    CHECK_MUTABLE(w);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1067,7 +1161,6 @@ gcry_mpi_addm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 void
 gcry_mpi_sub(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 {
-    CHECK_MUTABLE(w);
     free_opaque(w);
 
     if (!BN_sub(w->bn, _gcry_mpi_bn(u), _gcry_mpi_bn(v))) {
@@ -1078,10 +1171,13 @@ gcry_mpi_sub(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_sub_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
-    CHECK_MUTABLE(w);
-
     if (w != u) {
-        gcry_mpi_set(w, u);
+        /* Not gcry_mpi_set(): that one honours the immutable flag. */
+        free_opaque(w);
+
+        if (!BN_copy(w->bn, _gcry_mpi_bn(u))) {
+            bn_fail("BN_copy failed");
+        }
     }
 
     free_opaque(w);
@@ -1096,7 +1192,6 @@ gcry_mpi_subm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
-    CHECK_MUTABLE(w);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1113,7 +1208,6 @@ gcry_mpi_mul(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 {
     BN_CTX *ctx;
 
-    CHECK_MUTABLE(w);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1127,10 +1221,13 @@ gcry_mpi_mul(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_mul_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
-    CHECK_MUTABLE(w);
-
     if (w != u) {
-        gcry_mpi_set(w, u);
+        /* Not gcry_mpi_set(): that one honours the immutable flag. */
+        free_opaque(w);
+
+        if (!BN_copy(w->bn, _gcry_mpi_bn(u))) {
+            bn_fail("BN_copy failed");
+        }
     }
 
     free_opaque(w);
@@ -1145,7 +1242,6 @@ gcry_mpi_mulm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
-    CHECK_MUTABLE(w);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1160,7 +1256,6 @@ gcry_mpi_mulm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 void
 gcry_mpi_mul_2exp(gcry_mpi_t w, gcry_mpi_t u, unsigned long cnt)
 {
-    CHECK_MUTABLE(w);
     free_opaque(w);
 
     if (!BN_lshift(w->bn, _gcry_mpi_bn(u), (int)cnt)) {
@@ -1177,16 +1272,6 @@ gcry_mpi_div(gcry_mpi_t q, gcry_mpi_t r, gcry_mpi_t dividend,
     BN_CTX *ctx;
     BIGNUM *tq;
     BIGNUM *tr;
-
-    if (q && mpi_is_immutable(q)) {
-        _gcry_mpi_immutable_failed();
-        return;
-    }
-
-    if (r && mpi_is_immutable(r)) {
-        _gcry_mpi_immutable_failed();
-        return;
-    }
 
     ctx = new_ctx();
     BN_CTX_start(ctx);
@@ -1238,7 +1323,6 @@ gcry_mpi_powm(gcry_mpi_t w, const gcry_mpi_t b, const gcry_mpi_t e,
 {
     BN_CTX *ctx;
 
-    CHECK_MUTABLE(w);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1257,11 +1341,6 @@ gcry_mpi_gcd(gcry_mpi_t g, gcry_mpi_t a, gcry_mpi_t b)
     BIGNUM *ta;
     BIGNUM *tb;
     int rc;
-
-    if (mpi_is_immutable(g)) {
-        _gcry_mpi_immutable_failed();
-        return 0;
-    }
 
     free_opaque(g);
     ctx = new_ctx();
@@ -1291,11 +1370,6 @@ gcry_mpi_invm(gcry_mpi_t x, gcry_mpi_t a, gcry_mpi_t m)
 {
     BN_CTX *ctx;
     BIGNUM *res;
-
-    if (mpi_is_immutable(x)) {
-        _gcry_mpi_immutable_failed();
-        return 0;
-    }
 
     free_opaque(x);
     ctx = new_ctx();
@@ -1637,7 +1711,8 @@ gcry_mpi_point_copy(gcry_mpi_point_t point)
     gcry_mpi_point_t p;
 
     if (!point) {
-        return NULL;
+        /* Upstream returns a new point at the origin. */
+        return gcry_mpi_point_new(0);
     }
 
     p = _gcry_xcalloc(1, sizeof * p);
