@@ -998,6 +998,145 @@ TEST(montgomery_and_degenerate_arithmetic)
     gcry_mpi_release(z);
 }
 
+/* The s or e member of an ECDH enc-val as an MPI. */
+static gcry_mpi_t
+encval_mpi(gcry_sexp_t ciph, const char *name)
+{
+    gcry_sexp_t l = gcry_sexp_find_token(ciph, name, 0);
+    gcry_mpi_t m = l ? gcry_sexp_nth_mpi(l, 1, GCRYMPI_FMT_USG) : NULL;
+
+    gcry_sexp_release(l);
+    return m;
+}
+
+/*
+ * RFC 7748 section 6 with the scalars already clamped: these take the
+ * X25519/X448 shortcut and must agree with the generic ladder, which the
+ * unclamped vector in the previous test exercises.  The numbers are the
+ * RFC's little endian byte strings read as big endian integers.
+ */
+TEST(montgomery_clamped_scalars)
+{
+    static const char k25[] =
+        "6a2cb91da5fb77b12a99c0eb872f4cdf4566b25172c1163c7da518730a6d0770";
+    static const char pub25a[] =
+        "6A4E9BAA8EA9A4EBF41A38260D3ABF0D5AF73EB4DC7D8B7454A7308909F02085";
+    static const char pub25b[] =
+        "4f2b886f147efcad4d67785bc843833f3735e4ecc2615bd3b4c17d7b7ddb9ede";
+    static const char k25shared[] =
+        "4217161E3C9BF076339ED147C9217EE0250F3580F43B8E72E12DCEA45B9D5D4A";
+    static const char k448[] =
+        "eb7298a5c0d8c29a1dab27f1a6826300917389449741a974f5bac9d98dc298d4"
+        "6555bce8bae89eeed400584bb046cf75579f51d125498f98";
+    static const char pub448a[] =
+        "A01FC432E5807F17530D1288DA125B0CD453D941726436C8BBD9C5222C3DA7FA"
+        "639CE03DB8D23B274A0721A1AED5227DE6E3B731CCF7089B";
+    static const char pub448b[] =
+        "0936f37bc6c1bd07ae3dec7ab5dc06a73ca13242fb343efc72b9d82730b445f3"
+        "d4b0bd077162a46dcfec6f9b590bfcbcf520cdb029a8b73e";
+    static const char k448shared[] =
+        "9D874A5137509A449AD5853040241C5236395435C36424FD560B0CB62B281D28"
+        "5275A740CE32A22DD1740F4AA9161CEC95CCC61A18F4FF07";
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t P = gcry_mpi_point_new(0);
+    gcry_mpi_point_t R = gcry_mpi_point_new(0);
+    gcry_mpi_t k;
+    gcry_mpi_t u;
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_sexp_t key = NULL;
+    gcry_sexp_t pub = NULL;
+    gcry_sexp_t data = NULL;
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_mpi_t m;
+
+    /* Curve25519: Alice's public key and the shared secret with Bob. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    k = hex_mpi(k25);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, pub25a));
+    u = hex_mpi(pub25b);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, k25shared));
+    gcry_mpi_release(u);
+    gcry_mpi_point_release(G);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* The same through the public key API with Alice's djb-tweak key. */
+    key = sexp_of("(private-key (ecc (curve Curve25519) (flags djb-tweak)"
+                  " (q #408520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4"
+                  "eba4a98eaa9b4e6a#)"
+                  " (d #6a2cb91da5fb77b12a99c0eb872f4cdf4566b25172c1163c7d"
+                  "a518730a6d0770#)))");
+    pub = sexp_of("(public-key (ecc (curve Curve25519) (flags djb-tweak)"
+                  " (q #408520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4"
+                  "eba4a98eaa9b4e6a#)))");
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(pub);
+    /* Bob's clamped secret as the ephemeral scalar: s is the RFC shared
+     * secret and e is Bob's public key. */
+    gcry_mpi_release(k);
+    k = hex_mpi("6be088ff278b2f1cfdb6182629b13b6fe60e80838b7fe1794b8a4a627e08ab58");
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", k));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, key));
+    /* djb-tweak values are 0x40 followed by the little endian u. */
+    m = encval_mpi(ciph, "e");
+    ASSERT_NOT_NULL(m);
+    ASSERT_TRUE(mpi_eq_hex(m, "40de9edb7d7b7dc1b4d35b61c2ece435373f8343c8"
+                           "5b78674dadfc7e146f882b4f"));
+    gcry_mpi_release(m);
+    m = encval_mpi(ciph, "s");
+    ASSERT_NOT_NULL(m);
+    ASSERT_TRUE(mpi_eq_hex(m, "404a5d9d5ba4ce2de1728e3bf480350f25e07e21c9"
+                           "47d19e3376f09b3c1e161742"));
+    {
+        gcry_sexp_t l = gcry_sexp_find_token(plain, "value", 0);
+        gcry_mpi_t v = gcry_sexp_nth_mpi(l, 1, GCRYMPI_FMT_USG);
+
+        ASSERT_NOT_NULL(v);
+        ASSERT_EQ(0, gcry_mpi_cmp(m, v));
+        gcry_mpi_release(v);
+        gcry_sexp_release(l);
+    }
+    gcry_mpi_release(m);
+    gcry_sexp_release(data);
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(plain);
+    data = ciph = plain = NULL;
+    gcry_sexp_release(key);
+    gcry_sexp_release(pub);
+    key = pub = NULL;
+
+    /* X448: Alice's public key and the shared secret with Bob. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "X448"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    gcry_mpi_release(k);
+    k = hex_mpi(k448);
+    gcry_mpi_ec_mul(R, k, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, pub448a));
+    u = hex_mpi(pub448b);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_release(u);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, k448shared));
+    gcry_mpi_point_release(G);
+    gcry_ctx_release(ctx);
+
+    gcry_mpi_point_release(P);
+    gcry_mpi_point_release(R);
+    gcry_mpi_release(k);
+    gcry_mpi_release(x);
+}
+
 int
 main(void)
 {
@@ -1014,5 +1153,6 @@ main(void)
     RUN_TEST(context_from_odd_keys);
     RUN_TEST(edwards_context_and_explicit_params);
     RUN_TEST(montgomery_and_degenerate_arithmetic);
+    RUN_TEST(montgomery_clamped_scalars);
     return TEST_RESULT();
 }

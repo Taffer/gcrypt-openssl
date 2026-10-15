@@ -1480,6 +1480,78 @@ leave:
     return rc;
 }
 
+/*
+ * Fast path: when the scalar already has the clamped form X25519/X448
+ * produce and the point is affine, OpenSSL's X25519/X448 compute exactly
+ * the u coordinate of [n]P, so the isomorphism path is not needed.
+ * Returns 1 and fills W on success, 0 when the generic path must be used
+ * (unclamped scalar, odd input, or a low order point for which OpenSSL
+ * refuses to produce the all-zero result).
+ */
+static int
+mont_mul_fast(gcry_mpi_point_t w, const BIGNUM *n, gcry_mpi_point_t u,
+              mpi_ec_t ec)
+{
+    unsigned int nbytes = (ec->nbits + 7) / 8;
+    unsigned char scalar[56];
+    unsigned char ubuf[56];
+    unsigned char out[56];
+    size_t outlen = nbytes;
+    const BIGNUM *ux;
+    EVP_PKEY *priv = NULL;
+    EVP_PKEY *pub = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    int ok = 0;
+
+    if ((ec->nbits != 255 && ec->nbits != 448) || BN_is_negative(n)
+        || gcry_mpi_cmp_ui(u->z, 1) || mpi_is_opaque(u->x)
+        || BN_bn2lebinpad(n, scalar, (int)nbytes) < 0) {
+        return 0;
+    }
+
+    if (nbytes == 32) {
+        if ((scalar[0] & 7) || (scalar[31] & 0x80) || !(scalar[31] & 0x40)) {
+            return 0;
+        }
+    } else if ((scalar[0] & 3) || !(scalar[55] & 0x80)) {
+        return 0;
+    }
+
+    /* Only a reduced u coordinate: X25519/X448 would mask or reduce
+     * anything larger, which the generic path does not. */
+    ux = _gcry_mpi_bn(u->x);
+
+    if (BN_is_negative(ux) || BN_ucmp(ux, _gcry_mpi_bn(ec->p)) >= 0
+        || BN_bn2lebinpad(ux, ubuf, (int)nbytes) < 0) {
+        return 0;
+    }
+
+    priv = EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(), mont_keytype(ec),
+                                           _gcry_propq(), scalar, nbytes);
+    pub = EVP_PKEY_new_raw_public_key_ex(_gcry_libctx(), mont_keytype(ec),
+                                         _gcry_propq(), ubuf, nbytes);
+    ctx = priv ? EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), priv,
+                                            _gcry_propq())
+          : NULL;
+
+    if (priv && pub && ctx && EVP_PKEY_derive_init(ctx) > 0
+        && EVP_PKEY_derive_set_peer_ex(ctx, pub, 0) > 0
+        && EVP_PKEY_derive(ctx, out, &outlen) > 0 && outlen == nbytes) {
+        reverse_buffer(out, nbytes);
+        _gcry_mpi_set_buffer(w->x, out, nbytes, 0);
+        gcry_mpi_set_ui(w->y, 0);
+        gcry_mpi_set_ui(w->z, 1);
+        ok = 1;
+    }
+
+    ERR_clear_error();
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(priv);
+    EVP_PKEY_free(pub);
+    _gcry_wipememory(scalar, sizeof scalar);
+    return ok;
+}
+
 static gcry_err_code_t
 mont_mul(gcry_mpi_point_t w, gcry_mpi_t n, gcry_mpi_point_t u, mpi_ec_t ec)
 {
@@ -1518,6 +1590,12 @@ mont_mul(gcry_mpi_point_t w, gcry_mpi_t n, gcry_mpi_point_t u, mpi_ec_t ec)
         _gcry_wipememory(scalar, scalarlen);
         _gcry_free(scalar);
         n = nnum;
+    }
+
+    if (mont_mul_fast(w, _gcry_mpi_bn(n), u, ec)) {
+        gcry_mpi_release(nnum);
+        BN_CTX_free(bctx);
+        return 0;
     }
 
     rc = mont_setup(ec, bctx);
