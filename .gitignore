@@ -65,3 +65,6 @@ CMakeUserPresets.json
 
 # Agent worktrees
 .claude/worktrees/
+
+# The linker version script is not linker output.
+!src/libgcrypt.map

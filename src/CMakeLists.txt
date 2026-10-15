@@ -6,6 +6,8 @@ set(GCRYPT_OPENSSL_SOURCES
     error.c
     global.c
     kem.c
+    mac.c
+    md.c
     memory.c
     misc.c
     mpi.c
