@@ -1,0 +1,10 @@
+# Exported symbols of libgcrypt-openssl.  The version node name matches the
+# one used by the reference library so that binaries linked against it can
+# resolve their versioned references here.
+GCRYPT_1.6 {
+  global:
+    gcry_*;
+    _gcry_mpi_get_const;
+  local:
+    *;
+};
