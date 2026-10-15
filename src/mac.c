@@ -133,6 +133,20 @@ spec_from_algo(int algo)
     return NULL;
 }
 
+/* The GCRY_MD_* digest behind an HMAC algorithm id, or 0 if MACALGO is not
+ * an HMAC. */
+int
+_gcry_mac_hmac_digest_algo(int macalgo)
+{
+    const struct mac_spec *spec = spec_from_algo(macalgo);
+
+    if (!spec || spec->kind != MAC_HMAC) {
+        return 0;
+    }
+
+    return spec->mdalgo;
+}
+
 static const struct mac_spec *
 spec_from_name(const char *name)
 {

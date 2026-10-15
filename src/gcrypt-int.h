@@ -224,6 +224,11 @@ EVP_MD *_gcry_md_fetch(int algo);
 /* Output size parameter needed for the truncated BLAKE2 variants, else 0. */
 unsigned int _gcry_md_reduced_size(int algo);
 
+/* ---- mac.c ------------------------------------------------------- */
+
+/* GCRY_MD_* digest behind an HMAC algorithm id, 0 if not an HMAC. */
+int _gcry_mac_hmac_digest_algo(int macalgo);
+
 /* ---- random.c ---------------------------------------------------- */
 
 gcry_err_code_t _gcry_random_bytes_into(void *buffer, size_t length,

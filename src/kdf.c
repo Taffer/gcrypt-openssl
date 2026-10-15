@@ -21,96 +21,23 @@
 #define SCRYPT_MAXMEM (1024u * 1024u * 1024u)
 
 /* --- Digest and MAC algorithm mapping ---------------------------------
- * The message digest module provides the authoritative mapping; until the
- * modules are integrated this private table covers the digests needed
- * here.  FIXME: switch to the md module's helper once available. */
-
-struct digest_name {
-    int algo;
-    const char *name;
-};
-
-static const struct digest_name digest_names[] = {
-    { GCRY_MD_MD5, "MD5" },
-    { GCRY_MD_SHA1, "SHA1" },
-    { GCRY_MD_RMD160, "RIPEMD160" },
-    { GCRY_MD_SHA256, "SHA256" },
-    { GCRY_MD_SHA384, "SHA384" },
-    { GCRY_MD_SHA512, "SHA512" },
-    { GCRY_MD_SHA224, "SHA224" },
-    { GCRY_MD_MD4, "MD4" },
-    { GCRY_MD_WHIRLPOOL, "WHIRLPOOL" },
-    { GCRY_MD_SHA3_224, "SHA3-224" },
-    { GCRY_MD_SHA3_256, "SHA3-256" },
-    { GCRY_MD_SHA3_384, "SHA3-384" },
-    { GCRY_MD_SHA3_512, "SHA3-512" },
-    { GCRY_MD_BLAKE2B_512, "BLAKE2B512" },
-    { GCRY_MD_BLAKE2S_256, "BLAKE2S256" },
-    { GCRY_MD_SM3, "SM3" },
-    { GCRY_MD_SHA512_256, "SHA512-256" },
-    { GCRY_MD_SHA512_224, "SHA512-224" },
-};
-
-static const struct digest_name hmac_names[] = {
-    { GCRY_MAC_HMAC_SHA256, "SHA256" },
-    { GCRY_MAC_HMAC_SHA224, "SHA224" },
-    { GCRY_MAC_HMAC_SHA512, "SHA512" },
-    { GCRY_MAC_HMAC_SHA384, "SHA384" },
-    { GCRY_MAC_HMAC_SHA1, "SHA1" },
-    { GCRY_MAC_HMAC_MD5, "MD5" },
-    { GCRY_MAC_HMAC_MD4, "MD4" },
-    { GCRY_MAC_HMAC_RMD160, "RIPEMD160" },
-    { GCRY_MAC_HMAC_WHIRLPOOL, "WHIRLPOOL" },
-    { GCRY_MAC_HMAC_SHA3_224, "SHA3-224" },
-    { GCRY_MAC_HMAC_SHA3_256, "SHA3-256" },
-    { GCRY_MAC_HMAC_SHA3_384, "SHA3-384" },
-    { GCRY_MAC_HMAC_SHA3_512, "SHA3-512" },
-    { GCRY_MAC_HMAC_BLAKE2B_512, "BLAKE2B512" },
-    { GCRY_MAC_HMAC_BLAKE2S_256, "BLAKE2S256" },
-    { GCRY_MAC_HMAC_SM3, "SM3" },
-    { GCRY_MAC_HMAC_SHA512_256, "SHA512-256" },
-    { GCRY_MAC_HMAC_SHA512_224, "SHA512-224" },
-};
-
-static const char *
-lookup_name(const struct digest_name *table, size_t n, int algo)
-{
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        if (table[i].algo == algo) {
-            return table[i].name;
-        }
-    }
-
-    return NULL;
-}
+ * The digest and MAC modules own the mapping of gcrypt algorithm ids to
+ * OpenSSL names. */
 
 /* Fetch the digest for a gcrypt digest algorithm id. */
 static EVP_MD *
 fetch_digest(int algo)
 {
-    const char *name = lookup_name(digest_names, DIM(digest_names), algo);
-    EVP_MD *md;
-
-    if (!name) {
-        return NULL;
-    }
-
-    md = EVP_MD_fetch(_gcry_libctx(), name, _gcry_propq());
-
-    if (!md) {
-        ERR_clear_error();
-    }
-
-    return md;
+    return _gcry_md_fetch(algo);
 }
 
-/* The digest behind an HMAC algorithm id, or NULL. */
+/* The OpenSSL digest name behind an HMAC algorithm id, or NULL. */
 static const char *
 hmac_digest_name(int macalgo)
 {
-    return lookup_name(hmac_names, DIM(hmac_names), macalgo);
+    int mdalgo = _gcry_mac_hmac_digest_algo(macalgo);
+
+    return mdalgo ? _gcry_md_openssl_name(mdalgo) : NULL;
 }
 
 static int
@@ -309,8 +236,8 @@ pbkdf2(const void *passphrase, size_t passphraselen, int hashalgo,
        const void *salt, size_t saltlen, unsigned long iterations,
        size_t keysize, void *keybuffer)
 {
-    const char *digest = lookup_name(digest_names, DIM(digest_names),
-                                     hashalgo);
+    const char *digest = _gcry_md_openssl_name(
+                             hashalgo);
     OSSL_PARAM params[6];
     size_t n = 0;
     uint64_t iter = iterations;
@@ -668,8 +595,8 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else if (paramlen != 1) {
             ec = GPG_ERR_INV_VALUE;
         } else {
-            h->digest = lookup_name(digest_names, DIM(digest_names),
-                                    subalgo);
+            h->digest = _gcry_md_openssl_name(
+                            subalgo);
 
             if (!h->digest || !digest_size(h->digest)) {
                 ec = GPG_ERR_DIGEST_ALGO;
@@ -725,8 +652,8 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else if (paramlen != 1) {
             ec = GPG_ERR_INV_VALUE;
         } else {
-            h->digest = lookup_name(digest_names, DIM(digest_names),
-                                    subalgo);
+            h->digest = _gcry_md_openssl_name(
+                            subalgo);
 
             if (!h->digest || !digest_size(h->digest)) {
                 ec = GPG_ERR_DIGEST_ALGO;
