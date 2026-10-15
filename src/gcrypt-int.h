@@ -224,6 +224,11 @@ EVP_MD *_gcry_md_fetch(int algo);
 /* Output size parameter needed for the truncated BLAKE2 variants, else 0. */
 unsigned int _gcry_md_reduced_size(int algo);
 
+/* ---- random.c ---------------------------------------------------- */
+
+gcry_err_code_t _gcry_random_bytes_into(void *buffer, size_t length,
+                                        enum gcry_random_level level);
+
 /* ---- mpi-ec.c ---------------------------------------------------- */
 
 void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,

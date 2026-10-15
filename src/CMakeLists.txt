@@ -5,6 +5,7 @@ set(GCRYPT_OPENSSL_SOURCES
     ecc-curves.c
     error.c
     global.c
+    kdf.c
     kem.c
     mac.c
     md.c
@@ -12,6 +13,8 @@ set(GCRYPT_OPENSSL_SOURCES
     misc.c
     mpi.c
     mpi-ec.c
+    prime.c
+    random.c
     sexp.c
 )
 
