@@ -1,4 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <gcrypt.h>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <stdlib.h>
 
@@ -463,6 +468,437 @@ TEST(points)
     gcry_mpi_release(t);
 }
 
+TEST(scan_edge_cases)
+{
+    gcry_mpi_t m = NULL;
+    size_t ns = 99;
+    unsigned char *big;
+
+    /* Two's complement input of every shape. */
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, "", 0, &ns));
+    ASSERT_EQ(0, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, "\x00\x81", 2, &ns));
+    ASSERT_EQ(2, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0x81));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, "\x00\x00\x01", 3, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 1));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, "\xff\xff", 2, NULL));
+    ASSERT_TRUE(gcry_mpi_is_neg(m));
+    gcry_mpi_abs(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 1));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, "\x80", 1, NULL));
+    gcry_mpi_abs(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0x80));
+    gcry_mpi_release(m);
+
+    /* PGP: oversized bit counts are refused, trailing bytes ignored. */
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_PGP,
+                                              "\xff\xff\x01", 3, &ns));
+    ASSERT_EQ(0, ns);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_PGP, "\x00\x00", 2, &ns));
+    ASSERT_EQ(2, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_PGP, "\x00\x09\x01\x00\xee", 5,
+                            &ns));
+    ASSERT_EQ(4, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0x100));
+    gcry_mpi_release(m);
+
+    /* SSH: an empty body is zero, negative bodies are two's complement. */
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_SSH, "\x00\x00\x00\x00", 4, &ns));
+    ASSERT_EQ(4, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_SSH, "\x00\x00\x00\x02\xff\x7f\xaa",
+                            7, &ns));
+    ASSERT_EQ(6, ns);
+    ASSERT_TRUE(gcry_mpi_is_neg(m));
+    gcry_mpi_abs(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0x81));
+    gcry_mpi_release(m);
+
+    /* HEX: empty, sign only and prefix only are all zero. */
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "", 0, &ns));
+    ASSERT_EQ(0, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-", 0, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    ASSERT_FALSE(gcry_mpi_is_neg(m));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "0x", 0, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-0x0a", 0, NULL));
+    ASSERT_TRUE(gcry_mpi_is_neg(m));
+    gcry_mpi_abs(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 10));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "abcDEF", 0, &ns));
+    ASSERT_EQ(6, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0xabcdef));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-00", 0, NULL));
+    ASSERT_FALSE(gcry_mpi_is_neg(m));
+    gcry_mpi_release(m);
+
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_scan(&m, (enum gcry_mpi_format)77,
+                                              "\x01", 1, NULL));
+    /* The result may be discarded. */
+    ASSERT_OK(gcry_mpi_scan(NULL, GCRYMPI_FMT_USG, "\x01", 1, &ns));
+    ASSERT_EQ(1, ns);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_USG, "\x00\x00\x05", 3, NULL));
+    ASSERT_EQ(3, gcry_mpi_get_nbits(m));
+    gcry_mpi_release(m);
+
+    /* Inputs beyond 16 MiB are rejected before anything is allocated. */
+    big = calloc(16u * 1024 * 1024 + 1, 1);
+    ASSERT_NOT_NULL(big);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_USG, big,
+                                              16u * 1024 * 1024 + 1, &ns));
+    ASSERT_EQ(0, ns);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_STD, big,
+                                              16u * 1024 * 1024 + 1, NULL));
+    free(big);
+}
+
+TEST(print_edge_cases)
+{
+    gcry_mpi_t m = from_hex("81");
+    unsigned char buf[16];
+    unsigned char *abuf = NULL;
+    size_t nw = 99;
+    size_t an = 99;
+
+    ASSERT_NOT_NULL(m);
+    gcry_mpi_neg(m, m); /* -129 */
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, sizeof buf, &nw, m));
+    ASSERT_EQ(6, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x02\xff\x7f", buf, 6);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 5, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_STD, buf, 1, &nw,
+                                                 m));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, NULL, 0, &nw, m));
+    ASSERT_EQ(6, nw);
+    gcry_mpi_set_ui(m, 128);
+    gcry_mpi_neg(m, m);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, sizeof buf, &nw, m));
+    ASSERT_EQ(5, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x01\x80", buf, 5);
+
+    /* Zero in the length prefixed formats. */
+    gcry_mpi_set_ui(m, 0);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, sizeof buf, &nw, m));
+    ASSERT_EQ(4, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x00", buf, 4);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_PGP, buf, sizeof buf, &nw, m));
+    ASSERT_EQ(2, nw);
+    ASSERT_MEM_EQ("\x00\x00", buf, 2);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_PGP, buf, 1, &nw,
+                                                 m));
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_USG, &abuf, &an, m));
+    ASSERT_NOT_NULL(abuf);
+    ASSERT_EQ(0, an);
+    gcry_free(abuf);
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_STD, &abuf, &an, m));
+    ASSERT_NOT_NULL(abuf);
+    ASSERT_EQ(0, an);
+    gcry_free(abuf);
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_PGP, &abuf, NULL, m));
+    ASSERT_MEM_EQ("\x00\x00", abuf, 2);
+    gcry_free(abuf);
+
+    /* Unsigned output and sizing without a buffer or a count. */
+    gcry_mpi_set_ui(m, 0x1234);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_USG, buf, 1, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_USG, NULL, 0, &nw, m));
+    ASSERT_EQ(2, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, sizeof buf, NULL, m));
+    ASSERT_MEM_EQ("\x12\x34", buf, 2);
+
+    gcry_mpi_release(m);
+}
+
+TEST(opaque_comparisons)
+{
+    gcry_mpi_t a = from_hex("05");
+    gcry_mpi_t b;
+    gcry_mpi_t o1 = gcry_mpi_set_opaque_copy(NULL, "\x01\x02", 16);
+    gcry_mpi_t o2 = gcry_mpi_set_opaque_copy(NULL, "\x01\x02\x03", 24);
+    gcry_mpi_t o3 = gcry_mpi_set_opaque_copy(NULL, "\x01\x02", 12);
+
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(o1);
+    ASSERT_NOT_NULL(o2);
+    ASSERT_NOT_NULL(o3);
+
+    /* gcry_mpi_set allocates when needed and tolerates w == u. */
+    b = gcry_mpi_set(NULL, a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_EQ(0, gcry_mpi_cmp(a, b));
+    ASSERT_TRUE(gcry_mpi_set(b, b) == b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(b, 5));
+
+    /* Opaque values order by bit length first, then by content. */
+    ASSERT_TRUE(gcry_mpi_cmp(o1, o2) < 0);
+    ASSERT_TRUE(gcry_mpi_cmp(o2, o1) > 0);
+    ASSERT_TRUE(gcry_mpi_cmp(o1, o3) > 0);
+    ASSERT_TRUE(gcry_mpi_cmp(o3, o1) < 0);
+    ASSERT_EQ(0, gcry_mpi_cmp(o1, o1));
+    ASSERT_FALSE(gcry_mpi_is_neg(o1));
+    ASSERT_FALSE(gcry_mpi_test_bit(o1, 0));
+    ASSERT_EQ(12, gcry_mpi_get_nbits(o3));
+
+    /* Negation into another MPI and back in place. */
+    gcry_mpi_neg(b, a);
+    ASSERT_TRUE(gcry_mpi_is_neg(b));
+    gcry_mpi_neg(b, b);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(b, 5));
+    gcry_mpi_neg(b, b);
+    ASSERT_TRUE(gcry_mpi_cmp(b, a) < 0);
+    ASSERT_TRUE(gcry_mpi_cmp(a, b) > 0);
+    ASSERT_TRUE(gcry_mpi_cmp_ui(b, 0) < 0);
+
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    gcry_mpi_release(o1);
+    gcry_mpi_release(o2);
+    gcry_mpi_release(o3);
+}
+
+TEST(immutable_refusals)
+{
+    gcry_mpi_t r = from_hex("01");
+    gcry_mpi_t u = from_hex("09");
+    gcry_mpi_t q = from_hex("02");
+
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(u);
+    ASSERT_NOT_NULL(q);
+    gcry_mpi_set_flag(r, GCRYMPI_FLAG_IMMUTABLE);
+
+    /* Assignments to an immutable MPI are ignored (with a warning). */
+    gcry_mpi_neg(r, r);
+    ASSERT_FALSE(gcry_mpi_is_neg(r));
+    gcry_mpi_set_opaque(r, NULL, 0);
+    ASSERT_FALSE(gcry_mpi_get_flag(r, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 1));
+    gcry_mpi_snatch(r, u);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 1));
+    gcry_mpi_release(u); /* Not consumed. */
+    gcry_mpi_clear_flag(r, GCRYMPI_FLAG_IMMUTABLE);
+    gcry_mpi_set_ui(r, 3);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 3));
+    gcry_mpi_release(r);
+
+    /* CONST implies IMMUTABLE and cannot be cleared again. */
+    gcry_mpi_set_flag(q, GCRYMPI_FLAG_CONST);
+    ASSERT_TRUE(gcry_mpi_get_flag(q, GCRYMPI_FLAG_CONST));
+    ASSERT_TRUE(gcry_mpi_get_flag(q, GCRYMPI_FLAG_IMMUTABLE));
+    gcry_mpi_clear_flag(q, GCRYMPI_FLAG_IMMUTABLE);
+    ASSERT_TRUE(gcry_mpi_get_flag(q, GCRYMPI_FLAG_IMMUTABLE));
+    gcry_mpi_set_ui(q, 77);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(q, 2));
+    /* A constant is never released, so Q is deliberately kept. */
+}
+
+TEST(arithmetic_edges)
+{
+    gcry_mpi_t a = from_hex("05");
+    gcry_mpi_t n = from_hex("-07");
+    gcry_mpi_t three = from_hex("03");
+    gcry_mpi_t six = from_hex("06");
+    gcry_mpi_t minus3 = from_hex("-03");
+    gcry_mpi_t minus1 = from_hex("-01");
+    gcry_mpi_t m = from_hex("08");
+    gcry_mpi_t z = gcry_mpi_new(0);
+    gcry_mpi_t r = gcry_mpi_new(0);
+    unsigned int ui = 99;
+
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(n);
+    ASSERT_NOT_NULL(minus1);
+
+    /* Immediate operands with a distinct destination. */
+    gcry_mpi_add_ui(r, a, 3);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 8));
+    gcry_mpi_sub_ui(r, a, 7);
+    ASSERT_TRUE(gcry_mpi_is_neg(r));
+    gcry_mpi_abs(r);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 2));
+    gcry_mpi_mul_ui(r, a, 3);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 15));
+
+    /* High bit operations beyond the current size. */
+    gcry_mpi_set_ui(r, 0x3f);
+    gcry_mpi_set_highbit(r, 10);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 0x43f));
+    gcry_mpi_clear_highbit(r, 20);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 0x43f));
+    gcry_mpi_clear_highbit(r, 0);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 0));
+    gcry_mpi_set_ui(r, 1);
+    gcry_mpi_lshift(r, r, 200);
+    ASSERT_EQ(201, gcry_mpi_get_nbits(r));
+    gcry_mpi_rshift(r, r, 300);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 0));
+
+    /* Floored modulus with negative operands. */
+    gcry_mpi_mod(r, n, three);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 2));
+    gcry_mpi_mod(r, a, n);
+    ASSERT_TRUE(gcry_mpi_is_neg(r));
+    gcry_mpi_abs(r);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 2));
+    gcry_mpi_div(r, NULL, a, n, -1);
+    ASSERT_EQ(0, gcry_mpi_cmp(r, minus1));
+    gcry_mpi_div(NULL, r, a, n, -1);
+    gcry_mpi_abs(r);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 2));
+
+    /* gcd with zero and with negative numbers. */
+    ASSERT_EQ(0, gcry_mpi_gcd(r, a, z));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 5));
+    ASSERT_EQ(0, gcry_mpi_gcd(r, z, z));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 0));
+    ASSERT_EQ(0, gcry_mpi_gcd(r, minus3, six));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 3));
+    ASSERT_EQ(1, gcry_mpi_invm(r, a, m));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 5));
+
+    /* Modular exponentiation corner cases: 5^0, 0^0 and 5^-1 mod 8. */
+    gcry_mpi_powm(r, a, z, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 1));
+    gcry_mpi_powm(r, z, z, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 1));
+    gcry_mpi_powm(r, a, minus1, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 5));
+    gcry_mpi_addm(r, a, a, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 2));
+    gcry_mpi_subm(r, z, a, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 3));
+    gcry_mpi_mulm(r, a, a, m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(r, 1));
+
+    /* Zero has no sign and no bits. */
+    ASSERT_EQ(0, gcry_mpi_get_nbits(z));
+    ASSERT_FALSE(gcry_mpi_is_neg(z));
+    gcry_mpi_neg(r, z);
+    ASSERT_FALSE(gcry_mpi_is_neg(r));
+    ASSERT_OK(gcry_mpi_get_ui(&ui, z));
+    ASSERT_EQ(0, ui);
+
+    /* NULL handling and the strongest random level. */
+    ASSERT_NULL(gcry_mpi_copy(NULL));
+    gcry_mpi_snatch(NULL, six); /* Releases SIX. */
+    gcry_mpi_randomize(r, 64, GCRY_VERY_STRONG_RANDOM);
+    ASSERT_TRUE(gcry_mpi_get_nbits(r) <= 64);
+
+    gcry_mpi_release(a);
+    gcry_mpi_release(n);
+    gcry_mpi_release(three);
+    gcry_mpi_release(minus3);
+    gcry_mpi_release(minus1);
+    gcry_mpi_release(m);
+    gcry_mpi_release(z);
+    gcry_mpi_release(r);
+}
+
+TEST(point_edges)
+{
+    gcry_mpi_point_t p;
+    gcry_mpi_t t = gcry_mpi_new(0);
+    gcry_mpi_t y = from_hex("02");
+
+    ASSERT_NOT_NULL(y);
+
+    /* NULL point and NULL coordinates allocate and zero as needed. */
+    p = gcry_mpi_point_set(NULL, NULL, NULL, NULL);
+    ASSERT_NOT_NULL(p);
+    gcry_mpi_set_ui(t, 9);
+    gcry_mpi_point_get(t, NULL, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_release(p);
+
+    p = gcry_mpi_point_snatch_set(NULL, NULL, y, NULL);
+    ASSERT_NOT_NULL(p);
+    gcry_mpi_set_ui(t, 9);
+    gcry_mpi_point_get(t, NULL, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_get(NULL, t, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 2));
+    gcry_mpi_set_ui(t, 9);
+    gcry_mpi_point_get(NULL, NULL, t, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_release(p);
+
+    p = gcry_mpi_point_snatch_set(NULL, from_hex("03"), NULL, from_hex("04"));
+    ASSERT_NOT_NULL(p);
+    gcry_mpi_set_ui(t, 9);
+    gcry_mpi_point_get(NULL, t, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_get(t, NULL, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 3));
+    gcry_mpi_point_get(NULL, NULL, t, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 4));
+    gcry_mpi_point_release(p);
+
+    /* The size hint does not change the initial value. */
+    p = gcry_mpi_point_new(256);
+    gcry_mpi_set_ui(t, 9);
+    gcry_mpi_point_get(t, NULL, NULL, p);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(t, 0));
+    gcry_mpi_point_release(p);
+    gcry_mpi_release(t);
+}
+
+TEST(dump)
+{
+    gcry_mpi_t a = from_hex("05");
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x01", 8);
+    int saved;
+    int devnull;
+
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(o);
+
+    /* The dumps go to the log on stderr; silence them. */
+    fflush(stderr);
+    saved = dup(2);
+    devnull = open("/dev/null", O_WRONLY);
+
+    if (saved >= 0 && devnull >= 0) {
+        dup2(devnull, 2);
+    }
+
+    gcry_mpi_dump(a);
+    gcry_mpi_dump(o);
+    gcry_mpi_dump(NULL);
+    fflush(stderr);
+
+    if (saved >= 0) {
+        dup2(saved, 2);
+        close(saved);
+    }
+
+    if (devnull >= 0) {
+        close(devnull);
+    }
+
+    gcry_mpi_release(a);
+    gcry_mpi_release(o);
+}
+
 int
 main(void)
 {
@@ -476,5 +912,12 @@ main(void)
     RUN_TEST(opaque_and_flags);
     RUN_TEST(secure_and_random);
     RUN_TEST(points);
+    RUN_TEST(scan_edge_cases);
+    RUN_TEST(print_edge_cases);
+    RUN_TEST(opaque_comparisons);
+    RUN_TEST(immutable_refusals);
+    RUN_TEST(arithmetic_edges);
+    RUN_TEST(point_edges);
+    RUN_TEST(dump);
     return TEST_RESULT();
 }
