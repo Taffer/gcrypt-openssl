@@ -1016,3 +1016,11 @@ _gcry_fips_reject_flags(void)
 {
     return fips_reject_flags;
 }
+
+/* Whether digest ALGO may be used in FIPS mode; the same set the
+ * GCRYCTL_FIPS_SERVICE_INDICATOR_MD query approves. */
+int
+_gcry_fips_md_approved(int algo)
+{
+    return fips_indicator_md(algo) == 0;
+}

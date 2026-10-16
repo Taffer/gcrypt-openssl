@@ -250,11 +250,34 @@ TEST(cshake)
 
 TEST(legacy_and_other_hashes)
 {
-    CHECK(GCRY_MD_RMD160, "abc", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
+    /* RIPEMD-160 is not a FIPS-approved digest: in FIPS mode it is reported
+     * as unavailable and a handle cannot be opened for it. */
+    if (gcry_fips_mode_active()) {
+        gcry_md_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_RMD160));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_open(&hd, GCRY_MD_RMD160, 0));
+        ASSERT_NULL(hd);
+    } else {
+        CHECK(GCRY_MD_RMD160, "abc", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
+    }
+
     CHECK(GCRY_MD_MD4, "abc", "a448017aaf21d8525fc10ae87aa6729d");
-    CHECK(GCRY_MD_WHIRLPOOL, "abc",
-          "4e2448a4c6f486bb16b6562c73b4020bf3043e3a731bce721ae1b303d97e6d4c"
-          "7181eebdb6c57e277d0e34957114cbd6c797fc9d95d8b582d225292076d4eef5");
+
+    /* Whirlpool is not FIPS-approved either. */
+    if (gcry_fips_mode_active()) {
+        gcry_md_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_WHIRLPOOL));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   gcry_md_open(&hd, GCRY_MD_WHIRLPOOL, 0));
+        ASSERT_NULL(hd);
+    } else {
+        CHECK(GCRY_MD_WHIRLPOOL, "abc",
+              "4e2448a4c6f486bb16b6562c73b4020bf3043e3a731bce721ae1b303d97e6d4c"
+              "7181eebdb6c57e277d0e34957114cbd6c797fc9d95d8b582d225292076d4eef5");
+    }
+
     CHECK(GCRY_MD_SM3, "abc",
           "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
 }
@@ -654,8 +677,14 @@ TEST(algorithm_info)
     n = sizeof oid;
     ASSERT_OK(gcry_md_get_asnoid(GCRY_MD_SHA1, oid, &n));
     ASSERT_EQ(15, n);
-    ASSERT_OK(gcry_md_get_asnoid(GCRY_MD_WHIRLPOOL, NULL, &n));
-    ASSERT_EQ(0, n);
+    /* Whirlpool has no DigestInfo prefix; in FIPS mode the algorithm itself
+     * is unavailable, which is reported first. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          gcry_md_get_asnoid(GCRY_MD_WHIRLPOOL, NULL, &n));
+
+    if (!gcry_fips_mode_active()) {
+        ASSERT_EQ(0, n);
+    }
 
     ASSERT_STR_EQ("SHA256", gcry_md_algo_name(GCRY_MD_SHA256));
     ASSERT_STR_EQ("RIPEMD160", gcry_md_algo_name(GCRY_MD_RMD160));

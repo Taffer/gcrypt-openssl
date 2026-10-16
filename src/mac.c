@@ -284,6 +284,13 @@ check_mac_algo(int algo)
         return GPG_ERR_MAC_ALGO;
     }
 
+    /* FIPS mode allows only the approved MACs (HMAC over SHA-2/SHA-3 and
+     * CMAC-AES), whatever OpenSSL's provider happens to offer. */
+    if (!spec->fips && _gcry_fips_mode()
+        && (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_MAC)) {
+        return GPG_ERR_MAC_ALGO;
+    }
+
     switch (spec->kind) {
     case MAC_HMAC: {
         EVP_MD *md;

@@ -153,10 +153,21 @@ TEST(cmac_rfc4493)
     ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_AES,
                           "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
                           NULL, "", 0, "028962f61b7bf89efc6b551f4667d983"));
-    /* 3DES CMAC (NIST SP 800-38B D.4, empty message). */
-    ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_3DES,
-                          "8aa83bf8cbda10620bc1bf19fbb6cd58bc313d4a371ca8b5", NULL,
-                          "", 0, "b7a688e122ffaf95"));
+
+    /* 3DES CMAC (NIST SP 800-38B D.4, empty message).  Triple-DES is not
+     * an approved MAC cipher, so FIPS mode refuses to open it. */
+    if (gcry_fips_mode_active()) {
+        gcry_mac_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
+        ASSERT_NULL(hd);
+    } else {
+        ASSERT_TRUE(check_mac(GCRY_MAC_CMAC_3DES,
+                              "8aa83bf8cbda10620bc1bf19fbb6cd58bc313d4a371ca8b5",
+                              NULL, "", 0, "b7a688e122ffaf95"));
+    }
 }
 
 TEST(gmac_and_poly1305)
@@ -327,8 +338,12 @@ TEST(algorithm_tables)
 
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA3_256));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
-    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
-    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_WHIRLPOOL));
+    /* SM3 is not FIPS-approved, so HMAC over it is refused in FIPS mode. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
+                          gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
+    /* HMAC over Whirlpool is unavailable in FIPS mode along with the digest. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
+                          gcry_mac_test_algo(GCRY_MAC_HMAC_WHIRLPOOL));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_TIGER1));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_STRIBOG256));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_256));
@@ -380,15 +395,21 @@ TEST(key_and_state_rules)
     gcry_mac_close(hd);
 
     /* Triple-DES CMAC takes three-key material only, and refuses weak or
-     * semi-weak subkeys like the cipher does. */
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 20));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
-    ASSERT_OK(gcry_mac_setkey(hd, key, 24));
-    memset(key + 8, 0x01, 8);
-    ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_mac_setkey(hd, key, 24));
-    memset(key, 7, sizeof key);
-    gcry_mac_close(hd);
+     * semi-weak subkeys like the cipher does.  FIPS mode does not offer
+     * it at all. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
+    } else {
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 20));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 24));
+        memset(key + 8, 0x01, 8);
+        ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_mac_setkey(hd, key, 24));
+        memset(key, 7, sizeof key);
+        gcry_mac_close(hd);
+    }
     ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
     ASSERT_OK(gcry_mac_setkey(hd, key, 5));

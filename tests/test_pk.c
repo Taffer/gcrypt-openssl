@@ -1979,13 +1979,20 @@ TEST(dsa_data_errors)
         gcry_sexp_release(d);
     }
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw prehash) (hash-algo rmd160)"
-                        " (value #0102#))", priv));
+    /* RIPEMD-160 is not FIPS-approved, so FIPS mode refuses it whether the
+     * library hashes or the caller supplies the digest. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw prehash)"
+                                    " (hash-algo rmd160) (value #0102#))",
+                                    priv));
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw) (hash rmd160 #" D20 "#))", priv));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw)"
+                                    " (hash rmd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw) (hash ripemd160 #" D20 "#))",
-                        priv));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw)"
+                                    " (hash ripemd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags raw) (value #01#)"
                         " (hash sha256 #" D32 "#))", priv));
@@ -2140,9 +2147,11 @@ TEST(rsa_data_errors)
                sign_text(&sig, "(data (flags pss) (hash md2"
                          " #0102030405060708091011121314151617#))", priv));
 
-    /* PKCS#1 with other digests and with prehashing. */
-    ASSERT_OK(sign_text(&sig, "(data (flags pkcs1) (hash rmd160 #" D20 "#))",
-                        priv));
+    /* PKCS#1 with other digests and with prehashing.  RIPEMD-160 is not
+     * FIPS-approved and is refused in FIPS mode. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags pkcs1)"
+                                    " (hash rmd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags pkcs1 prehash) (hash-algo sha256)"
                         " (value #0102#))", priv));

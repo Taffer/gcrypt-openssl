@@ -1155,6 +1155,16 @@ _gcry_pk_data_parse(gcry_sexp_t input, struct pk_data *pd)
         rc = GPG_ERR_CONFLICT;
     }
 
+    /* In FIPS mode a digest that is not approved (RIPEMD-160, MD5, ...)
+     * must not take part in a public key operation, whether it is to be
+     * computed here or was supplied by the caller.  This is not tied to
+     * GCRY_FIPS_FLAG_REJECT_PK_MD, which is off by default; the algorithm
+     * check in pk.c is unconditional in the same way. */
+    if (!rc && pd->hash_algo && _gcry_fips_mode()
+        && !_gcry_fips_md_approved(pd->hash_algo)) {
+        rc = GPG_ERR_DIGEST_ALGO;
+    }
+
 leave:
     pd->flags |= parsed_flags;
     gcry_sexp_release(lhash);

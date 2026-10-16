@@ -108,6 +108,17 @@ static int test_count_ = 0;
         }                                                                    \
     } while (0)
 
+/* EXPR must succeed, unless the library runs in FIPS mode, where the
+ * operation is not approved and must fail with CODE instead. */
+#define ASSERT_OK_OR_FIPS_ERR(code, expr)   \
+    do {                                    \
+        if (gcry_fips_mode_active()) {      \
+            ASSERT_ERR(code, expr);         \
+        } else {                            \
+            ASSERT_OK(expr);                \
+        }                                   \
+    } while (0)
+
 #define TEST_RESULT()                                                    \
     (printf("%d test(s), %d failure(s)\n", test_count_, test_failures_), \
      test_failures_ == 0 ? 0 : 1)
