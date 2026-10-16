@@ -55,11 +55,11 @@ This project was extruded by Claude. Use at your own risk.
 |------|-----------|---------------|
 | Ciphers | AES, Camellia, ARIA, SM4, 3DES, DES, CAST5, Blowfish, IDEA, RC2, SEED, RC4, ChaCha20; ECB, CBC (+CTS, +MAC), CFB, CFB8, OFB, CTR, GCM, CCM, OCB, XTS, SIV, GCM-SIV, AES key wrap (+padding), ChaCha20-Poly1305 | Twofish, Serpent, Salsa20, GOST 28147, SAFER; EAX mode; Camellia GCM-SIV |
 | Digests | MD4, MD5, SHA-1, SHA-2 (all), SHA-3, SHAKE, cSHAKE (customisation string only), RIPEMD-160, Whirlpool, BLAKE2b/s (all sizes), SM3, CRC32/CRC24; HMAC flag | Tiger, Haval, GOST R 34.11, Stribog; MD2 (only if the legacy provider offers it, which OpenSSL 4 does not) |
-| MACs | HMAC (all available digests), CMAC (available block ciphers), GMAC-AES, Poly1305 | Poly1305-cipher variants, GMAC for non-AES ciphers, GOST IMIT |
 | KDFs | S2K (all three), PBKDF2, scrypt, Argon2 (d/i/id), HKDF, one-step KDF (hash and HMAC), X9.63; the `gcry_kdf_open` handle API | PBKDF1 (upstream rejects it too), Balloon (no OpenSSL implementation) |
-| Public key | RSA (PKCS#1 v1.5, PSS, OAEP, raw), DSA (incl. RFC 6979), ElGamal (raw, PKCS#1, OAEP, PSS), ECDSA (incl. RFC 6979), ECDH, EdDSA (Ed25519, Ed448, prehash and context variants), X25519/X448, SM2 on its own curve; key generation, keygrips, curve queries | ECDSA on GOST curves, GOST signatures, SM2 on other curves |
 | KEMs | ML-KEM-512/768/1024, raw X25519/X448 and Weierstrass KEMs, DHKEM (RFC 9180) | sntrup761, Classic McEliece |
 | Low-level EC | All `gcry_mpi_ec_*` operations on Weierstrass curves (NIST, Brainpool, secp256k1, SM2, GOST); scalar multiplication on Montgomery curves | Point addition/doubling on Edwards and Montgomery curves |
+| MACs | HMAC (all available digests), CMAC (available block ciphers), GMAC-AES, Poly1305 | Poly1305-cipher variants, GMAC for non-AES ciphers, GOST IMIT |
+| Public key | RSA (PKCS#1 v1.5, PSS, OAEP, raw), DSA (incl. RFC 6979), ElGamal (raw, PKCS#1, OAEP, PSS), ECDSA (incl. RFC 6979), ECDH, EdDSA (Ed25519, Ed448, prehash and context variants), X25519/X448, SM2 on its own curve; key generation, keygrips, curve queries | ECDSA on GOST curves, GOST signatures, SM2 on other curves |
 
 Unsupported algorithms report the error codes upstream uses for an unknown
 algorithm; names and sizes are still answered. The ECDSA/DSA nonce override
@@ -72,12 +72,12 @@ value instead of failing with `GPG_ERR_ENCODING_PROBLEM` as upstream does.
 
 | Path           | Contents                                                    |
 |----------------|-------------------------------------------------------------|
-| `src/`         | Library sources, one file per module; `libgcrypt.map` is the symbol version script |
-| `src/include/` | The public header `gcrypt.h`                                |
-| `tests/`       | One `test_*.c` program per module, `test_common.h` assertion helpers, `expected-exports.txt`, KEM vectors and the script that regenerates them |
 | `benchmarks/`  | `bench_gcrypt` sources and `compare.sh`                     |
 | `cmake/`       | Package config, pkg-config and `libgcrypt-config` templates, `drop-in.cmake` |
 | `scripts/`     | `build-openssl.sh`, `check-exports.sh`, `coverage.py`       |
+| `src/`         | Library sources, one file per module; `libgcrypt.map` is the symbol version script |
+| `src/include/` | The public header `gcrypt.h`                                |
+| `tests/`       | One `test_*.c` program per module, `test_common.h` assertion helpers, `expected-exports.txt`, KEM vectors and the script that regenerates them |
 
 ## Building
 
@@ -102,17 +102,17 @@ ctest --test-dir build
 
 | Option                              | Default | Effect                          |
 |-------------------------------------|---------|---------------------------------|
+| `GCRYPT_OPENSSL_BENCH_ARGS`         | empty   | Arguments the `bench-compare` target passes to both benchmarks |
+| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
 | `GCRYPT_OPENSSL_BUILD_SHARED`       | `ON`    | Build the shared library        |
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
 | `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
-| `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
-| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `ON`    | Pass `-Werror` (or `/WX`) to every target that compiles C: libraries, drop-in, tests, benchmarks |
-| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
+| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
-| `GCRYPT_OPENSSL_BENCH_ARGS`         | empty   | Arguments the `bench-compare` target passes to both benchmarks |
+| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `ON`    | Pass `-Werror` (or `/WX`) to every target that compiles C: libraries, drop-in, tests, benchmarks |
 | `OPENSSL_ROOT_DIR`                  | unset   | Where to find OpenSSL 4 if it is not the system one |
 
 At least one of the two library options must stay on. Tests and benchmarks
@@ -125,11 +125,11 @@ name; every one uses Ninja and writes `compile_commands.json`.
 
 | Preset     | Build directory  | Configuration                                   |
 |------------|------------------|-------------------------------------------------|
-| `default`  | `build/`         | RelWithDebInfo                                  |
-| `debug`    | `build-debug/`   | Debug                                           |
-| `release`  | `build-release/` | Release (no test preset)                        |
 | `coverage` | `build-coverage/`| Debug, `GCRYPT_OPENSSL_COVERAGE=ON`, benchmarks off |
+| `debug`    | `build-debug/`   | Debug                                           |
+| `default`  | `build/`         | RelWithDebInfo                                  |
 | `fips`     | `build-fips/`    | RelWithDebInfo, `GCRYPT_OPENSSL_FIPS=ON`        |
+| `release`  | `build-release/` | Release (no test preset)                        |
 
 The extra build presets `coverage-report` and `memcheck` run the
 `coverage` target in the `coverage` tree and the `memcheck` target in the
@@ -141,21 +141,21 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 
 | Target | Alias | Output |
 |--------|-------|--------|
-| `gcrypt_openssl_shared` | `gcrypt-openssl::shared` | `libgcrypt-openssl.so.0.1.0` with soname `libgcrypt-openssl.so.0`; exports exactly the `gcry_*` symbols plus `_gcry_mpi_get_const` via `src/libgcrypt.map` |
-| `gcrypt_openssl_static` | `gcrypt-openssl::static` | `libgcrypt-openssl.a`, built with PIC so it can be linked into other shared objects |
-| (alias only) | `gcrypt-openssl::gcrypt-openssl` | The shared library when built, else the static one; what the tests and benchmarks link |
-| `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
-| `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
-| `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
-| `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
-| `test_version_static` | | `test_version.c` linked against the static library, to prove both flavours link and run |
-| `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
+| `bench-compare` | | Runs both benchmarks through `benchmarks/compare.sh` |
 | `bench_gcrypt` | | Benchmark driver linked against this library |
 | `bench_gcrypt_stock` | | The same sources linked against the stock `libgcrypt.so.20`, when one is found |
-| `bench-compare` | | Runs both benchmarks through `benchmarks/compare.sh` |
+| `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
 | `coverage` | | Runs the tests and writes the coverage report; only with `GCRYPT_OPENSSL_COVERAGE=ON` |
-| `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
+| `gcrypt-openssl::gcrypt-openssl` | (alias only) | The shared library when built, else the static one; what the tests and benchmarks link |
+| `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
+| `gcrypt_openssl_shared` | `gcrypt-openssl::shared` | `libgcrypt-openssl.so.0.1.0` with soname `libgcrypt-openssl.so.0`; exports exactly the `gcry_*` symbols plus `_gcry_mpi_get_const` via `src/libgcrypt.map` |
+| `gcrypt_openssl_static` | `gcrypt-openssl::static` | `libgcrypt-openssl.a`, built with PIC so it can be linked into other shared objects |
+| `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
 | `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
+| `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
+| `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
+| `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
+| `test_version_static` | | `test_version.c` linked against the static library, to prove both flavours link and run |
 
 All libraries, tests and benchmarks are part of the default (`all`) target.
 Benchmarks are not registered with CTest.
