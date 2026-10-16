@@ -3478,6 +3478,83 @@ TEST(ecc_sm2_and_curve_rules)
     ASSERT_EQ(27, i);
 }
 
+TEST(null_arguments)
+{
+    gcry_sexp_t key = genkey("(genkey (ecc (curve \"Ed25519\")))");
+    gcry_sexp_t data = sexp("(data (flags eddsa) (hash-algo sha512)"
+                            " (value #616263#))");
+    gcry_sexp_t result = sexp("(foo)");
+    gcry_ctx_t ctx = NULL;
+    unsigned char grip[20];
+    unsigned char byte = 1;
+    unsigned int nbits = 1;
+    size_t n;
+
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(data);
+
+    /* A missing result pointer. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_encrypt(NULL, data, key));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_decrypt(NULL, data, key));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_sign(NULL, data, key));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_genkey(NULL, data));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_pk_hash_sign(NULL, "(data (value %b))", key, NULL, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_hash_sign(&result, NULL, key, NULL,
+                                                  NULL));
+    gcry_sexp_release(result); /* Untouched: the template is checked first. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_hash_verify(NULL, NULL, key, NULL,
+                                                    NULL));
+    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pubkey_get_sexp(NULL, 0, NULL));
+    ASSERT_ERR(GPG_ERR_EINVAL, gcry_pk_random_override_new(NULL, &byte, 1));
+    ASSERT_ERR(GPG_ERR_EINVAL, gcry_pk_random_override_new(&ctx, NULL, 1));
+    ASSERT_ERR(GPG_ERR_EINVAL, gcry_pk_random_override_new(&ctx, NULL, 0));
+    ASSERT_NULL(ctx);
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_pk_algo_info(GCRY_PK_RSA, GCRYCTL_GET_ALGO_USAGE, NULL,
+                                 NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_pk_algo_info(GCRY_PK_RSA, GCRYCTL_GET_ALGO_NPKEY, NULL,
+                                 NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_pk_algo_info(GCRY_PK_RSA, GCRYCTL_TEST_ALGO, &n, NULL));
+
+    /* A NULL S-expression is not a key or data object: the reference
+     * library reports GPG_ERR_INV_OBJ, not GPG_ERR_INV_ARG. */
+    result = sexp("(foo)");
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_encrypt(&result, data, NULL));
+    ASSERT_NULL(result);
+    result = sexp("(foo)");
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_decrypt(&result, data, NULL));
+    ASSERT_NULL(result);
+    result = sexp("(foo)");
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_sign(&result, data, NULL));
+    ASSERT_NULL(result);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_sign(&result, NULL, key));
+    ASSERT_NULL(result);
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_verify(NULL, data, NULL));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_verify(NULL, data, key));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_verify(NULL, NULL, key));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_testkey(NULL));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_genkey(&result, NULL));
+    ASSERT_NULL(result);
+    /* Without a digest handle or data context there is nothing to sign. */
+    ASSERT_ERR(GPG_ERR_EINVAL,
+               gcry_pk_hash_sign(&result, "(data (value %b))", NULL, NULL,
+                                 NULL));
+    ASSERT_EQ(0, gcry_pk_get_nbits(NULL));
+    ASSERT_NULL(gcry_pk_get_keygrip(NULL, grip));
+    ASSERT_NULL(gcry_pk_get_keygrip(NULL, NULL));
+    ASSERT_NULL(gcry_pk_get_curve(NULL, -1, &nbits));
+    ASSERT_EQ(0, nbits);
+    ASSERT_NULL(gcry_pk_get_param(GCRY_PK_ECC, NULL));
+    ASSERT_NULL(gcry_pk_get_param(GCRY_PK_ECDSA, NULL));
+    ASSERT_EQ(0, gcry_pk_map_name(NULL));
+
+    gcry_sexp_release(data);
+    gcry_sexp_release(key);
+}
+
 int
 main(void)
 {
@@ -3518,5 +3595,6 @@ main(void)
     RUN_TEST(dsa_sizes);
     RUN_TEST(ecc_sm2_and_curve_rules);
     RUN_TEST(disable_algorithm);
+    RUN_TEST(null_arguments);
     return TEST_RESULT();
 }
