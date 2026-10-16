@@ -1197,6 +1197,339 @@ TEST(montgomery_clamped_scalars)
     gcry_mpi_release(x);
 }
 
+/* The little endian Ed25519 encoding of a small y coordinate: FIRST is
+ * the low byte, LAST the top byte carrying the sign bit (hex). */
+#define ED25519_Y(first, last) \
+    first "000000000000000000000000000000000000000000000000000000000000" last
+/* The same for Ed448, whose encoding is 57 bytes with the sign bit alone
+ * in the last one. */
+#define ED448_Y(first, last) \
+    first "0000000000000000000000000000000000000000000000000000000000000000" \
+    "0000000000000000000000000000000000000000000000" last
+
+/* An encoded point that does not decode is reported as an invalid object
+ * wherever it arrives; ENC is the hex encoding. */
+static int
+eddsa_rejects(gcry_ctx_t ctx, const char *curve, const char *enc, int opaque)
+{
+    gcry_mpi_point_t W = gcry_mpi_point_new(0);
+    gcry_mpi_t q = opaque ? hex_opaque(enc) : hex_mpi(enc);
+    gcry_sexp_t key = NULL;
+    gcry_ctx_t kctx = NULL;
+    int rc;
+
+    /* The direct decoder. */
+    rc = gcry_err_code(gcry_mpi_ec_decode_point(W, q, ctx)) == GPG_ERR_INV_OBJ;
+
+    /* Updating the public point of an existing context: the old point is
+     * dropped along with the rejection. */
+    if (rc) {
+        rc = gcry_err_code(gcry_mpi_ec_set_mpi("q", q, ctx)) == GPG_ERR_INV_OBJ
+             && gcry_mpi_ec_get_point("q", ctx, 1) == NULL;
+    }
+
+    /* A key with the encoding as its q. */
+    if (rc) {
+        char *text = gcry_malloc(strlen(enc) + 80);
+
+        sprintf(text, "(public-key (ecc (curve %s) (q #%s#)))", curve, enc);
+        key = sexp_of(text);
+        gcry_free(text);
+        rc = key != NULL
+             && gcry_err_code(gcry_mpi_ec_new(&kctx, key, NULL))
+             == GPG_ERR_INV_OBJ
+             && kctx == NULL;
+    }
+
+    gcry_ctx_release(kctx);
+    gcry_sexp_release(key);
+    gcry_mpi_release(q);
+    gcry_mpi_point_release(W);
+    return rc;
+}
+
+/*
+ * Encodings that look like EdDSA public keys but do not decode: a y
+ * coordinate without a matching x (the quotient u/v is a non-residue), a
+ * sign bit on the point with x = 0, and an encoding of the wrong length.
+ * Those are rejected the same way by the decoder, by a public point
+ * update and by a key parameter list.  The encodings with a sign bit are
+ * only valid as opaque values; the plain numbers take the second route
+ * through the decoder.
+ */
+TEST(eddsa_decoding_rejections)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t W = gcry_mpi_point_new(0);
+    gcry_mpi_t q;
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Ed25519"));
+
+    /* y = 2, 7 and 8 have no x on Ed25519, with or without the sign. */
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("02", "00"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("07", "00"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("08", "80"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("02", "00"), 0));
+    /* y = 1 gives x = 0, which has no odd counterpart: the sign bit
+     * makes the encoding invalid, without it the point is (0, 1). */
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("01", "80"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("01", "80"), 0));
+    q = hex_opaque(ED25519_Y("01", "00"));
+    ASSERT_OK(gcry_mpi_ec_decode_point(W, q, ctx));
+    gcry_mpi_release(q);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, W, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(y, 1));
+    ASSERT_TRUE(gcry_mpi_ec_curve_point(W, ctx));
+    /* Too short (31 bytes) and too long (34 bytes) opaque encodings. */
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("01", ""), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", ED25519_Y("01", "00ffff"), 1));
+    /* A short number is padded rather than rejected for its length, so
+     * only the point recovery can turn it down: 0x0180 has the sign bit
+     * in the low byte and y = 2^240, which has no x. */
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed25519", "0180", 0));
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* Ed448: y = 2, 6 and 10 have no x. */
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Ed448"));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("02", "00"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("06", "80"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("0a", "00"), 0));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("01", "80"), 1));
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("01", "80"), 0));
+    q = hex_opaque(ED448_Y("01", "00"));
+    ASSERT_OK(gcry_mpi_ec_decode_point(W, q, ctx));
+    gcry_mpi_release(q);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, W, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(y, 1));
+    /* 56 bytes: the sign byte is missing. */
+    ASSERT_TRUE(eddsa_rejects(ctx, "Ed448", ED448_Y("01", ""), 1));
+    gcry_ctx_release(ctx);
+
+    gcry_mpi_point_release(W);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+}
+
+/* The u coordinate of R, or -1 when R is the point at infinity. */
+static int
+mont_u(gcry_mpi_t u, gcry_mpi_point_t R, gcry_ctx_t ctx)
+{
+    return gcry_mpi_ec_get_affine(u, NULL, R, ctx);
+}
+
+/* Is R the point at infinity (Z = 0)? */
+static int
+is_infinity(gcry_mpi_point_t R)
+{
+    gcry_mpi_t z = gcry_mpi_new(0);
+    int inf;
+
+    gcry_mpi_point_get(NULL, NULL, z, R);
+    inf = gcry_mpi_cmp_ui(z, 0) == 0;
+    gcry_mpi_release(z);
+    return inf;
+}
+
+/*
+ * Curve25519 scalar multiplication outside the X25519 shortcut, which
+ * only takes a clamped scalar and an affine, reduced u coordinate on
+ * the curve: the generic ladder runs for a point with Z != 1 or u >= p
+ * and must agree with the shortcut, which does not use Z at all (as
+ * the reference library's ladder does not).  Points of the quadratic
+ * twist are computed by the shortcut but rejected by the ladder, and
+ * the low order points yield the point at infinity for a clamped
+ * scalar.
+ */
+TEST(montgomery_generic_ladder)
+{
+    static const char k25[] =
+        "6a2cb91da5fb77b12a99c0eb872f4cdf4566b25172c1163c7da518730a6d0770";
+    static const char pub25a[] =
+        "6A4E9BAA8EA9A4EBF41A38260D3ABF0D5AF73EB4DC7D8B7454A7308909F02085";
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t P = gcry_mpi_point_new(0);
+    gcry_mpi_point_t R = gcry_mpi_point_new(0);
+    gcry_mpi_t k = hex_mpi(k25);
+    gcry_mpi_t three = gcry_mpi_set_ui(NULL, 3);
+    gcry_mpi_t u = gcry_mpi_new(0);
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+    gcry_mpi_t p;
+
+    if (gcry_fips_mode_active()) {
+        /* Curve25519 is not an approved curve. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        ASSERT_NULL(ctx);
+        gcry_mpi_point_release(P);
+        gcry_mpi_point_release(R);
+        gcry_mpi_release(k);
+        gcry_mpi_release(three);
+        gcry_mpi_release(u);
+        gcry_mpi_release(x);
+        gcry_mpi_release(y);
+        return;
+    }
+
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+    p = gcry_mpi_ec_get_mpi("p", ctx, 1);
+    ASSERT_NOT_NULL(p);
+
+    /* The base point with Z = 2 and as u = p + 9: both go through the
+     * ladder and give the public key of the RFC 7748 vector. */
+    gcry_mpi_set_ui(u, 9);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_TWO);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, pub25a));
+    gcry_mpi_add(u, u, p);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, pub25a));
+    /* An unclamped scalar on u = p + 9 is [3]G. */
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "1C12BC1A6D57ABE645534D91C21BBA64F8824E67621C08"
+                           "59C00A03AFFB713C12"));
+
+    /* u = 4 with Z = 1 (shortcut) and Z = 2 (ladder) agree, for the
+     * clamped and for a small scalar. */
+    gcry_mpi_set_ui(u, 4);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_TWO);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, mont_u(y, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp(x, y));
+    ASSERT_TRUE(mpi_eq_hex(x, "4E5EFA318B12E538623E90138729D59CCFE94AA5EBBA92"
+                           "A44DE0B1143EB2C43D"));
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_EQ(0, mont_u(y, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp(x, y));
+    ASSERT_TRUE(mpi_eq_hex(x, "06D8178C692E349C09DB4791DDB24311D22601F3691605"
+                           "23413EB9C584A8CD13"));
+
+    /* u = 2 lies on the quadratic twist: the shortcut computes the
+     * X25519 result, the ladder has no lift for it and reports the point
+     * at infinity. */
+    gcry_mpi_set_ui(u, 2);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(P, ctx));
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x, "4DCFDE1A4F86328ED39B1047CD9753A35C11C9E81663DD"
+                           "1ED7C5A1D3E90B0CE8"));
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_TRUE(is_infinity(R));
+    ASSERT_EQ(-1, mont_u(x, R, ctx));
+    /* u = p - 1 is a point of order 4 on the twist. */
+    gcry_mpi_sub_ui(u, p, 1);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(P, ctx));
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_TRUE(is_infinity(R));
+
+    /* u = 0 has order 2: even multiples are the point at infinity, odd
+     * ones the point itself. */
+    gcry_mpi_set_ui(u, 0);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_TRUE(is_infinity(R));
+    gcry_mpi_ec_mul(R, GCRYMPI_CONST_TWO, P, ctx);
+    ASSERT_TRUE(is_infinity(R));
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    gcry_mpi_ec_mul(R, GCRYMPI_CONST_ONE, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+
+    /* u = 1 has order 4: [2](1) = (0), [3](1) = (1), and a clamped
+     * scalar, a multiple of 8, gives the point at infinity. */
+    gcry_mpi_set_ui(u, 1);
+    gcry_mpi_point_set(P, u, NULL, GCRYMPI_CONST_ONE);
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(P, ctx));
+    gcry_mpi_ec_mul(R, k, P, ctx);
+    ASSERT_TRUE(is_infinity(R));
+    gcry_mpi_ec_mul(R, GCRYMPI_CONST_TWO, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 0));
+    gcry_mpi_ec_mul(R, three, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 1));
+    gcry_mpi_ec_mul(R, GCRYMPI_CONST_ONE, P, ctx);
+    ASSERT_EQ(0, mont_u(x, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 1));
+    /* There is no Y coordinate to ask for on a Montgomery curve. */
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, R, ctx));
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(NULL, y, R, ctx));
+
+    gcry_mpi_release(p);
+    gcry_ctx_release(ctx);
+    gcry_mpi_point_release(P);
+    gcry_mpi_point_release(R);
+    gcry_mpi_release(k);
+    gcry_mpi_release(three);
+    gcry_mpi_release(u);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+}
+
+/* An Edwards point in projective coordinates: get_affine divides both
+ * coordinates by Z, and the curve test accepts it. */
+TEST(edwards_projective_point)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t P = gcry_mpi_point_new(0);
+    gcry_mpi_t gx = hex_mpi("216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7"
+                            "B2C9562D608F25D51A");
+    gcry_mpi_t gy = hex_mpi("66666666666666666666666666666666666666666666666"
+                            "66666666666666658");
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+    gcry_mpi_t z = gcry_mpi_set_ui(NULL, 7);
+    gcry_mpi_t p;
+
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Ed25519"));
+    p = gcry_mpi_ec_get_mpi("p", ctx, 1);
+    ASSERT_NOT_NULL(p);
+    gcry_mpi_mulm(x, gx, z, p);
+    gcry_mpi_mulm(y, gy, z, p);
+    gcry_mpi_point_set(P, x, y, z);
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(P, ctx));
+    gcry_mpi_set_ui(x, 0);
+    gcry_mpi_set_ui(y, 0);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, y, P, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp(x, gx));
+    ASSERT_EQ(0, gcry_mpi_cmp(y, gy));
+    /* One coordinate at a time, too. */
+    gcry_mpi_set_ui(x, 0);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, P, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp(x, gx));
+    gcry_mpi_set_ui(y, 0);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(NULL, y, P, ctx));
+    ASSERT_EQ(0, gcry_mpi_cmp(y, gy));
+
+    gcry_mpi_release(p);
+    gcry_mpi_release(gx);
+    gcry_mpi_release(gy);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+    gcry_mpi_release(z);
+    gcry_mpi_point_release(P);
+    gcry_ctx_release(ctx);
+}
+
 /* Invalid arguments are reported, never dereferenced.  The void
  * arithmetic functions abort on NULL and are not exercised here. */
 TEST(argument_checks)
@@ -1291,6 +1624,9 @@ main(void)
     RUN_TEST(edwards_context_and_explicit_params);
     RUN_TEST(montgomery_and_degenerate_arithmetic);
     RUN_TEST(montgomery_clamped_scalars);
+    RUN_TEST(eddsa_decoding_rejections);
+    RUN_TEST(montgomery_generic_ladder);
+    RUN_TEST(edwards_projective_point);
     RUN_TEST(argument_checks);
     return TEST_RESULT();
 }
