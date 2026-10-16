@@ -48,6 +48,89 @@ TEST(prime_check)
     gcry_mpi_release(x);
 }
 
+/*
+ * Small and corner case inputs to gcry_prime_check: the only even prime,
+ * the non-primes below it, negative numbers, even numbers, and the base 2
+ * Fermat pseudoprimes, which a plain Fermat test would let through.  The
+ * flags are not used by the check and change nothing.
+ */
+TEST(prime_check_small_numbers)
+{
+    static const unsigned long pseudoprimes[] = {
+        341, 561, 645, 1105, 1387, 1729, 1905, 2047, 2465, 2701, 2821, 3277
+    };
+    static const unsigned long primes[] = {
+        337, 347, 557, 563, 641, 647, 1103, 1109, 1723, 1733, 2039, 2053
+    };
+    static const unsigned long evens[] = { 4, 6, 100, 340, 562, 65536 };
+    static const unsigned int flags[] = {
+        0, 1, GCRY_PRIME_FLAG_SECRET, GCRY_PRIME_FLAG_SPECIAL_FACTOR, 0xffffffffu
+    };
+    gcry_mpi_t x = gcry_mpi_new(0);
+    size_t i;
+    size_t j;
+
+    for (j = 0; j < sizeof flags / sizeof flags[0]; j++) {
+        gcry_mpi_set_ui(x, 2);
+        ASSERT_OK(gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 3);
+        ASSERT_OK(gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 1);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 0);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+
+        /* Negative numbers are no primes, even when their absolute value
+         * is one. */
+        gcry_mpi_set_ui(x, 2);
+        gcry_mpi_neg(x, x);
+        ASSERT_TRUE(gcry_mpi_is_neg(x));
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 7);
+        gcry_mpi_neg(x, x);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 65537);
+        gcry_mpi_neg(x, x);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        gcry_mpi_set_ui(x, 1);
+        gcry_mpi_neg(x, x);
+        ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+
+        for (i = 0; i < sizeof evens / sizeof evens[0]; i++) {
+            gcry_mpi_set_ui(x, evens[i]);
+            ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        }
+
+        /* 2^(n-1) = 1 (mod n) for all of these composites. */
+        for (i = 0; i < sizeof pseudoprimes / sizeof pseudoprimes[0]; i++) {
+            gcry_mpi_set_ui(x, pseudoprimes[i]);
+            ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, flags[j]));
+        }
+
+        for (i = 0; i < sizeof primes / sizeof primes[0]; i++) {
+            gcry_mpi_set_ui(x, primes[i]);
+            ASSERT_OK(gcry_prime_check(x, flags[j]));
+        }
+    }
+
+    /* A large even number: 2^128. */
+    gcry_mpi_set_ui(x, 1);
+    gcry_mpi_lshift(x, x, 128);
+    ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, 0));
+    /* 2^128 + 1 = 59649589127497217 * 5704689200685129054721. */
+    gcry_mpi_add_ui(x, x, 1);
+    ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, 0));
+    /* 2^127 - 1 is prime; its negative is not. */
+    gcry_mpi_set_ui(x, 1);
+    gcry_mpi_lshift(x, x, 127);
+    gcry_mpi_sub_ui(x, x, 1);
+    ASSERT_OK(gcry_prime_check(x, 0));
+    gcry_mpi_neg(x, x);
+    ASSERT_ERR(GPG_ERR_NO_PRIME, gcry_prime_check(x, 0));
+
+    gcry_mpi_release(x);
+}
+
 TEST(generate_plain)
 {
     gcry_mpi_t p = NULL;
@@ -353,6 +436,7 @@ main(void)
 {
     gcry_check_version(NULL);
     RUN_TEST(prime_check);
+    RUN_TEST(prime_check_small_numbers);
     RUN_TEST(generate_plain);
     RUN_TEST(generate_with_factors);
     RUN_TEST(callback);
