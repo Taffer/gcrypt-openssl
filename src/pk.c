@@ -649,7 +649,7 @@ gcry_pk_get_param(int algo, const char *name)
 {
     const struct gcry_pk_spec *spec;
 
-    if (map_algo(algo) != GCRY_PK_ECC) {
+    if (!name || map_algo(algo) != GCRY_PK_ECC) {
         return NULL;
     }
 

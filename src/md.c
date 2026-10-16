@@ -1484,6 +1484,10 @@ gcry_md_write(gcry_md_hd_t hd, const void *buffer, size_t length)
         return;
     }
 
+    if (!buffer && length) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_md_write: NULL argument");
+    }
+
     md_write(hd, buffer, length);
 }
 
@@ -1521,7 +1525,7 @@ gcry_md_extract(gcry_md_hd_t hd, int algo, void *buffer, size_t length)
 {
     struct md_entry *e;
 
-    if (!hd) {
+    if (!hd || (!buffer && length)) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
@@ -1545,6 +1549,11 @@ gcry_md_hash_buffer(int algo, void *digest, const void *buffer,
 {
     gcry_md_hd_t hd;
     gcry_err_code_t rc;
+
+    if (!digest || (!buffer && length)) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG,
+                          "gcry_md_hash_buffer: NULL argument");
+    }
 
     _gcry_global_init();
 
@@ -1579,11 +1588,23 @@ gcry_md_hash_buffers_ext(int algo, unsigned int flags, void *digest,
     int hmac;
     gcry_md_hd_t hd;
     gcry_err_code_t rc;
+    int i;
 
     _gcry_global_init();
 
     if (!iov || iovcnt < 0) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    /* Nothing is written for a zero-length XOF output. */
+    if (!digest && digestlen != 0) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    for (i = 0; i < iovcnt; i++) {
+        if (!iov[i].data && iov[i].len) {
+            return GCRY_ERR(GPG_ERR_INV_ARG);
+        }
     }
 
     if (flags & ~(unsigned int)GCRY_MD_FLAG_HMAC) {

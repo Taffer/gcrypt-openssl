@@ -892,6 +892,66 @@ TEST(hash_buffers_edges)
     ASSERT_MEM_EQ(expect, out, 32);
 }
 
+TEST(buffer_argument_checks)
+{
+    gcry_md_hd_t hd = NULL;
+    gcry_buffer_t iov[2];
+    unsigned char out[32];
+    unsigned char expect[32];
+    char key[] = "key";
+    char msg[] = "abc";
+
+    /* gcry_md_extract: a NULL output buffer is only fine for no bytes. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHAKE128, 0));
+    gcry_md_write(hd, NULL, 0);
+    gcry_md_write(hd, msg, 3);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_extract(hd, 0, NULL, 16));
+    ASSERT_OK(gcry_md_extract(hd, 0, NULL, 0));
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 16));
+    unhex("5881092dd818bf5cf8a3ddb793fbcba7", expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 16);
+    gcry_md_close(hd);
+
+    /* gcry_md_hash_buffers_ext: the digest buffer and every iov entry. */
+    memset(iov, 0, sizeof iov);
+    iov[0].data = key;
+    iov[0].len = 3;
+    iov[1].data = msg;
+    iov[1].len = 3;
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, NULL, 32, iov + 1, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers(GCRY_MD_SHA256, 0, NULL, iov + 1, 1));
+    iov[1].data = NULL;
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers(GCRY_MD_SHA256, 0, out, iov + 1, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, out, iov,
+                                    2));
+    /* A NULL entry without data contributes nothing. */
+    iov[1].len = 0;
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, 0, out, iov + 1, 1));
+    unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 32);
+    /* The NULL key of an HMAC is likewise an empty key. */
+    iov[0].data = NULL;
+    iov[0].len = 0;
+    iov[1].data = msg;
+    iov[1].len = 3;
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, out, iov,
+                                   2));
+    unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
+          expect, sizeof expect);
+    ASSERT_MEM_EQ(expect, out, 32);
+    /* No XOF output bytes may be requested into no buffer. */
+    ASSERT_OK(gcry_md_hash_buffers_ext(GCRY_MD_SHAKE128, 0, NULL, 0, iov + 1,
+                                       1));
+    /* NULL iov with no entries was always rejected (reference behaviour). */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_md_hash_buffers(GCRY_MD_SHA256, 0, out, NULL, 0));
+}
+
 int
 main(void)
 {
@@ -913,5 +973,6 @@ main(void)
     RUN_TEST(cshake_copy);
     RUN_TEST(debug_dump);
     RUN_TEST(hash_buffers_edges);
+    RUN_TEST(buffer_argument_checks);
     return TEST_RESULT();
 }
