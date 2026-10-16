@@ -286,11 +286,14 @@ mlkem_genkey(const struct kem_info *info, unsigned char *pubkey,
     return rc;
 }
 
-/* Common encapsulation on an EVP_PKEY.  PARAMS may be NULL. */
+/* Common encapsulation on an EVP_PKEY.  PARAMS may be NULL; FALLBACK is
+ * the error for a failure OpenSSL does not explain, which for the DHKEMs
+ * means an unusable public key (a low order point), hence GPG_ERR_INV_DATA
+ * like the reference library. */
 static gcry_err_code_t
 do_encapsulate(EVP_PKEY *pkey, const OSSL_PARAM *params,
-               unsigned char *ciphertext, size_t cipher_len,
-               unsigned char *shared, size_t shared_len)
+               gcry_err_code_t fallback, unsigned char *ciphertext,
+               size_t cipher_len, unsigned char *shared, size_t shared_len)
 {
     EVP_PKEY_CTX *ctx;
     size_t ctl = cipher_len;
@@ -301,7 +304,7 @@ do_encapsulate(EVP_PKEY *pkey, const OSSL_PARAM *params,
 
     if (!ctx || EVP_PKEY_encapsulate_init(ctx, params) <= 0
         || EVP_PKEY_encapsulate(ctx, ciphertext, &ctl, shared, &ssl) <= 0) {
-        rc = ossl_error(GPG_ERR_GENERAL);
+        rc = ossl_error(fallback);
     } else if (ctl != cipher_len || ssl != shared_len) {
         rc = GPG_ERR_INV_LENGTH;
     }
@@ -312,8 +315,8 @@ do_encapsulate(EVP_PKEY *pkey, const OSSL_PARAM *params,
 
 static gcry_err_code_t
 do_decapsulate(EVP_PKEY *pkey, const OSSL_PARAM *params,
-               const unsigned char *ciphertext, size_t cipher_len,
-               unsigned char *shared, size_t shared_len)
+               gcry_err_code_t fallback, const unsigned char *ciphertext,
+               size_t cipher_len, unsigned char *shared, size_t shared_len)
 {
     EVP_PKEY_CTX *ctx;
     size_t ssl = shared_len;
@@ -324,7 +327,7 @@ do_decapsulate(EVP_PKEY *pkey, const OSSL_PARAM *params,
     if (!ctx || EVP_PKEY_decapsulate_init(ctx, params) <= 0
         || EVP_PKEY_decapsulate(ctx, shared, &ssl, ciphertext,
                                 cipher_len) <= 0) {
-        rc = ossl_error(GPG_ERR_GENERAL);
+        rc = ossl_error(fallback);
     } else if (ssl != shared_len) {
         rc = GPG_ERR_INV_LENGTH;
     }
@@ -353,7 +356,8 @@ mlkem_encap(const struct kem_info *info, const unsigned char *pubkey,
     params[0] = OSSL_PARAM_construct_octet_string(OSSL_KEM_PARAM_IKME,
                                                   unconst(m), MLKEM_RANDOM_LEN);
     params[1] = OSSL_PARAM_construct_end();
-    rc = do_encapsulate(pkey, m ? params : NULL, ciphertext, info->cipher_len,
+    rc = do_encapsulate(pkey, m ? params : NULL, GPG_ERR_GENERAL, ciphertext,
+                        info->cipher_len,
                         shared, info->shared_len);
     EVP_PKEY_free(pkey);
     return rc;
@@ -373,7 +377,8 @@ mlkem_decap(const struct kem_info *info, const unsigned char *seckey,
         return rc;
     }
 
-    rc = do_decapsulate(pkey, NULL, ciphertext, info->cipher_len, shared,
+    rc = do_decapsulate(pkey, NULL, GPG_ERR_GENERAL, ciphertext, info->cipher_len,
+                        shared,
                         info->shared_len);
     EVP_PKEY_free(pkey);
     return rc;
@@ -727,7 +732,7 @@ dhkem_encap(const struct kem_info *info, const unsigned char *pubkey,
         return rc;
     }
 
-    rc = do_encapsulate(pkey, dhkem_params(params), ciphertext,
+    rc = do_encapsulate(pkey, dhkem_params(params), GPG_ERR_INV_DATA, ciphertext,
                         info->cipher_len, shared, shared_len);
     EVP_PKEY_free(pkey);
     return rc;
@@ -748,7 +753,7 @@ dhkem_decap(const struct kem_info *info, const unsigned char *seckey,
         return rc;
     }
 
-    rc = do_decapsulate(pkey, dhkem_params(params), ciphertext,
+    rc = do_decapsulate(pkey, dhkem_params(params), GPG_ERR_INV_DATA, ciphertext,
                         info->cipher_len, shared, shared_len);
     EVP_PKEY_free(pkey);
     return rc;

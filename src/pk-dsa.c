@@ -30,6 +30,35 @@ dsa_get_nbits(gcry_sexp_t parms)
     return nbits;
 }
 
+/* A copy of BN carrying BN_FLG_SECURE.  OSSL_PARAM_BLD_push_BN puts such a
+ * number into the blob that OSSL_PARAM_free wipes, the others into one it
+ * merely frees. */
+static BIGNUM *
+secure_bn_copy(const BIGNUM *bn)
+{
+    BIGNUM *copy = BN_secure_new();
+
+    if (copy && !BN_copy(copy, bn)) {
+        BN_clear_free(copy);
+        copy = NULL;
+    }
+
+    return copy;
+}
+
+/* A secure MPI with the value of BN, for private key material. */
+static gcry_mpi_t
+secure_mpi_from_bn(const BIGNUM *bn)
+{
+    BIGNUM *copy = secure_bn_copy(bn);
+
+    if (!copy) {
+        _gcry_fatal_error(GPG_ERR_ENOMEM, NULL);
+    }
+
+    return _gcry_mpi_new_from_bn(copy, 1);
+}
+
 /* Build an EVP_PKEY from p, q, g, y and optionally x.  Q is returned for
  * range checks of signatures. */
 static gcry_err_code_t
@@ -42,6 +71,7 @@ dsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
     gcry_mpi_t g = NULL;
     gcry_mpi_t y = NULL;
     gcry_mpi_t x = NULL;
+    BIGNUM *sx = NULL;
     OSSL_PARAM_BLD *bld = NULL;
     OSSL_PARAM *params = NULL;
     EVP_PKEY_CTX *ctx = NULL;
@@ -66,15 +96,19 @@ dsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
 
     bld = OSSL_PARAM_BLD_new();
 
-    if (!bld
+    /* The private value goes in as a secure copy, see secure_bn_copy. */
+    if (want_private) {
+        sx = secure_bn_copy(_gcry_mpi_bn(x));
+    }
+
+    if (!bld || (want_private && !sx)
         || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_P, _gcry_mpi_bn(p))
         || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_Q, _gcry_mpi_bn(q))
         || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_G, _gcry_mpi_bn(g))
         || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY,
                                    _gcry_mpi_bn(y))
         || (want_private
-            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY,
-                                       _gcry_mpi_bn(x)))) {
+            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, sx))) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
     }
@@ -103,6 +137,7 @@ leave:
     EVP_PKEY_CTX_free(ctx);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(sx);
     gcry_mpi_release(p);
     gcry_mpi_release(q);
     gcry_mpi_release(g);
@@ -579,7 +614,10 @@ dsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
             goto leave;
         }
 
-        m[i] = _gcry_pk_mpi_from_bn(bn[i]);
+        /* x, the last one, is secret: a secure MPI makes the key
+         * S-expression secure. */
+        m[i] = i == 4 ? secure_mpi_from_bn(bn[i])
+               : _gcry_pk_mpi_from_bn(bn[i]);
     }
 
     rc = _gcry_sexp_build(r_skey, NULL,

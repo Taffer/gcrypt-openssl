@@ -450,6 +450,7 @@ sm2_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
     EVP_PKEY_CTX *pctx = NULL;
     OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
     OSSL_PARAM *params = NULL;
+    BIGNUM *sd = NULL;
     gcry_mpi_t pub = NULL;
     const unsigned char *pubbuf = NULL;
     unsigned int publen = 0;
@@ -458,6 +459,17 @@ sm2_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
     if (!bld) {
         rc = GPG_ERR_ENOMEM;
         goto leave;
+    }
+
+    /* The secret scalar goes in as a copy flagged secure: that puts it
+     * into the parameter blob OSSL_PARAM_free wipes. */
+    if (want_private) {
+        sd = BN_secure_new();
+
+        if (!sd || !BN_copy(sd, _gcry_mpi_bn(ec->d))) {
+            rc = GPG_ERR_ENOMEM;
+            goto leave;
+        }
     }
 
     if (!ec->Q && ec->d) {
@@ -482,8 +494,7 @@ sm2_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
         || !OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY,
                                              pubbuf, (publen + 7) / 8)
         || (want_private
-            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY,
-                                       _gcry_mpi_bn(ec->d)))) {
+            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, sd))) {
         rc = GPG_ERR_INTERNAL;
         goto leave;
     }
@@ -512,6 +523,7 @@ leave:
     EVP_PKEY_CTX_free(pctx);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(sd);
     gcry_mpi_release(pub);
     *r_rc = key ? 0 : (rc ? rc : GPG_ERR_INTERNAL);
     return key;
@@ -985,6 +997,42 @@ leave:
     return rc;
 }
 
+/* Whether the u coordinate of PT, reduced modulo p, is one of the low
+ * order points of a Montgomery curve (RFC 7748 section 6): 0, 1 and p - 1
+ * on both curves, and on Curve25519 the two points of order 8.  Their
+ * multiples by an unclamped secret scalar would reveal it modulo the
+ * cofactor. */
+static int
+mont_low_order(mpi_ec_t ec, gcry_mpi_point_t pt)
+{
+    static const char *const order8_25519[] = {
+        "00B8495F16056286FDB1329CEB8D09DA6AC49FF1FAE35616AEB8413B7C7AEBE0",
+        "57119FD0DD4E22D8868E1C58C45C44045BEF839C55B1D0B1248C50A3BC959C5F",
+    };
+    gcry_mpi_t u = gcry_mpi_new(0);
+    gcry_mpi_t t = gcry_mpi_new(0);
+    size_t i;
+    int low;
+
+    gcry_mpi_mod(u, pt->x, ec->p);
+    gcry_mpi_sub_ui(t, ec->p, 1);
+    low = !gcry_mpi_cmp_ui(u, 0) || !gcry_mpi_cmp_ui(u, 1) || !gcry_mpi_cmp(u, t);
+
+    for (i = 0; !low && ec->nbits == 255 && i < DIM(order8_25519); i++) {
+        gcry_mpi_t v = NULL;
+
+        if (!_gcry_mpi_scan(&v, GCRYMPI_FMT_HEX, order8_25519[i], 0, NULL)) {
+            low = !gcry_mpi_cmp(u, v);
+        }
+
+        gcry_mpi_release(v);
+    }
+
+    gcry_mpi_release(u);
+    gcry_mpi_release(t);
+    return low;
+}
+
 static gcry_err_code_t
 ecc_decrypt_raw(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 {
@@ -1037,6 +1085,14 @@ ecc_decrypt_raw(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 
     if (ec->model == GCRY_ECC_MODEL_WEIERSTRASS
         && !_gcry_mpi_ec_on_curve(kG, ec)) {
+        rc = GPG_ERR_INV_DATA;
+        goto leave;
+    }
+
+    /* A low order peer point would reveal the secret scalar modulo the
+     * cofactor when it is not clamped; reject it whichever way the
+     * multiplication would be done. */
+    if (ec->model == GCRY_ECC_MODEL_MONTGOMERY && mont_low_order(ec, kG)) {
         rc = GPG_ERR_INV_DATA;
         goto leave;
     }

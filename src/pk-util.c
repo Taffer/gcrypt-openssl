@@ -1350,6 +1350,8 @@ _gcry_pk_pkcs1_encode_for_enc(unsigned int nbits, const unsigned char *value,
                     need--;
                 }
             }
+
+            _gcry_wipememory(buf, sizeof buf);
         }
     }
 
@@ -1360,12 +1362,47 @@ _gcry_pk_pkcs1_encode_for_enc(unsigned int nbits, const unsigned char *value,
     return 0;
 }
 
+/* Branch free helpers for the PKCS#1 block scan: 1 when V is zero, 1 when
+ * A < B (both far below 2^63), and B when BIT is 1 else A. */
+static size_t
+ct_is_zero(size_t v)
+{
+    return ((v | (0 - v)) >> (sizeof v * 8 - 1)) ^ 1;
+}
+
+static size_t
+ct_lt(size_t a, size_t b)
+{
+    return (a - b) >> (sizeof a * 8 - 1);
+}
+
+static size_t
+ct_select(size_t bit, size_t b, size_t a)
+{
+    size_t mask = 0 - bit;
+
+    return (b & mask) | (a & ~mask);
+}
+
+/*
+ * Decode a PKCS#1 v1.5 encryption block, 00 02 || PS || 00 || M with at
+ * least eight non-zero padding bytes.  The whole block is examined without
+ * data dependent branches and every malformed block yields the same error,
+ * so that the padding check itself is not a timing or error oracle; the
+ * length of the recovered message (and so of the copy and of the result)
+ * still is, as in the reference library.  This decoder is used by ElGamal;
+ * RSA leaves PKCS#1 decryption, with implicit rejection, to OpenSSL.
+ */
 gcry_err_code_t
 _gcry_pk_pkcs1_decode_for_enc(const unsigned char *frame, size_t nframe,
                               unsigned char **r_value, size_t *r_valuelen)
 {
-    size_t n = 0;
-    size_t sep;
+    size_t skip;
+    size_t start;
+    size_t sep = 0;
+    size_t found = 0;
+    size_t bad;
+    size_t i;
     unsigned char *value;
 
     *r_value = NULL;
@@ -1376,25 +1413,30 @@ _gcry_pk_pkcs1_decode_for_enc(const unsigned char *frame, size_t nframe,
     }
 
     /* The leading zero may already have been stripped by the conversion
-     * from a number. */
-    if (frame[n] == 0) {
-        n++;
+     * from a number: the block type is then the first byte. */
+    skip = ct_is_zero(frame[0]);
+    start = skip + 1;
+    bad = ct_is_zero(ct_select(skip, frame[1], frame[0]) ^ 2) ^ 1;
+
+    /* The separator is the first zero byte after the block type. */
+    for (i = 1; i < nframe; i++) {
+        size_t hit = ct_is_zero(frame[i]) & ct_lt(skip, i) & (found ^ 1);
+
+        sep = ct_select(hit, i, sep);
+        found |= hit;
     }
 
-    if (frame[n++] != 2) {
+    bad |= found ^ 1;
+    bad |= ct_lt(sep - start, 8) & found;
+
+    if (bad) {
         return GPG_ERR_ENCODING_PROBLEM;
     }
 
-    for (sep = n; sep < nframe && frame[sep]; sep++) {
-        ;
-    }
-
-    if (sep >= nframe || sep - n < 8) {
-        return GPG_ERR_ENCODING_PROBLEM;
-    }
-
+    /* The message is secret: a secure buffer makes the (value %b) result
+     * S-expression secure as well, as in the reference library. */
     sep++;
-    value = _gcry_malloc(nframe - sep + 1);
+    value = _gcry_malloc_secure(nframe - sep + 1);
 
     if (!value) {
         return _gcry_err_code_from_syserror();
@@ -1509,6 +1551,10 @@ _gcry_pk_oaep_encode(unsigned int nbits, int algo, const unsigned char *value,
     *r_frame = NULL;
     *r_framelen = 0;
 
+    if (!nbits) {
+        return GPG_ERR_TOO_SHORT; /* No key size: nothing fits. */
+    }
+
     if (!hlen || nframe < 2 * (size_t)hlen + 2) {
         return GPG_ERR_DIGEST_ALGO;
     }
@@ -1573,6 +1619,16 @@ _gcry_pk_oaep_encode(unsigned int nbits, int algo, const unsigned char *value,
     frame = NULL;
 
 leave:
+
+    /* The frame holds the message and the mask what it was blinded with. */
+    if (frame) {
+        _gcry_wipememory(frame, nframe);
+    }
+
+    if (mask) {
+        _gcry_wipememory(mask, dblen);
+    }
+
     _gcry_free(frame);
     _gcry_free(mask);
     return rc;
@@ -1605,9 +1661,10 @@ _gcry_pk_oaep_decode(const unsigned char *frame, size_t nframe, int algo,
         return GPG_ERR_ENCODING_PROBLEM;
     }
 
-    buf = _gcry_malloc(nframe);
+    /* The unmasked frame is the plaintext with its padding. */
+    buf = _gcry_malloc_secure(nframe);
     dblen = nframe - 1 - hlen;
-    mask = _gcry_malloc(dblen);
+    mask = _gcry_malloc_secure(dblen);
 
     if (!buf || !mask) {
         rc = _gcry_err_code_from_syserror();
@@ -1662,8 +1719,10 @@ _gcry_pk_oaep_decode(const unsigned char *frame, size_t nframe, int algo,
         goto leave;
     }
 
+    /* The message is secret: a secure buffer makes the (value %b) result
+     * S-expression secure as well, as in the reference library. */
     *r_valuelen = dblen - one - 1;
-    *r_value = _gcry_malloc(*r_valuelen + 1);
+    *r_value = _gcry_malloc_secure(*r_valuelen + 1);
 
     if (!*r_value) {
         *r_valuelen = 0;
@@ -1677,6 +1736,10 @@ leave:
 
     if (buf) {
         _gcry_wipememory(buf, nframe);
+    }
+
+    if (mask) {
+        _gcry_wipememory(mask, dblen);
     }
 
     _gcry_free(buf);
@@ -1714,8 +1777,8 @@ _gcry_pk_pss_encode(unsigned int nbits, int algo, unsigned int saltlen,
                     size_t *r_framelen)
 {
     unsigned int hlen = enc_hash_len(algo);
-    size_t embits = nbits - 1;
-    size_t emlen = (embits + 7) / 8;
+    size_t embits;
+    size_t emlen;
     unsigned char mhash[64];
     unsigned char h[64];
     unsigned char *salt = NULL;
@@ -1727,6 +1790,15 @@ _gcry_pk_pss_encode(unsigned int nbits, int algo, unsigned int saltlen,
 
     *r_frame = NULL;
     *r_framelen = 0;
+
+    /* The encoded message is NBITS - 1 bits long; without a key size
+     * there is none. */
+    if (!nbits) {
+        return GPG_ERR_TOO_SHORT;
+    }
+
+    embits = nbits - 1;
+    emlen = (embits + 7) / 8;
 
     if (!hlen || hlen > sizeof mhash) {
         return GPG_ERR_DIGEST_ALGO;
@@ -1932,6 +2004,12 @@ _gcry_pk_data_to_frame(struct pk_data *pd, unsigned int nbits,
 
     *r_frame = NULL;
     *r_framelen = 0;
+
+    /* No key size (a key without its modulus): nothing fits, which is
+     * also what the reference library reports. */
+    if (!nbits) {
+        return GPG_ERR_TOO_SHORT;
+    }
 
     switch (pd->encoding) {
     case PUBKEY_ENC_RAW:
