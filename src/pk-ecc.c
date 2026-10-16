@@ -491,7 +491,14 @@ sm2_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
     params = OSSL_PARAM_BLD_to_param(bld);
     pctx = EVP_PKEY_CTX_new_from_name(_gcry_libctx(), "SM2", _gcry_propq());
 
-    if (!params || !pctx || EVP_PKEY_fromdata_init(pctx) <= 0
+    /* No "SM2" key type at all: the provider was built without SM2, the
+     * same situation as FIPS mode refusing the curve. */
+    if (!pctx) {
+        rc = GPG_ERR_NOT_SUPPORTED;
+        goto leave;
+    }
+
+    if (!params || EVP_PKEY_fromdata_init(pctx) <= 0
         || EVP_PKEY_fromdata(pctx, &key,
                              want_private ? EVP_PKEY_KEYPAIR
                              : EVP_PKEY_PUBLIC_KEY, params) <= 0) {

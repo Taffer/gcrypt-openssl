@@ -24,6 +24,20 @@
 /* FIPS mode of this process once it has initialised normally. */
 static int parent_fips = -1;
 
+/* Whether a strict provider lacks an algorithm the library's tables list,
+ * which no reject flag can bring back. */
+static int
+strict_lacks_cipher(int algo)
+{
+    return TEST_STRICT_PROVIDER && gcry_cipher_test_algo(algo) != 0;
+}
+
+static int
+strict_lacks_mac(int algo)
+{
+    return TEST_STRICT_PROVIDER && gcry_mac_test_algo(algo) != 0;
+}
+
 /* Outcomes of the children, collected before the parent initialises. */
 static int r_force;
 static int r_no_fips;
@@ -280,14 +294,22 @@ TEST(reject_cipher_and_mac)
     memset(key, 0x42, sizeof key); /* Both XTS halves identical. */
 
     /* With every rejection switched off, FIPS mode still only offers what
-     * the provider has: Triple-DES is there, CAST5 and MD5 are not. */
+     * the provider has: Triple-DES is there, CAST5 and MD5 are not.  A
+     * strict provider may lack any of them even outside FIPS mode; such an
+     * algorithm stays unknown whatever the flags. */
     ASSERT_OK(set_reject_flags(0));
-    ASSERT_OK(gcry_cipher_test_algo(GCRY_CIPHER_3DES));
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_CIPHER_ALGO,
-                          gcry_cipher_test_algo(GCRY_CIPHER_CAST5));
-    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
-                          gcry_mac_test_algo(GCRY_MAC_HMAC_MD5));
+    ASSERT_OK_UNLESS(strict_lacks_cipher(GCRY_CIPHER_3DES), GPG_ERR_CIPHER_ALGO,
+                     gcry_cipher_test_algo(GCRY_CIPHER_3DES));
+    ASSERT_OK_UNLESS(gcry_fips_mode_active()
+                     || strict_lacks_cipher(GCRY_CIPHER_CAST5),
+                     GPG_ERR_CIPHER_ALGO,
+                     gcry_cipher_test_algo(GCRY_CIPHER_CAST5));
+    ASSERT_OK_UNLESS(strict_lacks_mac(GCRY_MAC_CMAC_3DES), GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
+    ASSERT_OK_UNLESS(gcry_fips_mode_active()
+                     || strict_lacks_mac(GCRY_MAC_HMAC_MD5),
+                     GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_HMAC_MD5));
 
     /* The XTS rule that the two key halves differ is not negotiable in
      * FIPS mode, flags or not. */
@@ -298,10 +320,14 @@ TEST(reject_cipher_and_mac)
 
     /* Back to the default set, the non-approved algorithms are refused. */
     ASSERT_OK(set_reject_flags(GCRY_FIPS_FLAG_REJECT_DEFAULT));
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_CIPHER_ALGO,
-                          gcry_cipher_test_algo(GCRY_CIPHER_3DES));
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
-                          gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
+    ASSERT_OK_UNLESS(gcry_fips_mode_active()
+                     || strict_lacks_cipher(GCRY_CIPHER_3DES),
+                     GPG_ERR_CIPHER_ALGO,
+                     gcry_cipher_test_algo(GCRY_CIPHER_3DES));
+    ASSERT_OK_UNLESS(gcry_fips_mode_active()
+                     || strict_lacks_mac(GCRY_MAC_CMAC_3DES),
+                     GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
     ASSERT_OK(gcry_cipher_test_algo(GCRY_CIPHER_AES));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_CMAC_AES));
 }

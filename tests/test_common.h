@@ -119,16 +119,30 @@ test_child_exit(int code)
     exit(code);
 }
 
+/* Whether the tests tolerate a provider that lacks algorithms the
+ * library's tables list, as Chainguard's strict FIPS provider does even
+ * when the library is not in FIPS mode.  Each test program decides from
+ * the family's test_algo function whether an algorithm is there. */
+#ifdef GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT
+    #define TEST_STRICT_PROVIDER 1
+#else
+    #define TEST_STRICT_PROVIDER 0
+#endif
+
+/* EXPR must succeed, unless COND holds, when it must fail with CODE. */
+#define ASSERT_OK_UNLESS(cond, code, expr) \
+    do {                                   \
+        if (cond) {                        \
+            ASSERT_ERR(code, expr);        \
+        } else {                           \
+            ASSERT_OK(expr);               \
+        }                                  \
+    } while (0)
+
 /* EXPR must succeed, unless the library runs in FIPS mode, where the
  * operation is not approved and must fail with CODE instead. */
-#define ASSERT_OK_OR_FIPS_ERR(code, expr)   \
-    do {                                    \
-        if (gcry_fips_mode_active()) {      \
-            ASSERT_ERR(code, expr);         \
-        } else {                            \
-            ASSERT_OK(expr);                \
-        }                                   \
-    } while (0)
+#define ASSERT_OK_OR_FIPS_ERR(code, expr) \
+    ASSERT_OK_UNLESS(gcry_fips_mode_active(), code, expr)
 
 #define TEST_RESULT()                                                    \
     (printf("%d test(s), %d failure(s)\n", test_count_, test_failures_), \
