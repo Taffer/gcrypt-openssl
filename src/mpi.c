@@ -99,6 +99,11 @@ _gcry_mpi_immutable_failed(void)
     log_info("Warning: trying to change an immutable MPI\n");
 }
 
+/* A secure MPI holds secret material: its limbs live in OpenSSL's secure
+ * heap and, just as important, every operation on it must take the
+ * constant-time paths, which OpenSSL selects by BN_FLG_CONSTTIME. */
+#define SECURE_BN_FLAGS (BN_FLG_SECURE | BN_FLG_CONSTTIME)
+
 gcry_mpi_t
 _gcry_mpi_alloc(int secure)
 {
@@ -108,6 +113,10 @@ _gcry_mpi_alloc(int secure)
 
     if (!a->bn) {
         _gcry_fatal_error(GPG_ERR_ENOMEM, NULL);
+    }
+
+    if (secure) {
+        BN_set_flags(a->bn, SECURE_BN_FLAGS);
     }
 
     a->flags = secure ? GCRYMPI_FLAG_SECURE : 0;
@@ -122,7 +131,43 @@ _gcry_mpi_new_from_bn(BIGNUM *bn, int secure)
 
     a->bn = bn;
     a->flags = secure ? GCRYMPI_FLAG_SECURE : 0;
+
+    if (secure) {
+        BN_set_flags(a->bn, SECURE_BN_FLAGS);
+    }
+
     return a;
+}
+
+/* Whether any of the (up to four) operands is secure, so that the
+ * operation must not leak through its timing. */
+static int
+any_secure(const gcry_mpi_t a, const gcry_mpi_t b, const gcry_mpi_t c,
+           const gcry_mpi_t d)
+{
+    return (a && mpi_is_secure(a)) || (b && mpi_is_secure(b))
+           || (c && mpi_is_secure(c)) || (d && mpi_is_secure(d));
+}
+
+/* A copy of BN in secure storage, with or without BN_FLG_CONSTTIME, to be
+ * passed to OpenSSL in place of an operand whose flags do not suit the
+ * operation: BN_mod_exp and BN_mod_inverse choose their constant-time
+ * variants from the flags of their operands. */
+static BIGNUM *
+flagged_copy(const BIGNUM *bn, int consttime)
+{
+    BIGNUM *copy = BN_secure_new();
+
+    if (!copy || !BN_copy(copy, bn)) {
+        BN_clear_free(copy);
+        bn_fail("BN_copy failed");
+    }
+
+    if (consttime) {
+        BN_set_flags(copy, BN_FLG_CONSTTIME);
+    }
+
+    return copy;
 }
 
 BIGNUM *
@@ -560,8 +605,12 @@ set_twos_complement(gcry_mpi_t a, const unsigned char *s, size_t n)
     }
 
     if (s[0] & 0x80) {
-        unsigned char *tmp = _gcry_malloc(n);
+        /* The inverted copy is as secret as the input: keep it in secure
+         * memory when A is, and wipe it in any case. */
+        unsigned char *tmp = mpi_is_secure(a) ? _gcry_malloc_secure(n)
+                             : _gcry_malloc(n);
         size_t i;
+        int ok;
 
         if (!tmp) {
             return _gcry_err_code_from_syserror();
@@ -571,12 +620,14 @@ set_twos_complement(gcry_mpi_t a, const unsigned char *s, size_t n)
             tmp[i] = (unsigned char)~s[i];
         }
 
-        if (!BN_bin2bn(tmp, (int)n, a->bn) || !BN_add_word(a->bn, 1)) {
-            _gcry_free(tmp);
+        ok = BN_bin2bn(tmp, (int)n, a->bn) && BN_add_word(a->bn, 1);
+        _gcry_wipememory(tmp, n);
+        _gcry_free(tmp);
+
+        if (!ok) {
             return GPG_ERR_INTERNAL;
         }
 
-        _gcry_free(tmp);
         BN_set_negative(a->bn, 1);
     } else if (!BN_bin2bn(s, (int)n, a->bn)) {
         return GPG_ERR_INTERNAL;
@@ -753,12 +804,16 @@ _gcry_mpi_scan(gcry_mpi_t *ret_mpi, enum gcry_mpi_format format,
         a = _gcry_mpi_alloc(secure);
 
         if (*s) {
+            /* BN_hex2bn allocates a plain BIGNUM; copy the value into
+             * the one allocated above so that a secure MPI keeps its
+             * secure storage and flags. */
             if (BN_hex2bn(&tmp, s) <= 0 || !tmp) {
                 rc = GPG_ERR_INV_OBJ;
-            } else {
-                BN_clear_free(a->bn);
-                a->bn = tmp;
+            } else if (!BN_copy(a->bn, tmp)) {
+                rc = GPG_ERR_INTERNAL;
             }
+
+            BN_clear_free(tmp);
         }
 
         if (!rc) {
@@ -1381,16 +1436,59 @@ gcry_mpi_powm(gcry_mpi_t w, const gcry_mpi_t b, const gcry_mpi_t e,
 {
     BN_CTX *ctx;
 
+    const BIGNUM *bb;
+    const BIGNUM *eb;
+    const BIGNUM *mb;
+    BIGNUM *copy_b = NULL;
+    BIGNUM *copy_e = NULL;
+    BIGNUM *copy_m = NULL;
+    int consttime;
+
     CHECK_NOT_NULL("gcry_mpi_powm", w && b && e && m);
     free_opaque(w);
+    bb = _gcry_mpi_bn(b);
+    eb = _gcry_mpi_bn(e);
+    mb = _gcry_mpi_bn(m);
+    consttime = BN_get_flags(bb, BN_FLG_CONSTTIME)
+                || BN_get_flags(eb, BN_FLG_CONSTTIME)
+                || BN_get_flags(mb, BN_FLG_CONSTTIME);
+
+    if (!BN_is_odd(mb)) {
+        /* OpenSSL has no constant-time exponentiation for an even
+         * modulus, and the one it has refuses operands flagged for
+         * constant time; work on copies without the flag. */
+        if (BN_get_flags(bb, BN_FLG_CONSTTIME)) {
+            copy_b = flagged_copy(bb, 0);
+            bb = copy_b;
+        }
+
+        if (BN_get_flags(eb, BN_FLG_CONSTTIME)) {
+            copy_e = flagged_copy(eb, 0);
+            eb = copy_e;
+        }
+
+        if (BN_get_flags(mb, BN_FLG_CONSTTIME)) {
+            copy_m = flagged_copy(mb, 0);
+            mb = copy_m;
+        }
+    } else if (!consttime && any_secure(w, b, e, m)) {
+        /* Secret material among the operands: the exponentiation must
+         * take OpenSSL's constant-time Montgomery path, which it does
+         * when an operand carries BN_FLG_CONSTTIME. */
+        copy_e = flagged_copy(eb, 1);
+        eb = copy_e;
+    }
+
     ctx = new_ctx();
 
-    if (!BN_mod_exp(w->bn, _gcry_mpi_bn(b), _gcry_mpi_bn(e), _gcry_mpi_bn(m),
-                    ctx)) {
+    if (!BN_mod_exp(w->bn, bb, eb, mb, ctx)) {
         bn_fail("BN_mod_exp failed");
     }
 
     release_ctx(ctx);
+    BN_clear_free(copy_b);
+    BN_clear_free(copy_e);
+    BN_clear_free(copy_m);
 }
 
 int
@@ -1433,15 +1531,30 @@ gcry_mpi_invm(gcry_mpi_t x, gcry_mpi_t a, gcry_mpi_t m)
 {
     BN_CTX *ctx;
     BIGNUM *res;
+    const BIGNUM *ab;
+    const BIGNUM *mb;
+    BIGNUM *tmp = NULL;
 
     if (!x || !a || !m) {
         return 0;
     }
 
     free_opaque(x);
+    ab = _gcry_mpi_bn(a);
+    mb = _gcry_mpi_bn(m);
+
+    /* As for powm: BN_mod_inverse takes its branch-free path when one of
+     * its operands carries BN_FLG_CONSTTIME. */
+    if (any_secure(x, a, m, NULL) && !BN_get_flags(ab, BN_FLG_CONSTTIME)
+        && !BN_get_flags(mb, BN_FLG_CONSTTIME)) {
+        tmp = flagged_copy(ab, 1);
+        ab = tmp;
+    }
+
     ctx = new_ctx();
-    res = BN_mod_inverse(x->bn, _gcry_mpi_bn(a), _gcry_mpi_bn(m), ctx);
+    res = BN_mod_inverse(x->bn, ab, mb, ctx);
     release_ctx(ctx);
+    BN_clear_free(tmp);
 
     if (!res) {
         ERR_clear_error();
@@ -1633,7 +1746,7 @@ gcry_mpi_set_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
     switch (flag) {
     case GCRYMPI_FLAG_SECURE:
         a->flags |= GCRYMPI_FLAG_SECURE;
-        BN_set_flags(a->bn, BN_FLG_SECURE | BN_FLG_CONSTTIME);
+        BN_set_flags(a->bn, SECURE_BN_FLAGS);
         break;
 
     case GCRYMPI_FLAG_CONST:
