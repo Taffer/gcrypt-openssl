@@ -151,6 +151,17 @@ free_opaque(gcry_mpi_t a)
     a->flags &= ~(unsigned int)GCRYMPI_FLAG_OPAQUE;
 }
 
+/* Argument sanity check for the void functions that have no way to
+ * report an error: a NULL result or operand is a fatal error rather
+ * than a silent no-op, which would corrupt the caller's results. */
+#define CHECK_NOT_NULL(func, cond)                            \
+    do {                                                      \
+        if (!(cond)) {                                        \
+            _gcry_fatal_error(GPG_ERR_INV_ARG,                \
+                              func ": NULL argument");        \
+        }                                                     \
+    } while (0)
+
 /* ------------------------------------------------------------------ */
 /* Allocation and assignment                                           */
 /* ------------------------------------------------------------------ */
@@ -223,6 +234,8 @@ gcry_mpi_snatch(gcry_mpi_t w, gcry_mpi_t u)
         return;
     }
 
+    CHECK_NOT_NULL("gcry_mpi_snatch", u);
+
     if (mpi_is_immutable(w)) {
         _gcry_mpi_immutable_failed();
         return;
@@ -240,6 +253,8 @@ gcry_mpi_snatch(gcry_mpi_t w, gcry_mpi_t u)
 gcry_mpi_t
 gcry_mpi_set(gcry_mpi_t w, const gcry_mpi_t u)
 {
+    CHECK_NOT_NULL("gcry_mpi_set", u);
+
     if (!w) {
         w = _gcry_mpi_alloc(mpi_is_secure(u));
     }
@@ -302,6 +317,10 @@ gcry_mpi_get_ui(unsigned int *w, gcry_mpi_t u)
 {
     BN_ULONG x;
 
+    if (!w || !u) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
     if (mpi_is_opaque(u) || BN_is_negative(u->bn)
         || BN_num_bits(u->bn) > 32) {
         return GCRY_ERR(GPG_ERR_ERANGE);
@@ -315,8 +334,10 @@ gcry_mpi_get_ui(unsigned int *w, gcry_mpi_t u)
 void
 gcry_mpi_swap(gcry_mpi_t a, gcry_mpi_t b)
 {
-    struct gcry_mpi tmp = *a;
+    struct gcry_mpi tmp;
 
+    CHECK_NOT_NULL("gcry_mpi_swap", a && b);
+    tmp = *a;
     *a = *b;
     *b = tmp;
 }
@@ -324,7 +345,7 @@ gcry_mpi_swap(gcry_mpi_t a, gcry_mpi_t b)
 int
 gcry_mpi_is_neg(gcry_mpi_t a)
 {
-    if (mpi_is_opaque(a)) {
+    if (!a || mpi_is_opaque(a)) {
         return 0;
     }
 
@@ -334,6 +355,8 @@ gcry_mpi_is_neg(gcry_mpi_t a)
 void
 gcry_mpi_neg(gcry_mpi_t w, gcry_mpi_t u)
 {
+    CHECK_NOT_NULL("gcry_mpi_neg", w && u);
+
     if (w != u) {
         gcry_mpi_set(w, u);
     } else if (mpi_is_immutable(w)) {
@@ -347,6 +370,8 @@ gcry_mpi_neg(gcry_mpi_t w, gcry_mpi_t u)
 void
 gcry_mpi_abs(gcry_mpi_t w)
 {
+    CHECK_NOT_NULL("gcry_mpi_abs", w);
+
     if (mpi_is_immutable(w)) {
         _gcry_mpi_immutable_failed();
         return;
@@ -358,6 +383,9 @@ gcry_mpi_abs(gcry_mpi_t w)
 int
 gcry_mpi_cmp(const gcry_mpi_t u, const gcry_mpi_t v)
 {
+    /* A comparison has no error return and 0 would claim equality. */
+    CHECK_NOT_NULL("gcry_mpi_cmp", u && v);
+
     if (mpi_is_opaque(u) || mpi_is_opaque(v)) {
         /* An opaque value sorts below every number, as upstream has it. */
         if (!mpi_is_opaque(u)) {
@@ -391,6 +419,8 @@ gcry_mpi_cmp_ui(const gcry_mpi_t u, unsigned long v)
 {
     BIGNUM *tmp;
     int rc;
+
+    CHECK_NOT_NULL("gcry_mpi_cmp_ui", u);
 
     if (mpi_is_opaque(u)) {
         /* Upstream treats an opaque value as a zero-limb number here. */
@@ -776,6 +806,10 @@ _gcry_mpi_print(enum gcry_mpi_format format, unsigned char *buffer,
 
     *nwritten = 0;
 
+    if (!a) {
+        return GPG_ERR_INV_ARG;
+    }
+
     /* An opaque value is printed as its raw bytes in every format, as
      * upstream does (its buffer accessor returns them unchanged). */
     negative = !mpi_is_opaque(a) && BN_is_negative(a->bn)
@@ -1015,7 +1049,16 @@ _gcry_mpi_aprint(enum gcry_mpi_format format, unsigned char **buffer,
     size_t n;
     gcry_err_code_t rc;
 
+    if (!buffer) {
+        return GPG_ERR_INV_ARG;
+    }
+
     *buffer = NULL;
+
+    if (!a) {
+        return GPG_ERR_INV_ARG;
+    }
+
     rc = _gcry_mpi_print(format, NULL, 0, &n, a);
 
     if (rc) {
@@ -1115,6 +1158,7 @@ gcry_mpi_dump(const gcry_mpi_t a)
 void
 gcry_mpi_add(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 {
+    CHECK_NOT_NULL("gcry_mpi_add", w && u && v);
     CHECK_MUTABLE(w);
     free_opaque(w);
 
@@ -1126,6 +1170,8 @@ gcry_mpi_add(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_add_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
+    CHECK_NOT_NULL("gcry_mpi_add_ui", w && u);
+
     if (w != u) {
         /* Not gcry_mpi_set(): that one honours the immutable flag. */
         free_opaque(w);
@@ -1147,6 +1193,7 @@ gcry_mpi_addm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
+    CHECK_NOT_NULL("gcry_mpi_addm", w && u && v && m);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1161,6 +1208,7 @@ gcry_mpi_addm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 void
 gcry_mpi_sub(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 {
+    CHECK_NOT_NULL("gcry_mpi_sub", w && u && v);
     free_opaque(w);
 
     if (!BN_sub(w->bn, _gcry_mpi_bn(u), _gcry_mpi_bn(v))) {
@@ -1171,6 +1219,8 @@ gcry_mpi_sub(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_sub_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
+    CHECK_NOT_NULL("gcry_mpi_sub_ui", w && u);
+
     if (w != u) {
         /* Not gcry_mpi_set(): that one honours the immutable flag. */
         free_opaque(w);
@@ -1192,6 +1242,7 @@ gcry_mpi_subm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
+    CHECK_NOT_NULL("gcry_mpi_subm", w && u && v && m);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1208,6 +1259,7 @@ gcry_mpi_mul(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 {
     BN_CTX *ctx;
 
+    CHECK_NOT_NULL("gcry_mpi_mul", w && u && v);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1221,6 +1273,8 @@ gcry_mpi_mul(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v)
 void
 gcry_mpi_mul_ui(gcry_mpi_t w, gcry_mpi_t u, unsigned long v)
 {
+    CHECK_NOT_NULL("gcry_mpi_mul_ui", w && u);
+
     if (w != u) {
         /* Not gcry_mpi_set(): that one honours the immutable flag. */
         free_opaque(w);
@@ -1242,6 +1296,7 @@ gcry_mpi_mulm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 {
     BN_CTX *ctx;
 
+    CHECK_NOT_NULL("gcry_mpi_mulm", w && u && v && m);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1256,6 +1311,7 @@ gcry_mpi_mulm(gcry_mpi_t w, gcry_mpi_t u, gcry_mpi_t v, gcry_mpi_t m)
 void
 gcry_mpi_mul_2exp(gcry_mpi_t w, gcry_mpi_t u, unsigned long cnt)
 {
+    CHECK_NOT_NULL("gcry_mpi_mul_2exp", w && u);
     free_opaque(w);
 
     if (!BN_lshift(w->bn, _gcry_mpi_bn(u), (int)cnt)) {
@@ -1273,6 +1329,7 @@ gcry_mpi_div(gcry_mpi_t q, gcry_mpi_t r, gcry_mpi_t dividend,
     BIGNUM *tq;
     BIGNUM *tr;
 
+    CHECK_NOT_NULL("gcry_mpi_div", dividend && divisor);
     ctx = new_ctx();
     BN_CTX_start(ctx);
     tq = BN_CTX_get(ctx);
@@ -1314,6 +1371,7 @@ gcry_mpi_div(gcry_mpi_t q, gcry_mpi_t r, gcry_mpi_t dividend,
 void
 gcry_mpi_mod(gcry_mpi_t r, gcry_mpi_t dividend, gcry_mpi_t divisor)
 {
+    CHECK_NOT_NULL("gcry_mpi_mod", r && dividend && divisor);
     gcry_mpi_div(NULL, r, dividend, divisor, -1);
 }
 
@@ -1323,6 +1381,7 @@ gcry_mpi_powm(gcry_mpi_t w, const gcry_mpi_t b, const gcry_mpi_t e,
 {
     BN_CTX *ctx;
 
+    CHECK_NOT_NULL("gcry_mpi_powm", w && b && e && m);
     free_opaque(w);
     ctx = new_ctx();
 
@@ -1341,6 +1400,10 @@ gcry_mpi_gcd(gcry_mpi_t g, gcry_mpi_t a, gcry_mpi_t b)
     BIGNUM *ta;
     BIGNUM *tb;
     int rc;
+
+    if (!g || !a || !b) {
+        return 0;
+    }
 
     free_opaque(g);
     ctx = new_ctx();
@@ -1371,6 +1434,10 @@ gcry_mpi_invm(gcry_mpi_t x, gcry_mpi_t a, gcry_mpi_t m)
     BN_CTX *ctx;
     BIGNUM *res;
 
+    if (!x || !a || !m) {
+        return 0;
+    }
+
     free_opaque(x);
     ctx = new_ctx();
     res = BN_mod_inverse(x->bn, _gcry_mpi_bn(a), _gcry_mpi_bn(m), ctx);
@@ -1391,6 +1458,10 @@ gcry_mpi_invm(gcry_mpi_t x, gcry_mpi_t a, gcry_mpi_t m)
 unsigned int
 gcry_mpi_get_nbits(gcry_mpi_t a)
 {
+    if (!a) {
+        return 0;
+    }
+
     if (mpi_is_opaque(a)) {
         return a->opaque_nbits;
     }
@@ -1401,7 +1472,7 @@ gcry_mpi_get_nbits(gcry_mpi_t a)
 int
 gcry_mpi_test_bit(gcry_mpi_t a, unsigned int n)
 {
-    if (mpi_is_opaque(a)) {
+    if (!a || mpi_is_opaque(a)) {
         return 0;
     }
 
@@ -1411,6 +1482,7 @@ gcry_mpi_test_bit(gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_set_bit(gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_set_bit", a);
     CHECK_MUTABLE(a);
 
     if (!BN_set_bit(_gcry_mpi_bn(a), (int)n)) {
@@ -1421,6 +1493,7 @@ gcry_mpi_set_bit(gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_clear_bit(gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_clear_bit", a);
     CHECK_MUTABLE(a);
 
     if (!BN_clear_bit(_gcry_mpi_bn(a), (int)n)) {
@@ -1431,6 +1504,7 @@ gcry_mpi_clear_bit(gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_set_highbit(gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_set_highbit", a);
     CHECK_MUTABLE(a);
 
     if (!BN_mask_bits(_gcry_mpi_bn(a), (int)n + 1)) {
@@ -1445,6 +1519,7 @@ gcry_mpi_set_highbit(gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_clear_highbit(gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_clear_highbit", a);
     CHECK_MUTABLE(a);
 
     if (!BN_mask_bits(_gcry_mpi_bn(a), (int)n)) {
@@ -1455,6 +1530,7 @@ gcry_mpi_clear_highbit(gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_rshift(gcry_mpi_t x, gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_rshift", x && a);
     CHECK_MUTABLE(x);
     free_opaque(x);
 
@@ -1466,6 +1542,7 @@ gcry_mpi_rshift(gcry_mpi_t x, gcry_mpi_t a, unsigned int n)
 void
 gcry_mpi_lshift(gcry_mpi_t x, gcry_mpi_t a, unsigned int n)
 {
+    CHECK_NOT_NULL("gcry_mpi_lshift", x && a);
     CHECK_MUTABLE(x);
     free_opaque(x);
 
@@ -1481,6 +1558,10 @@ gcry_mpi_lshift(gcry_mpi_t x, gcry_mpi_t a, unsigned int n)
 gcry_mpi_t
 gcry_mpi_set_opaque(gcry_mpi_t a, void *p, unsigned int nbits)
 {
+    if (!p && nbits) {
+        return NULL; /* A NULL buffer may only be empty. */
+    }
+
     if (!a) {
         a = _gcry_mpi_alloc(0);
     }
@@ -1509,19 +1590,30 @@ gcry_mpi_set_opaque_copy(gcry_mpi_t a, const void *p, unsigned int nbits)
     unsigned int n = (nbits + 7) / 8;
     void *d;
 
+    if (!p && nbits) {
+        return NULL; /* A NULL buffer may only be empty. */
+    }
+
     d = _gcry_is_secure(p) ? _gcry_malloc_secure(n) : _gcry_malloc(n);
 
     if (!d) {
         return NULL;
     }
 
-    memcpy(d, p, n);
+    if (n) {
+        memcpy(d, p, n);
+    }
+
     return gcry_mpi_set_opaque(a, d, nbits);
 }
 
 void *
 gcry_mpi_get_opaque(gcry_mpi_t a, unsigned int *nbits)
 {
+    if (!a) {
+        return NULL;
+    }
+
     if (!mpi_is_opaque(a)) {
         _gcry_log(GCRY_LOG_BUG, "mpi_get_opaque on normal mpi\n");
     }
@@ -1536,6 +1628,8 @@ gcry_mpi_get_opaque(gcry_mpi_t a, unsigned int *nbits)
 void
 gcry_mpi_set_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
 {
+    CHECK_NOT_NULL("gcry_mpi_set_flag", a);
+
     switch (flag) {
     case GCRYMPI_FLAG_SECURE:
         a->flags |= GCRYMPI_FLAG_SECURE;
@@ -1566,6 +1660,8 @@ gcry_mpi_set_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
 void
 gcry_mpi_clear_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
 {
+    CHECK_NOT_NULL("gcry_mpi_clear_flag", a);
+
     switch (flag) {
     case GCRYMPI_FLAG_IMMUTABLE:
         if (!(a->flags & GCRYMPI_FLAG_CONST)) {
@@ -1592,6 +1688,10 @@ gcry_mpi_clear_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
 int
 gcry_mpi_get_flag(gcry_mpi_t a, enum gcry_mpi_flag flag)
 {
+    if (!a) {
+        return 0;
+    }
+
     switch (flag) {
     case GCRYMPI_FLAG_SECURE:
     case GCRYMPI_FLAG_OPAQUE:
@@ -1638,7 +1738,8 @@ _gcry_mpi_get_const(int no)
     pthread_once(&const_once, init_constants);
 
     if (no < 0 || (size_t)no >= DIM(constants) || !constants[no]) {
-        _gcry_log(GCRY_LOG_BUG, "invalid mpi constant %d requested\n", no);
+        log_info("invalid mpi constant %d requested\n", no);
+        return NULL;
     }
 
     return constants[no];
@@ -1656,6 +1757,7 @@ gcry_mpi_randomize(gcry_mpi_t w, unsigned int nbits,
     unsigned char *p;
     int ok;
 
+    CHECK_NOT_NULL("gcry_mpi_randomize", w);
     CHECK_MUTABLE(w);
     p = mpi_is_secure(w) ? _gcry_xmalloc_secure(nbytes ? nbytes : 1)
         : _gcry_xmalloc(nbytes ? nbytes : 1);
@@ -1726,6 +1828,8 @@ void
 gcry_mpi_point_get(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_t z,
                    gcry_mpi_point_t point)
 {
+    CHECK_NOT_NULL("gcry_mpi_point_get", point);
+
     if (x) {
         gcry_mpi_set(x, point->x);
     }
@@ -1743,6 +1847,7 @@ void
 gcry_mpi_point_snatch_get(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_t z,
                           gcry_mpi_point_t point)
 {
+    CHECK_NOT_NULL("gcry_mpi_point_snatch_get", point);
     gcry_mpi_point_get(x, y, z, point);
     gcry_mpi_point_release(point);
 }

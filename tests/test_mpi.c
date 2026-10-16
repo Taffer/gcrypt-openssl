@@ -1041,6 +1041,121 @@ TEST(dump)
     gcry_mpi_release(o);
 }
 
+/* Invalid arguments are reported instead of dereferenced.  Only the
+ * functions with an error return (or a NULL/0 result) are covered here;
+ * the void arithmetic functions raise a fatal error instead. */
+TEST(argument_checks)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t b = gcry_mpi_set_ui(NULL, 3);
+    gcry_mpi_t o;
+    gcry_mpi_t c0;
+    gcry_mpi_t c5;
+    gcry_mpi_t cm1;
+    gcry_mpi_t c9;
+    unsigned int ui = 42;
+    unsigned int nbits = 42;
+    unsigned char sentinel[1] = { 'x' };
+    unsigned char *abuf = sentinel;
+    size_t nw = 42;
+    int saved;
+    int devnull;
+
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+
+    /* Scan: the buffer is required even for an empty value. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_scan(&o, GCRYMPI_FMT_USG, NULL, 0,
+                                              NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_scan(&o, GCRYMPI_FMT_STD, NULL, 4,
+                                              NULL));
+
+    /* Print and aprint need a value; aprint needs its output pointer. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_print(GCRYMPI_FMT_STD, NULL, 0, &nw,
+                                               NULL));
+    ASSERT_EQ(0, nw);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_aprint(GCRYMPI_FMT_HEX, NULL, &nw,
+                                                a));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_aprint(GCRYMPI_FMT_HEX, &abuf, &nw,
+                                                NULL));
+    ASSERT_NULL(abuf);
+    abuf = sentinel;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_aprint((enum gcry_mpi_format)77,
+                                                &abuf, &nw, a));
+    ASSERT_NULL(abuf);
+
+    /* get_ui needs both the destination and the value. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_get_ui(NULL, a));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_get_ui(&ui, NULL));
+    ASSERT_EQ(42, ui);
+
+    /* Predicates and sizes report 0 for a NULL value. */
+    ASSERT_EQ(0, gcry_mpi_is_neg(NULL));
+    ASSERT_EQ(0, gcry_mpi_get_nbits(NULL));
+    ASSERT_EQ(0, gcry_mpi_test_bit(NULL, 0));
+    ASSERT_EQ(0, gcry_mpi_get_flag(NULL, GCRYMPI_FLAG_SECURE));
+
+    /* gcd and invm report "no" without touching anything. */
+    ASSERT_EQ(0, gcry_mpi_gcd(NULL, a, b));
+    ASSERT_EQ(0, gcry_mpi_gcd(a, NULL, b));
+    ASSERT_EQ(0, gcry_mpi_gcd(a, b, NULL));
+    ASSERT_EQ(0, gcry_mpi_invm(NULL, a, b));
+    ASSERT_EQ(0, gcry_mpi_invm(a, NULL, b));
+    ASSERT_EQ(0, gcry_mpi_invm(a, b, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(a, 5));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(b, 3));
+
+    /* Opaque values: a NULL buffer is only valid when it is empty. */
+    ASSERT_NULL(gcry_mpi_set_opaque(a, NULL, 8));
+    ASSERT_FALSE(gcry_mpi_get_flag(a, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(a, 5));
+    ASSERT_NULL(gcry_mpi_set_opaque(NULL, NULL, 8));
+    ASSERT_NULL(gcry_mpi_set_opaque_copy(NULL, NULL, 8));
+    ASSERT_NULL(gcry_mpi_set_opaque_copy(a, NULL, 1));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(a, 5));
+    o = gcry_mpi_set_opaque_copy(NULL, NULL, 0);
+    ASSERT_NOT_NULL(o);
+    ASSERT_TRUE(gcry_mpi_get_flag(o, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_get_nbits(o));
+    gcry_mpi_release(o);
+    ASSERT_NULL(gcry_mpi_get_opaque(NULL, &nbits));
+    ASSERT_EQ(42, nbits);
+
+    /* Unknown constants are reported (on the log) and yield NULL. */
+    fflush(stderr);
+    saved = dup(2);
+    devnull = open("/dev/null", O_WRONLY);
+
+    if (saved >= 0 && devnull >= 0) {
+        dup2(devnull, 2);
+    }
+
+    c0 = _gcry_mpi_get_const(0);
+    c5 = _gcry_mpi_get_const(5);
+    cm1 = _gcry_mpi_get_const(-1);
+    c9 = _gcry_mpi_get_const(9);
+    fflush(stderr);
+
+    if (saved >= 0) {
+        dup2(saved, 2);
+        close(saved);
+    }
+
+    if (devnull >= 0) {
+        close(devnull);
+    }
+
+    ASSERT_NULL(c0);
+    ASSERT_NULL(c5);
+    ASSERT_NULL(cm1);
+    ASSERT_NULL(c9);
+    ASSERT_NOT_NULL(_gcry_mpi_get_const(1));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(GCRYMPI_CONST_FOUR, 4));
+
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+}
+
 int
 main(void)
 {
@@ -1063,5 +1178,6 @@ main(void)
     RUN_TEST(arithmetic_edges);
     RUN_TEST(point_edges);
     RUN_TEST(dump);
+    RUN_TEST(argument_checks);
     return TEST_RESULT();
 }
