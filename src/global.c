@@ -77,6 +77,19 @@ try_enable_fips(void)
     return 1;
 }
 
+/* A configuration may activate the FIPS provider without making fips=yes
+ * the default property (Chainguard's images do that, for instance).  Only
+ * approved algorithms are then meant to be available, which is FIPS mode
+ * in every way that matters here, so treat it as such.  Once a
+ * configuration activated a provider, OpenSSL no longer loads the default
+ * provider as a fallback, which is why its absence is meaningful. */
+static int
+fips_provider_only(void)
+{
+    return OSSL_PROVIDER_available(libctx, "fips")
+           && !OSSL_PROVIDER_available(libctx, "default");
+}
+
 static void
 do_global_init(void)
 {
@@ -109,8 +122,12 @@ do_global_init(void)
 
     if (want_fips && !no_fips_mode_required) {
         fips_mode = try_enable_fips();
-    } else {
-        fips_mode = EVP_default_properties_is_fips_enabled(libctx) > 0;
+    } else if (EVP_default_properties_is_fips_enabled(libctx) > 0) {
+        fips_mode = 1;
+    } else if (fips_provider_only()) {
+        /* Make the property explicit so that the legacy provider loaded
+         * above cannot supply non-approved algorithms either. */
+        fips_mode = try_enable_fips();
     }
 
     any_init_done = 1;

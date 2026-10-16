@@ -233,7 +233,11 @@ property, so every algorithm fetch is served by the FIPS provider. If the
 provider cannot be loaded the library carries on without FIPS mode;
 `gcry_get_config(0, "fips-mode")` and `GCRYCTL_FIPS_MODE_P` report what
 actually happened. `GCRYCTL_NO_FIPS_MODE` before initialisation turns the
-request off.
+request off. Without any request, the library is also in FIPS mode when
+the OpenSSL configuration made `fips=yes` the default property, or when
+it activated the `fips` provider and not the `default` one, so that only
+approved algorithms exist (Chainguard's FIPS images are configured that
+way).
 
 `-DGCRYPT_OPENSSL_FIPS=ON` (the `fips` preset) makes the build ask for FIPS
 mode unconditionally, as if the marker file were present, and defines
