@@ -2133,50 +2133,9 @@ wleave:
             }
         }
     } else {
-        unsigned int nbytes = (ec->nbits + 7) / 8;
-
-        if (want_private) {
-            unsigned char *scalar;
-            size_t scalarlen;
-
-            rc = _gcry_ecc_mont_scalar(ec->d, ec->nbits, &scalar, &scalarlen);
-
-            if (!rc) {
-                key = EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(),
-                                                      mont_keytype(ec), _gcry_propq(), scalar, scalarlen);
-                _gcry_wipememory(scalar, scalarlen);
-                _gcry_free(scalar);
-
-                if (!key) {
-                    rc = _gcry_err_from_openssl(GPG_ERR_BAD_SECKEY);
-                }
-            }
-        } else if (!ec->Q) {
-            rc = GPG_ERR_NO_PUBKEY;
-        } else {
-            unsigned char *u = _gcry_malloc(nbytes);
-
-            if (!u) {
-                rc = GPG_ERR_ENOMEM;
-            } else {
-                gcry_mpi_t ux = gcry_mpi_new(0);
-
-                if (_gcry_mpi_ec_affine(ux, NULL, ec->Q, ec)
-                    || _gcry_ecc_mont_decode_u(ux, ec->nbits, u)) {
-                    rc = GPG_ERR_INV_OBJ;
-                } else {
-                    key = EVP_PKEY_new_raw_public_key_ex(_gcry_libctx(),
-                                                         mont_keytype(ec), _gcry_propq(), u, nbytes);
-
-                    if (!key) {
-                        rc = _gcry_err_from_openssl(GPG_ERR_BAD_PUBKEY);
-                    }
-                }
-
-                gcry_mpi_release(ux);
-                _gcry_free(u);
-            }
-        }
+        /* Montgomery keys never become EVP_PKEY objects here: scalar
+         * multiplication builds its own raw keys in mont_mul_fast(). */
+        rc = GPG_ERR_NOT_IMPLEMENTED;
     }
 
     *r_rc = key ? 0 : (rc ? rc : GPG_ERR_INTERNAL);
@@ -2659,44 +2618,4 @@ gcry_mpi_ec_curve_point(gcry_mpi_point_t w, gcry_ctx_t ctx)
     }
 
     return _gcry_mpi_ec_on_curve(w, ec);
-}
-
-void
-_gcry_log_printpnt(const char *text, gcry_mpi_point_t point, gcry_ctx_t ctx)
-{
-    mpi_ec_t ec = ctx ? _gcry_ctx_get_ec(ctx) : NULL;
-
-    if (text && *text) {
-        _gcry_log(GCRY_LOG_DEBUG, "%s:\n", text);
-    }
-
-    if (!point) {
-        _gcry_log(GCRY_LOG_DEBUG, "  (null)\n");
-        return;
-    }
-
-    if (ec) {
-        gcry_mpi_t x = gcry_mpi_new(0);
-        gcry_mpi_t y = gcry_mpi_new(0);
-
-        if (!_gcry_mpi_ec_affine(x, ec->model == GCRY_ECC_MODEL_MONTGOMERY
-                                 ? NULL : y, point, ec)) {
-            gcry_log_debugmpi("  x", x);
-
-            if (ec->model != GCRY_ECC_MODEL_MONTGOMERY) {
-                gcry_log_debugmpi("  y", y);
-            }
-
-            gcry_mpi_release(x);
-            gcry_mpi_release(y);
-            return;
-        }
-
-        gcry_mpi_release(x);
-        gcry_mpi_release(y);
-    }
-
-    gcry_log_debugmpi("  x", point->x);
-    gcry_log_debugmpi("  y", point->y);
-    gcry_log_debugmpi("  z", point->z);
 }

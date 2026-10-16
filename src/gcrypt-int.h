@@ -127,14 +127,11 @@ gcry_err_code_t _gcry_sexp_vbuild(gcry_sexp_t *retsexp, size_t *erroff,
                                   const char *format, va_list arg_ptr);
 gcry_err_code_t _gcry_sexp_sscan(gcry_sexp_t *retsexp, size_t *erroff,
                                  const char *buffer, size_t length);
-gcry_err_code_t _gcry_sexp_new(gcry_sexp_t *retsexp, const void *buffer,
-                               size_t length, int autodetect);
 gcry_err_code_t _gcry_sexp_extract_param(gcry_sexp_t sexp, const char *path,
                                          const char *list, ...);
 gcry_err_code_t _gcry_sexp_vextract_param(gcry_sexp_t sexp,
                                           const char *path,
                                           const char *list, va_list arg_ptr);
-void *_gcry_hex2buffer(const char *string, size_t *r_length);
 
 /* ---- mpi.c ------------------------------------------------------- */
 
@@ -316,7 +313,6 @@ int _gcry_pk_util_hash_algo_from_name(const char *s, size_t n);
 /* Digest helpers for the public key code.  They talk to OpenSSL directly
  * so that this module does not depend on the md module. */
 const char *_gcry_pk_md_openssl_name(int algo);
-const char *_gcry_pk_md_gcry_name(int algo);
 unsigned int _gcry_pk_md_dlen(int algo);
 gcry_err_code_t _gcry_pk_md_hash(int algo, const void *data, size_t len,
                                  unsigned char *out, size_t outlen);
@@ -484,8 +480,5 @@ EVP_PKEY *_gcry_ecc_evp_key(mpi_ec_t ec, int want_private,
 gcry_err_code_t _gcry_pk_ecc_get_sexp(gcry_sexp_t *r_sexp, int mode,
                                       mpi_ec_t ec);
 mpi_ec_t _gcry_ctx_get_ec(gcry_ctx_t ctx);
-
-void _gcry_log_printpnt(const char *text, gcry_mpi_point_t point,
-                        gcry_ctx_t ctx);
 
 #endif /* GCRYPT_INT_H */

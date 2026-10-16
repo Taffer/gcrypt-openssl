@@ -1136,13 +1136,6 @@ sexp_create(gcry_sexp_t *retsexp, const void *buffer, size_t length,
     return do_sexp_sscan(retsexp, NULL, buffer, length, 0, NULL);
 }
 
-gcry_err_code_t
-_gcry_sexp_new(gcry_sexp_t *retsexp, const void *buffer, size_t length,
-               int autodetect)
-{
-    return sexp_create(retsexp, buffer, length, autodetect);
-}
-
 gcry_error_t
 gcry_sexp_create(gcry_sexp_t *retsexp, void *buffer, size_t length,
                  int autodetect, void (*freefnc)(void *))
@@ -2733,35 +2726,4 @@ gcry_sexp_extract_param(gcry_sexp_t sexp, const char *path,
     rc = _gcry_sexp_vextract_param(sexp, path, list, arg_ptr);
     va_end(arg_ptr);
     return GCRY_ERR(rc);
-}
-
-/* Convert a hex string to a newly allocated binary buffer. */
-void *
-_gcry_hex2buffer(const char *string, size_t *r_length)
-{
-    const char *s;
-    unsigned char *buffer;
-    size_t length = 0;
-
-    buffer = _gcry_malloc(strlen(string) / 2 + 1);
-
-    if (!buffer) {
-        *r_length = 0;
-        return NULL;
-    }
-
-    for (s = string; *s; s += 2) {
-        if (!hexdigitp(s) || !hexdigitp(s + 1)) {
-            _gcry_free(buffer);
-            errno = EINVAL;
-            *r_length = 0;
-            return NULL;
-        }
-
-        buffer[length++] = (unsigned char)(hextonibble(s[0]) * 16
-                                           + hextonibble(s[1]));
-    }
-
-    *r_length = length;
-    return buffer;
 }

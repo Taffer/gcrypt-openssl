@@ -159,20 +159,6 @@ _gcry_pk_md_openssl_name(int algo)
     return NULL;
 }
 
-const char *
-_gcry_pk_md_gcry_name(int algo)
-{
-    size_t i;
-
-    for (i = 0; i < DIM(digests); i++) {
-        if (digests[i].algo == algo) {
-            return digests[i].name;
-        }
-    }
-
-    return "?";
-}
-
 unsigned int
 _gcry_pk_md_dlen(int algo)
 {
