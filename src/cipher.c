@@ -1818,12 +1818,13 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
         }
     }
 
+    /* XTS with two equal keys is weak and the FIPS provider refuses it
+     * outright, so report it here rather than as an internal error at the
+     * first data call; the reference library gives the same code. */
     if (h->mode == GCRY_CIPHER_MODE_XTS && _gcry_fips_mode()
         && !CRYPTO_memcmp(key, (const unsigned char *)key + keylen / 2,
                           keylen / 2)) {
-        if (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_CIPHER) {
-            return GPG_ERR_WEAK_KEY;
-        }
+        return GPG_ERR_WEAK_KEY;
     }
 
     _gcry_wipememory(h->key, sizeof h->key);

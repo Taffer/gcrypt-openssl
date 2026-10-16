@@ -39,6 +39,16 @@ algo_available(int algo)
     return 1;
 }
 
+/* The error for opening a non-FIPS algorithm in a mode it cannot do: the
+ * algorithm check precedes the mode check, so FIPS mode reports the
+ * algorithm, as the reference library does. */
+static gcry_err_code_t
+bad_mode_err(void)
+{
+    return gcry_fips_mode_active() ? GPG_ERR_CIPHER_ALGO
+           : GPG_ERR_INV_CIPHER_MODE;
+}
+
 /* One-shot encrypt and decrypt check for a block or stream cipher. */
 static void
 check_vector(int algo, int mode, const char *keyhex, const char *ivhex,
@@ -182,8 +192,9 @@ TEST(other_block_ciphers)
                  "4706480851e61be85d74bfb3fd956185", NULL,
                  "83a2f8a288641fb9a4e9a5cc2f131c7d",
                  "ee54d13ebcae706d226bc3142cd40d4a");
+
     /* CTR with a 64 bit block cipher exercises the composed CTR. */
-    {
+    if (algo_available(GCRY_CIPHER_CAST5)) {
         gcry_cipher_hd_t hd;
         unsigned char key[16];
         unsigned char ctr[8] = { 0, 0, 0, 0, 0, 0, 0, 0xff };
@@ -370,6 +381,14 @@ TEST(chacha20_poly1305_rfc8439)
           "3ff4def08e4b7a9de576d26586cec64b6116", expect_ct, sizeof expect_ct);
     unhex("1ae10b594f09e26a7e902ecbd0600691", expect_tag, sizeof expect_tag);
     ASSERT_EQ(114, strlen(msg));
+
+    if (gcry_fips_mode_active()) {
+        /* ChaCha20 is not a FIPS algorithm. */
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                    GCRY_CIPHER_MODE_POLY1305, 0));
+        return;
+    }
 
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_POLY1305,
                                0));
@@ -595,6 +614,21 @@ TEST(aes_gcm_siv_rfc8452)
     unhex("b5d839330ac7b786", expect_ct, sizeof expect_ct);
     unhex("578782fff6013b815b287c22493a364c", expect_tag, sizeof expect_tag);
 
+    if (gcry_fips_mode_active()) {
+        /* The FIPS provider has no AES-GCM-SIV; the mode is refused at
+         * open for every AES variant. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES192,
+                                    GCRY_CIPHER_MODE_GCM_SIV, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES256,
+                                    GCRY_CIPHER_MODE_GCM_SIV, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES,
+                                    GCRY_CIPHER_MODE_GCM_SIV, 0));
+        return;
+    }
+
     /* RFC 8452 only defines 128 and 256 bit keys. */
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES192,
                                GCRY_CIPHER_MODE_GCM_SIV, 0));
@@ -643,6 +677,20 @@ TEST(aes_xts_ieee1619)
           expect, sizeof expect);
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_XTS, 0));
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, key, 16));
+
+    /* Two equal keys are weak; FIPS mode refuses them at setkey. */
+    {
+        unsigned char same[32];
+
+        memset(same, 0x11, sizeof same);
+
+        if (gcry_fips_mode_active()) {
+            ASSERT_ERR(GPG_ERR_WEAK_KEY, gcry_cipher_setkey(hd, same, sizeof same));
+        } else {
+            ASSERT_OK(gcry_cipher_setkey(hd, same, sizeof same));
+        }
+    }
+
     ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
     ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
     ASSERT_OK(gcry_cipher_encrypt(hd, out, sizeof out, pt, sizeof pt));
@@ -879,9 +927,9 @@ TEST(errors)
     ASSERT_NULL(hd);
     ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
                gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_STREAM, 0));
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_GCM, 0));
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR, GCRY_CIPHER_MODE_CBC, 0));
     ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
                gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_POLY1305, 0));
@@ -1005,6 +1053,18 @@ TEST(aes_siv_rfc5297)
     unhex("40c02b9690c4dc04daef7f6afe5c", expect_ct, sizeof expect_ct);
     unhex("85632d07c6e8f37f950acd320a2ecc93", expect_tag, sizeof expect_tag);
 
+    if (gcry_fips_mode_active()) {
+        /* The FIPS provider has no AES-SIV. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_SIV,
+                                    0));
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_SIV, 0));
+        return;
+    }
+
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV, 0));
     /* SIV needs two AES keys. */
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_cipher_setkey(hd, key, 16));
@@ -1059,6 +1119,13 @@ TEST(aes_gcm_siv_states)
     /* RFC 8452 C.1, 8 byte plaintext with one byte of AAD. */
     unhex("1e6daba35669f427", expect_ct, sizeof expect_ct);
     unhex("3b0a1a2560969cdf790d99759abd1508", expect_tag, sizeof expect_tag);
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
+                                    0));
+        return;
+    }
 
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
                                0));
@@ -1227,7 +1294,7 @@ TEST(aes_ccm_states)
     ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 8));
     gcry_cipher_close(hd);
 
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_CCM, 0));
 }
 
@@ -1326,7 +1393,7 @@ TEST(xts_and_keywrap_lengths)
     ASSERT_OK(gcry_cipher_decrypt(hd, back, 17, out, 17));
     ASSERT_MEM_EQ(data, back, 17);
     gcry_cipher_close(hd);
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_XTS, 0));
 
     /* RFC 3394 wrap needs at least two whole semiblocks. */
@@ -1444,7 +1511,7 @@ TEST(ocb_generic_block_ciphers)
     }
 
     /* OCB needs a 128 bit block cipher and a key before the nonce. */
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_OCB, 0));
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_OCB, 0));
     ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, nonce, sizeof nonce));
@@ -1525,7 +1592,7 @@ TEST(controls_and_misc)
                                                           GCRYCTL_GET_BLKLEN, NULL, NULL));
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_algo_info(GCRY_CIPHER_AES,
                                                       GCRYCTL_TEST_ALGO, NULL, &n));
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(),
                gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_CBC,
                                 0));
 
@@ -1557,19 +1624,28 @@ TEST(controls_and_misc)
         gcry_cipher_close(hd);
     }
 
-    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_STREAM,
-                               0));
-    ASSERT_OK(gcry_cipher_setkey(hd, data, 32));
-    ASSERT_OK(gcry_cipher_setiv(hd, iv, 16));
-    ASSERT_OK(gcry_cipher_setiv(hd, iv, 8));
-    gcry_cipher_close(hd);
-    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
-                               GCRY_CIPHER_MODE_POLY1305, 0));
-    ASSERT_OK(gcry_cipher_setkey(hd, data, 32));
-    ASSERT_OK(gcry_cipher_setiv(hd, iv, 8));
-    ASSERT_OK(gcry_cipher_info(hd, GCRYCTL_GET_TAGLEN, NULL, &n));
-    ASSERT_EQ(16, n);
-    gcry_cipher_close(hd);
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                    GCRY_CIPHER_MODE_STREAM, 0));
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                    GCRY_CIPHER_MODE_POLY1305, 0));
+    } else {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                   GCRY_CIPHER_MODE_STREAM, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, data, 32));
+        ASSERT_OK(gcry_cipher_setiv(hd, iv, 16));
+        ASSERT_OK(gcry_cipher_setiv(hd, iv, 8));
+        gcry_cipher_close(hd);
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20,
+                                   GCRY_CIPHER_MODE_POLY1305, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, data, 32));
+        ASSERT_OK(gcry_cipher_setiv(hd, iv, 8));
+        ASSERT_OK(gcry_cipher_info(hd, GCRYCTL_GET_TAGLEN, NULL, &n));
+        ASSERT_EQ(16, n);
+        gcry_cipher_close(hd);
+    }
 
     /* OpenPGP CFB sync after partial blocks; the ciphertext comes from the
      * reference library. */
@@ -1784,6 +1860,13 @@ TEST(upstream_siv_states)
     const char *tag_hex = "08348491cf6aa22075b4bdadf2d6738e";
 
     compat_fill();
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV, 0));
+        return;
+    }
+
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_SIV, 0));
     ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 32));
 
@@ -1903,6 +1986,14 @@ TEST(upstream_gcm_siv_states)
     const char *tag_hex = "49ea9de2bd470ea3fbe567d7cb22e2bf";
 
     compat_fill();
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
+                                    0));
+        return;
+    }
+
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM_SIV,
                                0));
     ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
@@ -2055,6 +2146,17 @@ TEST(upstream_key_lengths)
         unsigned char k3[24];
         size_t w;
 
+        if (gcry_fips_mode_active()) {
+            /* Neither DES nor 3DES is a FIPS algorithm. */
+            ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                       gcry_cipher_open(&hd, GCRY_CIPHER_DES, GCRY_CIPHER_MODE_ECB,
+                                        0));
+            ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                       gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_ECB,
+                                        0));
+            return;
+        }
+
         for (w = 0; w < sizeof weak / sizeof weak[0]; w++) {
             ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_DES, GCRY_CIPHER_MODE_ECB,
                                        0));
@@ -2156,13 +2258,19 @@ TEST(upstream_iv_conventions)
     gcry_cipher_close(hd);
 
     /* ARCFOUR takes and ignores an IV. */
-    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR, GCRY_CIPHER_MODE_STREAM,
-                               0));
-    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
-    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
-    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
-    ASSERT_TRUE(hex_eq(ct, "493de25ae347bf6bae723d6da27084e0"));
-    gcry_cipher_close(hd);
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR,
+                                    GCRY_CIPHER_MODE_STREAM, 0));
+    } else {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR,
+                                   GCRY_CIPHER_MODE_STREAM, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 16));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
+        ASSERT_OK(gcry_cipher_encrypt(hd, ct, 16, cmp_pt, 16));
+        ASSERT_TRUE(hex_eq(ct, "493de25ae347bf6bae723d6da27084e0"));
+        gcry_cipher_close(hd);
+    }
 
     /* CBC-MAC handles decrypt as plain CBC. */
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC,
@@ -2253,13 +2361,19 @@ TEST(upstream_keywrap_and_ccm)
         gcry_cipher_close(hd);
     }
 
-    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_AESWRAP,
-                               0));
-    ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 24));
-    ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
-    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
-    ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_decrypt(hd, out, 16, ct, 24));
-    gcry_cipher_close(hd);
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                   gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_AESWRAP,
+                                    0));
+    } else {
+        ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_AESWRAP,
+                                   0));
+        ASSERT_OK(gcry_cipher_setkey(hd, cmp_key, 24));
+        ASSERT_OK(gcry_cipher_setiv(hd, cmp_iv, 8));
+        ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_encrypt(hd, ct, 24, cmp_pt, 16));
+        ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_cipher_decrypt(hd, out, 16, ct, 24));
+        gcry_cipher_close(hd);
+    }
 
     /* CCM: lengths are not checked against the L field, and the tag calls
      * before the lengths are set report a length problem. */
@@ -2298,23 +2412,27 @@ TEST(upstream_keywrap_and_ccm)
 TEST(disable_algo)
 {
     gcry_cipher_hd_t hd = NULL;
-    int algo = GCRY_CIPHER_CAST5;
+    /* FIPS mode has already rejected CAST5; disable an AES variant there. */
+    int fips = gcry_fips_mode_active();
+    int algo = fips ? GCRY_CIPHER_AES192 : GCRY_CIPHER_CAST5;
+    const char *name = fips ? "AES192" : "CAST5";
+    size_t keylen = fips ? 24 : 16;
 
-    if (!algo_available(GCRY_CIPHER_CAST5)) {
+    if (!algo_available(algo)) {
         return;
     }
 
     ASSERT_ERR(GPG_ERR_CIPHER_ALGO, gcry_cipher_ctl(NULL, GCRYCTL_DISABLE_ALGO,
                                                     &algo, 2));
     ASSERT_OK(gcry_cipher_ctl(NULL, GCRYCTL_DISABLE_ALGO, &algo, sizeof algo));
-    ASSERT_ERR(GPG_ERR_CIPHER_ALGO, gcry_cipher_test_algo(GCRY_CIPHER_CAST5));
+    ASSERT_ERR(GPG_ERR_CIPHER_ALGO, gcry_cipher_test_algo(algo));
     ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
-               gcry_cipher_open(&hd, GCRY_CIPHER_CAST5, GCRY_CIPHER_MODE_CBC, 0));
+               gcry_cipher_open(&hd, algo, GCRY_CIPHER_MODE_CBC, 0));
     ASSERT_NULL(hd);
     /* The tables still know the algorithm. */
-    ASSERT_EQ(16, gcry_cipher_get_algo_keylen(GCRY_CIPHER_CAST5));
-    ASSERT_STR_EQ("CAST5", gcry_cipher_algo_name(GCRY_CIPHER_CAST5));
-    ASSERT_EQ(GCRY_CIPHER_CAST5, gcry_cipher_map_name("CAST5"));
+    ASSERT_EQ(keylen, gcry_cipher_get_algo_keylen(algo));
+    ASSERT_STR_EQ(name, gcry_cipher_algo_name(algo));
+    ASSERT_EQ(algo, gcry_cipher_map_name(name));
 }
 
 TEST(null_buffer_arguments)
