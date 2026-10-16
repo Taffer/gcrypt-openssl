@@ -2306,6 +2306,27 @@ _gcry_ctx_get_ec(gcry_ctx_t ctx)
     return slot ? *slot : NULL;
 }
 
+/* The EC context behind CTX for the void arithmetic functions, which
+ * have no way to report an error.  A missing operand (OPERANDS_OK is
+ * zero) or a missing or foreign context is fatal: silently leaving the
+ * result untouched would corrupt the caller's computation.  FUNC names
+ * the calling function for the message. */
+static mpi_ec_t
+arith_context(const char *func, gcry_ctx_t ctx, int operands_ok)
+{
+    mpi_ec_t ec = operands_ok && ctx ? _gcry_ctx_get_ec(ctx) : NULL;
+
+    if (!ec) {
+        char msg[64];
+
+        snprintf(msg, sizeof msg, "%s: %s", func,
+                 operands_ok && ctx ? "not an EC context" : "NULL argument");
+        _gcry_fatal_error(GPG_ERR_INV_ARG, msg);
+    }
+
+    return ec;
+}
+
 gpg_error_t
 gcry_mpi_ec_new(gcry_ctx_t *r_ctx, gcry_sexp_t keyparam,
                 const char *curvename)
@@ -2460,6 +2481,12 @@ gcry_mpi_ec_set_mpi(const char *name, gcry_mpi_t newvalue, gcry_ctx_t ctx)
                            : !strcmp(name, "a") ? &ec->a
                            : !strcmp(name, "b") ? &ec->b : &ec->n;
 
+        /* The curve parameters are numbers the rest of the context
+         * dereferences; they can be replaced but not removed. */
+        if (!newvalue || mpi_is_opaque(newvalue)) {
+            return GCRY_ERR(GPG_ERR_INV_ARG);
+        }
+
         gcry_mpi_release(*slot);
         *slot = gcry_mpi_copy(newvalue);
 
@@ -2488,6 +2515,10 @@ gcry_mpi_ec_set_mpi(const char *name, gcry_mpi_t newvalue, gcry_ctx_t ctx)
             ec->Q = NULL;
         }
     } else if (!strcmp(name, "d")) {
+        if (newvalue && mpi_is_opaque(newvalue)) {
+            return GCRY_ERR(GPG_ERR_INV_ARG); /* A secret scalar is a number. */
+        }
+
         gcry_mpi_release(ec->d);
         ec->d = gcry_mpi_copy(newvalue);
 
@@ -2554,11 +2585,7 @@ gcry_mpi_ec_get_affine(gcry_mpi_t x, gcry_mpi_t y, gcry_mpi_point_t point,
 void
 gcry_mpi_ec_dup(gcry_mpi_point_t w, gcry_mpi_point_t u, gcry_ctx_t ctx)
 {
-    mpi_ec_t ec = _gcry_ctx_get_ec(ctx);
-
-    if (!ec) {
-        return;
-    }
+    mpi_ec_t ec = arith_context("gcry_mpi_ec_dup", ctx, w && u);
 
     if (ec->model != GCRY_ECC_MODEL_WEIERSTRASS) {
         report_unsupported("point doubling", ec, w);
@@ -2574,11 +2601,7 @@ void
 gcry_mpi_ec_add(gcry_mpi_point_t w, gcry_mpi_point_t u, gcry_mpi_point_t v,
                 gcry_ctx_t ctx)
 {
-    mpi_ec_t ec = _gcry_ctx_get_ec(ctx);
-
-    if (!ec) {
-        return;
-    }
+    mpi_ec_t ec = arith_context("gcry_mpi_ec_add", ctx, w && u && v);
 
     if (ec->model != GCRY_ECC_MODEL_WEIERSTRASS) {
         report_unsupported("point addition", ec, w);
@@ -2594,11 +2617,7 @@ void
 gcry_mpi_ec_sub(gcry_mpi_point_t w, gcry_mpi_point_t u, gcry_mpi_point_t v,
                 gcry_ctx_t ctx)
 {
-    mpi_ec_t ec = _gcry_ctx_get_ec(ctx);
-
-    if (!ec) {
-        return;
-    }
+    mpi_ec_t ec = arith_context("gcry_mpi_ec_sub", ctx, w && u && v);
 
     if (ec->model != GCRY_ECC_MODEL_WEIERSTRASS) {
         report_unsupported("point subtraction", ec, w);
@@ -2614,10 +2633,10 @@ void
 gcry_mpi_ec_mul(gcry_mpi_point_t w, gcry_mpi_t n, gcry_mpi_point_t u,
                 gcry_ctx_t ctx)
 {
-    mpi_ec_t ec = _gcry_ctx_get_ec(ctx);
+    mpi_ec_t ec = arith_context("gcry_mpi_ec_mul", ctx, w && n && u);
 
-    if (!ec) {
-        return;
+    if (mpi_is_opaque(n)) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_mpi_ec_mul: opaque scalar");
     }
 
     if (ec->model == GCRY_ECC_MODEL_EDWARDS) {

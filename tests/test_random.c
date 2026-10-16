@@ -75,7 +75,23 @@ TEST(add_bytes)
     ASSERT_OK(gcry_random_add_bytes(seed, sizeof seed, -5)); /* clamped */
     ASSERT_OK(gcry_random_add_bytes(seed, 0, 50));
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_random_add_bytes(NULL, 10, 50));
+    /* As in the reference, a NULL buffer is rejected even for 0 bytes. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_random_add_bytes(NULL, 0, 50));
     ASSERT_OK(gcry_control(GCRYCTL_FAST_POLL, NULL));
+}
+
+/* A NULL buffer with a non-zero length aborts; with zero bytes requested
+ * it is a no-op. */
+TEST(zero_length_null_buffers)
+{
+    unsigned char *p;
+
+    gcry_randomize(NULL, 0, GCRY_WEAK_RANDOM);
+    gcry_randomize(NULL, 0, GCRY_VERY_STRONG_RANDOM);
+    gcry_create_nonce(NULL, 0);
+    p = gcry_random_bytes(0, GCRY_STRONG_RANDOM);
+    ASSERT_NOT_NULL(p);
+    gcry_free(p);
 }
 
 TEST(control_rng_type)
@@ -95,6 +111,7 @@ main(void)
     RUN_TEST(random_bytes_allocation);
     RUN_TEST(nonce);
     RUN_TEST(add_bytes);
+    RUN_TEST(zero_length_null_buffers);
     RUN_TEST(control_rng_type);
     return TEST_RESULT();
 }

@@ -1142,6 +1142,83 @@ TEST(montgomery_clamped_scalars)
     gcry_mpi_release(x);
 }
 
+/* Invalid arguments are reported, never dereferenced.  The void
+ * arithmetic functions abort on NULL and are not exercised here. */
+TEST(argument_checks)
+{
+    gcry_ctx_t ctx = NULL;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t R = gcry_mpi_point_new(0);
+    gcry_mpi_t p;
+    gcry_mpi_t m = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "abc", 24);
+    gcry_mpi_t x = gcry_mpi_new(0);
+    unsigned char scalar[56] = { 9 };
+    unsigned char out[56];
+
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_new(NULL, NULL, "NIST P-256"));
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "NIST P-256"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    ASSERT_NOT_NULL(G);
+
+    /* Lookups without a name or a context. */
+    ASSERT_NULL(gcry_mpi_ec_get_mpi(NULL, ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("", ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("p", NULL, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_point(NULL, ctx, 1));
+    ASSERT_NULL(gcry_mpi_ec_get_point("g", NULL, 1));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi(NULL, m, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("d", m, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_point(NULL, G, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_point("g", G, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_decode_point(NULL, m, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_decode_point(R, NULL, ctx));
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, NULL, NULL, ctx));
+    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, NULL, G, NULL));
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(NULL, ctx));
+    ASSERT_EQ(0, gcry_mpi_ec_curve_point(G, NULL));
+
+    /* Curve parameters are numbers and cannot be removed; the context
+     * stays intact after a rejected update. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("p", NULL, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("n", NULL, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("a", o, ctx));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("d", o, ctx));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_NAME, gcry_mpi_ec_set_mpi("zz", NULL, ctx));
+    p = gcry_mpi_ec_get_mpi("p", ctx, 0);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(256, gcry_mpi_get_nbits(p));
+    ASSERT_EQ(1, gcry_mpi_ec_curve_point(G, ctx));
+    gcry_mpi_ec_mul(R, m, G, ctx);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_TRUE(mpi_eq_hex(x,
+                           "51590B7A515140D2D784C85608668FDFEF8C82FD1F5BE52421554A0DC3D033ED"));
+    /* Clearing the secret scalar and the public point is allowed. */
+    ASSERT_OK(gcry_mpi_ec_set_mpi("d", m, ctx));
+    ASSERT_NOT_NULL(gcry_mpi_ec_get_mpi("d", ctx, 0));
+    ASSERT_OK(gcry_mpi_ec_set_mpi("d", NULL, ctx));
+    ASSERT_NULL(gcry_mpi_ec_get_mpi("d", ctx, 0));
+    ASSERT_OK(gcry_mpi_ec_set_point("q", G, ctx));
+    ASSERT_OK(gcry_mpi_ec_set_mpi("q", NULL, ctx));
+    ASSERT_NULL(gcry_mpi_ec_get_point("q", ctx, 1));
+
+    /* The raw X25519/X448 helper. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_ecc_mul_point(GCRY_ECC_CURVE25519, NULL, scalar, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_ecc_mul_point(GCRY_ECC_CURVE448, out, NULL, NULL));
+    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_ecc_mul_point(0, NULL, NULL, NULL));
+    ASSERT_EQ(0, gcry_ecc_get_algo_keylen(0));
+    ASSERT_EQ(0, gcry_ecc_get_algo_keylen(-1));
+
+    gcry_mpi_point_release(G);
+    gcry_mpi_point_release(R);
+    gcry_mpi_release(m);
+    gcry_mpi_release(o);
+    gcry_mpi_release(x);
+    gcry_ctx_release(ctx);
+}
+
 int
 main(void)
 {
@@ -1159,5 +1236,6 @@ main(void)
     RUN_TEST(edwards_context_and_explicit_params);
     RUN_TEST(montgomery_and_degenerate_arithmetic);
     RUN_TEST(montgomery_clamped_scalars);
+    RUN_TEST(argument_checks);
     return TEST_RESULT();
 }

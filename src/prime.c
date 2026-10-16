@@ -531,7 +531,8 @@ gcry_prime_group_generator(gcry_mpi_t *r_g, gcry_mpi_t prime,
 
     *r_g = NULL;
 
-    if (!factors || !prime || mpi_is_opaque(prime)) {
+    if (!factors || !prime || mpi_is_opaque(prime)
+        || (start_g && mpi_is_opaque(start_g))) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
