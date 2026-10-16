@@ -32,13 +32,29 @@ fetch_digest(int algo)
     return _gcry_md_fetch(algo);
 }
 
+/* The OpenSSL digest name behind a gcrypt digest id for use in an EVP_KDF
+ * parameter, or NULL.  The EVP_KDF algorithms take their digest by name
+ * only, so the truncated BLAKE2 variants, which OpenSSL knows as the full
+ * size digest plus an output-size parameter, cannot be expressed: they
+ * would silently run at full length.  They are refused, as the digest and
+ * MAC modules refuse them in HMAC. */
+static const char *
+kdf_digest_name(int mdalgo)
+{
+    if (_gcry_md_reduced_size(mdalgo)) {
+        return NULL;
+    }
+
+    return _gcry_md_openssl_name(mdalgo);
+}
+
 /* The OpenSSL digest name behind an HMAC algorithm id, or NULL. */
 static const char *
 hmac_digest_name(int macalgo)
 {
     int mdalgo = _gcry_mac_hmac_digest_algo(macalgo);
 
-    return mdalgo ? _gcry_md_openssl_name(mdalgo) : NULL;
+    return mdalgo ? kdf_digest_name(mdalgo) : NULL;
 }
 
 /* The output size of the digest behind a gcrypt digest id, 0 if OpenSSL
@@ -68,6 +84,9 @@ openpgp_s2k(const void *passphrase, size_t passphraselen, int algo,
 {
     EVP_MD *md;
     EVP_MD_CTX *mdctx = NULL;
+    OSSL_PARAM params[2];
+    const OSSL_PARAM *init_params = NULL;
+    size_t reduced = _gcry_md_reduced_size(hashalgo);
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int dlen;
     unsigned char *key = keybuffer;
@@ -87,6 +106,15 @@ openpgp_s2k(const void *passphrase, size_t passphraselen, int algo,
         return GPG_ERR_DIGEST_ALGO;
     }
 
+    /* The truncated BLAKE2 variants are OpenSSL's full size digest with
+     * an output-size parameter, as the digest module sets it up. */
+    if (reduced) {
+        params[0] = OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE,
+                                                &reduced);
+        params[1] = OSSL_PARAM_construct_end();
+        init_params = params;
+    }
+
     mdctx = EVP_MD_CTX_new();
 
     if (!mdctx) {
@@ -98,7 +126,7 @@ openpgp_s2k(const void *passphrase, size_t passphraselen, int algo,
         unsigned int i;
         static const unsigned char zero = 0;
 
-        if (!EVP_DigestInit_ex2(mdctx, md, NULL)) {
+        if (!EVP_DigestInit_ex2(mdctx, md, init_params)) {
             rc = GPG_ERR_INTERNAL;
             goto leave;
         }
@@ -316,8 +344,7 @@ pbkdf2(const void *passphrase, size_t passphraselen, int hashalgo,
        const void *salt, size_t saltlen, unsigned long iterations,
        size_t keysize, void *keybuffer)
 {
-    const char *digest = _gcry_md_openssl_name(
-                             hashalgo);
+    const char *digest = kdf_digest_name(hashalgo);
     OSSL_PARAM params[6];
     size_t n = 0;
     uint64_t iter = iterations;
@@ -706,8 +733,7 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else if (paramlen != 1) {
             ec = GPG_ERR_INV_VALUE;
         } else {
-            h->digest = _gcry_md_openssl_name(
-                            subalgo);
+            h->digest = kdf_digest_name(subalgo);
 
             if (!h->digest || !digest_size(subalgo)) {
                 ec = GPG_ERR_DIGEST_ALGO;
@@ -765,8 +791,7 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else if (paramlen != 1) {
             ec = GPG_ERR_INV_VALUE;
         } else {
-            h->digest = _gcry_md_openssl_name(
-                            subalgo);
+            h->digest = kdf_digest_name(subalgo);
 
             if (!h->digest || !digest_size(subalgo)) {
                 ec = GPG_ERR_DIGEST_ALGO;

@@ -746,6 +746,158 @@ wait_none(void *jobs_context)
     return 0;
 }
 
+/* The truncated BLAKE2 digests are OpenSSL's full size BLAKE2 with an
+ * output-size parameter.  The S2K functions set it and must agree with
+ * the reference library; the EVP_KDF algorithms take a digest by name only
+ * and cannot, so they refuse the truncated variants rather than derive at
+ * full length (the reference library derives with the truncated digest, so
+ * a full-length result would be a silently wrong key). */
+TEST(truncated_blake2)
+{
+    /* Values computed with the reference library (libgcrypt 1.12). */
+    static const struct {
+        int algo;
+        int hashalgo;
+        const char *salt;
+        unsigned long c;
+        const char *dk;
+    } s2k[] = {
+        {
+            GCRY_KDF_SIMPLE_S2K, GCRY_MD_BLAKE2B_256, NULL, 0,
+            "3b1ad8a047635d78bc91f93090fef3488f6a57c4c6b20c6457b9a9fd1119efa2"
+            "6e352c24664319e5"
+        },
+        {
+            GCRY_KDF_SALTED_S2K, GCRY_MD_BLAKE2B_256, "saltsalt", 0,
+            "029833909afe68979d0c9892c1344a1ee5a4876bc005e93fd7ce6219d6193684"
+            "5f539cda1ef8cfba"
+        },
+        {
+            GCRY_KDF_ITERSALTED_S2K, GCRY_MD_BLAKE2B_256, "saltsalt", 1024,
+            "a14b4f56bc2e5dc07f3e11356f80236dde9f0ca504ee3a41152f3638bca4970b"
+            "77fc1189bcc034cc"
+        },
+        {
+            GCRY_KDF_SIMPLE_S2K, GCRY_MD_BLAKE2B_160, NULL, 0,
+            "304e304949043ac15d7c1b030196c52d012611b85879892bf485f8d017d23154"
+            "f9c1f16f33edb6c5"
+        },
+        {
+            GCRY_KDF_ITERSALTED_S2K, GCRY_MD_BLAKE2S_128, "saltsalt", 1024,
+            "d4910cf54e68f48f37b2e009e2efacb5f0a1b6de573f1f2d643d727d2dc54349"
+            "a1308fd361efcf06"
+        },
+        {
+            GCRY_KDF_SIMPLE_S2K, GCRY_MD_BLAKE2S_224, NULL, 0,
+            "a0c8a358327791eb5194fee04db3f1b92ded86f2bbf77562b2cab4fadd8a001b"
+            "05e64ce9a41822b6"
+        },
+        {
+            /* The full size digests take no parameter. */
+            GCRY_KDF_ITERSALTED_S2K, GCRY_MD_BLAKE2B_512, "saltsalt", 1024,
+            "c8bf6bdf9138ac46a1b2cc341ba55f3cf422ce08e7dd874ee2e2359a182add35"
+            "5caf83a866ba893c"
+        },
+        {
+            GCRY_KDF_SALTED_S2K, GCRY_MD_BLAKE2S_256, "saltsalt", 0,
+            "252530c476f5c83ce564709e28048d2c93a62ce68b10333140909f617fca8729"
+            "abd50a7f3c3a973f"
+        },
+    };
+    static const int truncated_md[] = {
+        GCRY_MD_BLAKE2B_160, GCRY_MD_BLAKE2B_256, GCRY_MD_BLAKE2B_384,
+        GCRY_MD_BLAKE2S_128, GCRY_MD_BLAKE2S_160, GCRY_MD_BLAKE2S_224
+    };
+    static const int truncated_mac[] = {
+        GCRY_MAC_HMAC_BLAKE2B_160, GCRY_MAC_HMAC_BLAKE2B_256,
+        GCRY_MAC_HMAC_BLAKE2B_384, GCRY_MAC_HMAC_BLAKE2S_128,
+        GCRY_MAC_HMAC_BLAKE2S_160, GCRY_MAC_HMAC_BLAKE2S_224
+    };
+    /* BLAKE2 is not a FIPS digest: the provider may not have it at all,
+     * in which case every derivation below fails the same way. */
+    int have_blake2 = !gcry_md_test_algo(GCRY_MD_BLAKE2B_512)
+                      && !gcry_md_test_algo(GCRY_MD_BLAKE2S_256);
+    unsigned long param[1] = { 32 };
+    unsigned char out[40];
+    unsigned char expect[40];
+    size_t i;
+
+    for (i = 0; i < sizeof s2k / sizeof s2k[0]; i++) {
+        memset(out, 0, sizeof out);
+        ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_DIGEST_ALGO,
+                         gcry_kdf_derive("passphrase", 10, s2k[i].algo,
+                                         s2k[i].hashalgo, s2k[i].salt,
+                                         s2k[i].salt ? 8 : 0, s2k[i].c, 40,
+                                         out));
+
+        if (have_blake2) {
+            unhex(s2k[i].dk, expect, sizeof expect);
+            ASSERT_MEM_EQ(expect, out, 40);
+        }
+    }
+
+    for (i = 0; i < sizeof truncated_md / sizeof truncated_md[0]; i++) {
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   gcry_kdf_derive("passphrase", 10, GCRY_KDF_PBKDF2,
+                                   truncated_md[i], "saltsalt", 8, 10, 40,
+                                   out));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   kdf_derive_hd(GCRY_KDF_ONESTEP_KDF, truncated_md[i], param,
+                                 1, "zz", 2, NULL, 0, NULL, 0, "ad", 2, 32,
+                                 out));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   kdf_derive_hd(GCRY_KDF_X963_KDF, truncated_md[i], param, 1,
+                                 "zz", 2, NULL, 0, NULL, 0, "ad", 2, 32,
+                                 out));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   kdf_derive_hd(GCRY_KDF_ONESTEP_KDF_MAC, truncated_mac[i],
+                                 param, 1, "zz", 2, NULL, 0, "key", 3, "ad",
+                                 2, 32, out));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   kdf_derive_hd(GCRY_KDF_HKDF, truncated_mac[i], param, 1,
+                                 "zz", 2, "salt", 4, NULL, 0, "ad", 2, 32,
+                                 out));
+    }
+
+    /* The full size digests keep working, and agree with the reference
+     * library. */
+    ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_DIGEST_ALGO,
+                     gcry_kdf_derive("passphrase", 10, GCRY_KDF_PBKDF2,
+                                     GCRY_MD_BLAKE2B_512, "saltsalt", 8, 10,
+                                     40, out));
+    unhex("9a7ea706fb348193eaf110dc0fe7fd211436b9f13a6afd62ec97266b6e31192b"
+          "b55cb2820db85708", expect, sizeof expect);
+    ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 40));
+    ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_DIGEST_ALGO,
+                     kdf_derive_hd(GCRY_KDF_ONESTEP_KDF, GCRY_MD_BLAKE2S_256,
+                                   param, 1, "zz", 2, NULL, 0, NULL, 0, "ad",
+                                   2, 32, out));
+    unhex("2c503c577052c86f79c069207d71dd901911b10e275744d1a1688bf4d88cae32",
+          expect, sizeof expect);
+    ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 32));
+    ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_DIGEST_ALGO,
+                     kdf_derive_hd(GCRY_KDF_X963_KDF, GCRY_MD_BLAKE2B_512,
+                                   param, 1, "zz", 2, NULL, 0, NULL, 0, "ad",
+                                   2, 32, out));
+    unhex("6cb9a5554f9c2938cc943a86c12a2655969113ac01072f251e235bbbbc1b2c2a",
+          expect, sizeof expect);
+    ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 32));
+    ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_MAC_ALGO,
+                     kdf_derive_hd(GCRY_KDF_ONESTEP_KDF_MAC,
+                                   GCRY_MAC_HMAC_BLAKE2S_256, param, 1, "zz",
+                                   2, NULL, 0, "key", 3, "ad", 2, 32, out));
+    unhex("4038a4e91eca691adb2a3699a94c3c802be741233bd9c4b0ba48a2b50ac0d8dd",
+          expect, sizeof expect);
+    ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 32));
+    ASSERT_OK_UNLESS(!have_blake2, GPG_ERR_MAC_ALGO,
+                     kdf_derive_hd(GCRY_KDF_HKDF, GCRY_MAC_HMAC_BLAKE2B_512,
+                                   param, 1, "zz", 2, "salt", 4, NULL, 0,
+                                   "ad", 2, 32, out));
+    unhex("edea92ddfca13d6f48c902c5f12289859680aa51fae51f987c358d302e19e04e",
+          expect, sizeof expect);
+    ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 32));
+}
+
 TEST(argument_validation)
 {
     unsigned char out[32];
@@ -976,6 +1128,7 @@ main(void)
     RUN_TEST(onestep_kdf_vectors);
     RUN_TEST(hkdf_vectors);
     RUN_TEST(x963_vectors);
+    RUN_TEST(truncated_blake2);
     RUN_TEST(argument_validation);
     RUN_TEST(null_buffer_arguments);
     return TEST_RESULT();
