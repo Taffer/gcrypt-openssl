@@ -1049,17 +1049,11 @@ TEST(argument_checks)
     gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
     gcry_mpi_t b = gcry_mpi_set_ui(NULL, 3);
     gcry_mpi_t o;
-    gcry_mpi_t c0;
-    gcry_mpi_t c5;
-    gcry_mpi_t cm1;
-    gcry_mpi_t c9;
     unsigned int ui = 42;
     unsigned int nbits = 42;
     unsigned char sentinel[1] = { 'x' };
     unsigned char *abuf = sentinel;
     size_t nw = 42;
-    int saved;
-    int devnull;
 
     ASSERT_NOT_NULL(a);
     ASSERT_NOT_NULL(b);
@@ -1121,34 +1115,8 @@ TEST(argument_checks)
     ASSERT_NULL(gcry_mpi_get_opaque(NULL, &nbits));
     ASSERT_EQ(42, nbits);
 
-    /* Unknown constants are reported (on the log) and yield NULL. */
-    fflush(stderr);
-    saved = dup(2);
-    devnull = open("/dev/null", O_WRONLY);
-
-    if (saved >= 0 && devnull >= 0) {
-        dup2(devnull, 2);
-    }
-
-    c0 = _gcry_mpi_get_const(0);
-    c5 = _gcry_mpi_get_const(5);
-    cm1 = _gcry_mpi_get_const(-1);
-    c9 = _gcry_mpi_get_const(9);
-    fflush(stderr);
-
-    if (saved >= 0) {
-        dup2(saved, 2);
-        close(saved);
-    }
-
-    if (devnull >= 0) {
-        close(devnull);
-    }
-
-    ASSERT_NULL(c0);
-    ASSERT_NULL(c5);
-    ASSERT_NULL(cm1);
-    ASSERT_NULL(c9);
+    /* An unknown constant selector is a fatal error, so only the valid
+     * selectors can be exercised here. */
     ASSERT_NOT_NULL(_gcry_mpi_get_const(1));
     ASSERT_EQ(0, gcry_mpi_cmp_ui(GCRYMPI_CONST_FOUR, 4));
 

@@ -1738,8 +1738,10 @@ _gcry_mpi_get_const(int no)
     pthread_once(&const_once, init_constants);
 
     if (no < 0 || (size_t)no >= DIM(constants) || !constants[no]) {
-        log_info("invalid mpi constant %d requested\n", no);
-        return NULL;
+        /* Only reachable by bypassing the GCRYMPI_CONST_* macros; a NULL
+         * would merely move the crash to the caller, so stop here with a
+         * message, as the reference library does. */
+        _gcry_log(GCRY_LOG_BUG, "invalid mpi constant %d requested\n", no);
     }
 
     return constants[no];
