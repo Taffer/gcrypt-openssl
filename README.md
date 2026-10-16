@@ -110,6 +110,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
+| `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
 | `GCRYPT_OPENSSL_BENCH_ARGS`         | empty   | Arguments the `bench-compare` target passes to both benchmarks |
 | `OPENSSL_ROOT_DIR`                  | unset   | Where to find OpenSSL 4 if it is not the system one |
@@ -256,6 +257,14 @@ run it, build OpenSSL with `enable-fips`, run `fipsinstall`, and point
 `OPENSSL_CONF` at a configuration that activates the `fips` and `base`
 providers with `fips=yes` as the default property; the library picks that
 up through `OSSL_LIB_CTX_load_config()`.
+
+Chainguard's strict FIPS provider omits some algorithms that FIPS
+approves and OpenSSL's own provider offers. `-DGCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT=ON`
+defines `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` for every target and
+makes the tests accept those omissions; the library itself is unchanged.
+Currently it covers one case: SHA-512/224 may be reported as an unknown
+digest, in which case `test_md` expects `GPG_ERR_DIGEST_ALGO` instead of
+the known answer.
 
 What FIPS mode offers, as seen through OpenSSL 4.0.3's FIPS provider: AES
 in every mode except SIV and GCM-SIV; SHA-1, SHA-2, SHA-3, SHAKE and

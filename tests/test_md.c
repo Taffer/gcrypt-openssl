@@ -301,8 +301,26 @@ TEST(md5_sha1_sha2)
     CHECK(GCRY_MD_SHA512, "abc",
           "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
           "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+#ifdef GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT
+
+    /* Chainguard's strict FIPS provider has no SHA-512/224 even though
+     * FIPS approves it; the algorithm is then reported as unavailable. */
+    if (gcry_md_test_algo(GCRY_MD_SHA512_224)) {
+        gcry_md_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_SHA512_224));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   gcry_md_open(&hd, GCRY_MD_SHA512_224, 0));
+        ASSERT_NULL(hd);
+    } else {
+        CHECK(GCRY_MD_SHA512_224, "abc",
+              "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa");
+    }
+
+#else
     CHECK(GCRY_MD_SHA512_224, "abc",
           "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa");
+#endif
     CHECK(GCRY_MD_SHA512_256, "abc",
           "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23");
 }

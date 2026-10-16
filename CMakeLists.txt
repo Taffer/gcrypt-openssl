@@ -66,6 +66,10 @@ option(GCRYPT_OPENSSL_FIPS
        "Start the library in FIPS mode by default (as if the system asked
        for it) and define GCRYPT_OPENSSL_FIPS for every target" OFF
 )
+option(GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT
+       "Adapt the tests to Chainguard's strict FIPS provider, which omits
+       some approved algorithms (currently: SHA-512/224)" OFF
+)
 
 if(NOT GCRYPT_OPENSSL_BUILD_SHARED AND NOT GCRYPT_OPENSSL_BUILD_STATIC)
     message(FATAL_ERROR "At least one of GCRYPT_OPENSSL_BUILD_SHARED or "
@@ -83,6 +87,14 @@ endif()
 if(GCRYPT_OPENSSL_FIPS)
     add_compile_definitions(GCRYPT_OPENSSL_FIPS=1)
     message(STATUS "FIPS mode enabled by default (GCRYPT_OPENSSL_FIPS)")
+endif()
+
+# Chainguard's strict FIPS provider leaves out some algorithms that FIPS
+# approves and OpenSSL's own provider offers. The definition only changes
+# what the tests expect; the library needs no adjustment.
+if(GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT)
+    add_compile_definitions(GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT=1)
+    message(STATUS "Tests adapted to the Chainguard strict FIPS provider")
 endif()
 
 # ---------------------------------------------------------------------------
