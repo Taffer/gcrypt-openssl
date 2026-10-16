@@ -22,14 +22,17 @@
 static int
 run_child(void (*fn)(void))
 {
-    pid_t pid = fork();
+    pid_t pid;
     int status = 0;
+
+    fflush(NULL); /* The child's exit() must not replay our buffers. */
+    pid = fork();
 
     if (pid == 0) {
         /* The children deliberately die noisily; keep the test log clean. */
         fclose(stderr);
         fn();
-        _exit(0);
+        test_child_exit(0);
     }
 
     if (pid < 0) {
@@ -104,10 +107,10 @@ fatal_exit42(void *opaque, int rc, const char *text)
 
     /* GPG_ERR_ENOMEM carries the system error bit. */
     if (rc == (int)GPG_ERR_ENOMEM && text && strlen(text) > 0) {
-        _exit(42);
+        test_child_exit(42);
     }
 
-    _exit(43);
+    test_child_exit(43);
 }
 
 /* --- in-process tests ----------------------------------------------------- */
@@ -291,20 +294,20 @@ child_disable_secmem_fips(void)
     char *s;
 
     if (gcry_control(GCRYCTL_DISABLE_SECMEM)) {
-        _exit(20);
+        test_child_exit(20);
     }
 
     p = gcry_malloc_secure(32);
 
     if (!p || !gcry_is_secure(p)) {
-        _exit(21);
+        test_child_exit(21);
     }
 
     memcpy(p, "still", 6);
     s = gcry_strdup(p);
 
     if (!s || !gcry_is_secure(s) || strcmp(s, "still")) {
-        _exit(22);
+        test_child_exit(22);
     }
 
     gcry_free(s);
@@ -312,16 +315,16 @@ child_disable_secmem_fips(void)
     p = gcry_xmalloc_secure(8);
 
     if (!p || !gcry_is_secure(p)) {
-        _exit(23);
+        test_child_exit(23);
     }
 
     gcry_free(p);
 
     if (gcry_control(GCRYCTL_TERM_SECMEM)) {
-        _exit(24);
+        test_child_exit(24);
     }
 
-    _exit(0);
+    test_child_exit(0);
 }
 
 static void
@@ -335,20 +338,20 @@ child_disable_secmem(void)
     }
 
     if (gcry_control(GCRYCTL_DISABLE_SECMEM)) {
-        _exit(10);
+        test_child_exit(10);
     }
 
     p = gcry_malloc_secure(32);
 
     if (!p || gcry_is_secure(p)) {
-        _exit(11);
+        test_child_exit(11);
     }
 
     memcpy(p, "plain", 6);
     s = gcry_strdup(p);
 
     if (!s || gcry_is_secure(s) || strcmp(s, "plain")) {
-        _exit(12);
+        test_child_exit(12);
     }
 
     gcry_free(s);
@@ -356,23 +359,23 @@ child_disable_secmem(void)
     p = gcry_xmalloc_secure(8);
 
     if (!p || gcry_is_secure(p)) {
-        _exit(13);
+        test_child_exit(13);
     }
 
     gcry_free(p);
     p = gcry_calloc_secure(4, 4);
 
     if (!p || gcry_is_secure(p)) {
-        _exit(14);
+        test_child_exit(14);
     }
 
     gcry_free(p);
 
     if (gcry_control(GCRYCTL_TERM_SECMEM)) {
-        _exit(15);
+        test_child_exit(15);
     }
 
-    _exit(0);
+    test_child_exit(0);
 }
 
 TEST(disable_secmem_in_child)
@@ -396,7 +399,7 @@ child_fatal_handler(void)
 
     if (gcry_fips_mode_active()) {
         if (!p || fails_left != 1000) {
-            _exit(2);
+            test_child_exit(2);
         }
 
         gcry_free(p);
@@ -404,7 +407,7 @@ child_fatal_handler(void)
     }
 
     free(p);
-    _exit(1); /* Unreachable. */
+    test_child_exit(1); /* Unreachable. */
 }
 
 TEST(fatal_handler_called)
@@ -426,7 +429,7 @@ child_fatal_abort(void)
 
     if (gcry_fips_mode_active()) {
         if (!s || fails_left != 1000) {
-            _exit(2);
+            test_child_exit(2);
         }
 
         gcry_free(s);
@@ -434,7 +437,7 @@ child_fatal_abort(void)
     }
 
     free(s);
-    _exit(1); /* Unreachable. */
+    test_child_exit(1); /* Unreachable. */
 }
 
 TEST(fatal_without_handler_aborts)
@@ -449,10 +452,10 @@ fatal_inv_arg_exit44(void *opaque, int rc, const char *text)
     (void)opaque;
 
     if (rc == (int)GPG_ERR_INV_ARG && text && strstr(text, "gcry_xstrdup")) {
-        _exit(44);
+        test_child_exit(44);
     }
 
-    _exit(45);
+    test_child_exit(45);
 }
 
 static void
@@ -463,7 +466,7 @@ child_xstrdup_null(void)
     gcry_set_fatalerror_handler(fatal_inv_arg_exit44, NULL);
     s = gcry_xstrdup(NULL);
     free(s);
-    _exit(1); /* Unreachable. */
+    test_child_exit(1); /* Unreachable. */
 }
 
 TEST(xstrdup_null_is_fatal)

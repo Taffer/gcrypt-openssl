@@ -145,7 +145,7 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | (alias only) | `gcrypt-openssl::gcrypt-openssl` | The shared library when built, else the static one; what the tests and benchmarks link |
 | `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
 | `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
-| `test_version` ... `test_secmem` (16 programs) | | One executable and CTest entry per public module; link the shared library |
+| `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
 | `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
 | `test_version_static` | | `test_version.c` linked against the static library, to prove both flavours link and run |
 | `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
@@ -168,7 +168,7 @@ S2K, RSA encodings). `ctest --preset debug` runs everything, including the
 export check:
 
 ```sh
-ctest --preset debug                    # all 20 entries
+ctest --preset debug                    # all 21 entries
 ctest --preset debug -R 'cipher|md'     # by name
 build-debug/tests/test_pk               # one program directly
 ```
@@ -242,7 +242,10 @@ both options. With an OpenSSL that has no `fips` module (such as the one
 `scripts/build-openssl.sh` produces) the library silently runs in non-FIPS
 mode.
 
-The test suite passes in genuine FIPS mode. Every test program branches on
+The test suite passes in genuine FIPS mode. `test_fips` covers the
+controls that only work before initialisation (`GCRYCTL_FORCE_FIPS_MODE`,
+`GCRYCTL_NO_FIPS_MODE`) in forked children and the
+`GCRYCTL_FIPS_REJECT_NON_FIPS` flags. Every other test program branches on
 `gcry_fips_mode_active()`: algorithms the FIPS provider lacks are asserted
 to fail with the family's unknown-algorithm code, FIPS-only parameter
 rules are asserted (HMAC keys of at least 14 bytes, PBKDF2 with a salt of

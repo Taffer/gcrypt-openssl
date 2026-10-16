@@ -58,13 +58,16 @@ log_reset(void)
 static int
 run_child(void (*fn)(void))
 {
-    pid_t pid = fork();
+    pid_t pid;
     int status = 0;
+
+    fflush(NULL); /* The child's exit() must not replay our buffers. */
+    pid = fork();
 
     if (pid == 0) {
         fclose(stderr);
         fn();
-        _exit(0);
+        test_child_exit(0);
     }
 
     if (pid < 0) {
@@ -156,7 +159,7 @@ child_wrong_context_type(void)
     gcry_ctx_t ctx = _gcry_ctx_alloc(7, 8, NULL);
     void *p = _gcry_ctx_get_pointer(ctx, 8); /* Must not return. */
 
-    _exit(p ? 1 : 2);
+    test_child_exit(p ? 1 : 2);
 }
 
 TEST(wrong_context_type_is_a_bug)
@@ -245,10 +248,10 @@ fatal_handler(void *opaque, int rc, const char *text)
 
     if (rc == (int)GPG_ERR_INTERNAL && text
         && !strcmp(text, "Internal error")) {
-        _exit(42);
+        test_child_exit(42);
     }
 
-    _exit(43);
+    test_child_exit(43);
 }
 
 static void
@@ -284,7 +287,7 @@ child_log_unknown_level(void)
     _gcry_log(GCRY_LOG_WARN, "warn\n");
     _gcry_log(GCRY_LOG_ERROR, "error\n");
     _gcry_log(GCRY_LOG_CONT, "cont\n");
-    _exit(7);
+    test_child_exit(7);
 }
 
 TEST(fatal_paths)
@@ -303,13 +306,13 @@ static void
 child_disable_secmem(void)
 {
     if (_gcry_secmem_is_disabled()) {
-        _exit(1);
+        test_child_exit(1);
     }
 
     _gcry_secmem_disable();
 
     if (!_gcry_secmem_is_disabled()) {
-        _exit(2);
+        test_child_exit(2);
     }
 
     /* Allocations still work, they are just not secure. */
@@ -317,14 +320,14 @@ child_disable_secmem(void)
         void *p = _gcry_malloc_secure(16);
 
         if (!p || _gcry_is_secure(p)) {
-            _exit(3);
+            test_child_exit(3);
         }
 
         _gcry_free(p);
     }
     _gcry_secmem_init(4096);
     _gcry_secmem_term();
-    _exit(0);
+    test_child_exit(0);
 }
 
 TEST(secmem_disable)

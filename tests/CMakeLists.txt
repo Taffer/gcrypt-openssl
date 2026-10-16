@@ -20,6 +20,7 @@ set(GCRYPT_OPENSSL_TESTS
     test_ec
     test_global
     test_secmem
+    test_fips
 )
 
 # Tests of internal helpers link the static library so that symbols hidden

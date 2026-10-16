@@ -5,6 +5,7 @@
 #define GCRYPT_OPENSSL_TEST_COMMON_H
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int test_failures_ = 0;
@@ -107,6 +108,16 @@ static int test_count_ = 0;
             return;                                                          \
         }                                                                    \
     } while (0)
+
+/* Leave a forked test child with CODE.  This is exit(), not _exit(): a
+ * coverage build flushes the library's counters from a destructor that
+ * only exit() runs.  Callers must fflush(NULL) before fork() so that the
+ * child does not re-emit the parent's buffered output. */
+static inline void
+test_child_exit(int code)
+{
+    exit(code);
+}
 
 /* EXPR must succeed, unless the library runs in FIPS mode, where the
  * operation is not approved and must fail with CODE instead. */
