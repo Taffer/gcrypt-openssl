@@ -539,6 +539,18 @@ argon2_open(gcry_kdf_hd_t h)
         return GPG_ERR_INV_VALUE;
     }
 
+#if ULONG_MAX > UINT32_MAX
+
+    /* Argon2 (RFC 9106, 3.1) defines t_cost, m_cost and the lane count as
+     * 32-bit quantities and OpenSSL takes them as such: a wider value
+     * must not be truncated into a weaker parameter set. */
+    if (h->param[1] > UINT32_MAX || h->param[2] > UINT32_MAX
+        || h->param[3] > UINT32_MAX) {
+        return GPG_ERR_INV_VALUE;
+    }
+
+#endif
+
     m_cost = h->param[2];
 
     if (m_cost > SIZE_MAX / 1024) {

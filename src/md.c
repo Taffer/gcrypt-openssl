@@ -435,24 +435,33 @@ crc_tables_init(void)
     }
 }
 
+/* A little-endian 32-bit word, whatever the host's byte order.  Compilers
+ * turn this into a single load on little-endian targets. */
+static uint32_t
+load_le32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
+           | ((uint32_t)p[3] << 24);
+}
+
 static uint32_t
 crc32_update(uint32_t crc, const unsigned char *buf, size_t len)
 {
     pthread_once(&crc_tables_once, crc_tables_init);
 
     /* Align to eight bytes so the wide loop reads naturally aligned words
-     * (through memcpy, so no alignment is actually assumed). */
+     * (assembled from bytes, so no alignment is actually assumed). */
     while (len && ((uintptr_t)buf & 7u)) {
         crc = crc32_table[0][(crc ^ *buf++) & 0xffu] ^ (crc >> 8);
         len--;
     }
 
+    /* Slicing-by-8: the tables are indexed by the input bytes in stream
+     * order, so the words must be read little-endian on every host. */
     while (len >= 8) {
-        uint32_t lo;
-        uint32_t hi;
+        uint32_t lo = load_le32(buf);
+        uint32_t hi = load_le32(buf + 4);
 
-        memcpy(&lo, buf, 4);
-        memcpy(&hi, buf + 4, 4);
         lo ^= crc;
         crc = crc32_table[7][lo & 0xffu]
               ^ crc32_table[6][(lo >> 8) & 0xffu]
@@ -498,6 +507,7 @@ struct md_entry {
     EVP_MAC_CTX *macctx;      /* HMAC or keyed BLAKE2. */
     int keyed;                /* MAC context is in use. */
     int unkeyed_hmac;         /* HMAC entry still waiting for its key. */
+    int failed;               /* An update or final failed: no digest. */
     unsigned char *cust_n;    /* cSHAKE function name. */
     size_t cust_nlen;
     unsigned char *cust_s;    /* cSHAKE customisation string. */
@@ -700,6 +710,7 @@ static gcry_err_code_t
 entry_reset(struct gcry_md_context *ctx, struct md_entry *e)
 {
     e->have_digest = 0;
+    e->failed = 0;
     memset(e->digest, 0, sizeof e->digest);
 
     if (e->spec->flags & MD_F_CRC) {
@@ -758,9 +769,12 @@ entry_write(struct md_entry *e, const unsigned char *buf, size_t len)
         return;
     }
 
+    /* gcry_md_write cannot report a failure; remember it so that the read
+     * that would hand out a wrong digest fails instead. */
     if (e->keyed) {
         if (!EVP_MAC_update(e->macctx, buf, len)) {
             ERR_clear_error();
+            e->failed = 1;
         }
 
         return;
@@ -768,6 +782,7 @@ entry_write(struct md_entry *e, const unsigned char *buf, size_t len)
 
     if (!EVP_DigestUpdate(e->mdctx, buf, len)) {
         ERR_clear_error();
+        e->failed = 1;
     }
 }
 
@@ -802,11 +817,8 @@ entry_final(struct md_entry *e)
 
     if (e->unkeyed_hmac) {
         /* No key was ever set and the provider will not compute the
-         * empty-key HMAC the reference library would: there is no
-         * digest to hand out. */
-        log_error("HMAC-%s handle was never keyed\n", e->spec->name);
-        memset(e->digest, 0, sizeof e->digest);
-        e->have_digest = 1;
+         * empty-key HMAC the reference library would: there is no digest
+         * to hand out, and reading one is fatal (see entry_check). */
         return;
     }
 
@@ -815,6 +827,7 @@ entry_final(struct md_entry *e)
 
         if (!EVP_MAC_final(e->macctx, e->digest, &outl, sizeof e->digest)) {
             ERR_clear_error();
+            e->failed = 1;
         }
 
         e->have_digest = 1;
@@ -831,10 +844,33 @@ entry_final(struct md_entry *e)
 
         if (!EVP_DigestFinal_ex(e->mdctx, e->digest, &outl)) {
             ERR_clear_error();
+            e->failed = 1;
         }
     }
 
     e->have_digest = 1;
+}
+
+/* Abort rather than hand out a digest E cannot provide: the reference
+ * library cannot fail in either way, so callers of gcry_md_read have no
+ * means to check, and a zeroed or stale digest would pass as genuine. */
+static void
+entry_check(const struct md_entry *e, const char *what)
+{
+    char text[128];
+
+    if (e->unkeyed_hmac) {
+        snprintf(text, sizeof text,
+                 "%s: HMAC-%s handle was never keyed and the provider "
+                 "refuses the empty key", what, e->spec->name);
+        _gcry_fatal_error(GPG_ERR_NO_KEY, text);
+    }
+
+    if (e->failed) {
+        snprintf(text, sizeof text, "%s: %s digest computation failed",
+                 what, e->spec->name);
+        _gcry_fatal_error(GPG_ERR_INTERNAL, text);
+    }
 }
 
 static void
@@ -866,6 +902,7 @@ entry_dup(struct gcry_md_context *ctx, const struct md_entry *src)
     e->have_digest = src->have_digest;
     e->keyed = src->keyed;
     e->unkeyed_hmac = src->unkeyed_hmac;
+    e->failed = src->failed;
     memcpy(e->digest, src->digest, sizeof e->digest);
 
     if (src->md) {
@@ -1576,15 +1613,17 @@ gcry_md_read(gcry_md_hd_t hd, int algo)
                           "requested algo not in md context");
     }
 
-    if ((e->spec->flags & MD_F_XOF) && !e->have_digest) {
+    if ((e->spec->flags & MD_F_XOF) && !e->have_digest && !e->failed) {
         /* Fixed-length output of an XOF: the first mdlen bytes. */
         if (!EVP_DigestSqueeze(e->mdctx, e->digest, e->spec->mdlen)) {
             ERR_clear_error();
+            e->failed = 1;
         }
 
         e->have_digest = 1;
     }
 
+    entry_check(e, "gcry_md_read");
     return e->digest;
 }
 
@@ -1604,7 +1643,14 @@ gcry_md_extract(gcry_md_hd_t hd, int algo, void *buffer, size_t length)
         return GCRY_ERR(GPG_ERR_DIGEST_ALGO);
     }
 
+    /* Unlike gcry_md_read this can report: an earlier failed update means
+     * the output would be wrong, so it is an error, not a result. */
+    if (e->failed) {
+        return GCRY_ERR(GPG_ERR_INTERNAL);
+    }
+
     if (length && !EVP_DigestSqueeze(e->mdctx, buffer, length)) {
+        e->failed = 1;
         return GCRY_ERR(_gcry_err_from_openssl(GPG_ERR_INTERNAL));
     }
 

@@ -898,6 +898,40 @@ TEST(truncated_blake2)
     ASSERT_TRUE(!have_blake2 || !memcmp(expect, out, 32));
 }
 
+/* Argon2 defines its cost parameters as 32-bit quantities; a wider value
+ * is an error, not a truncation into a cheaper derivation. */
+TEST(argon2_wide_parameters)
+{
+    unsigned long param[4] = { 32, 3, 32, 1 };
+    gcry_kdf_hd_t hd;
+    size_t i;
+
+    if (sizeof(unsigned long) <= 4) {
+        return; /* Cannot be expressed. */
+    }
+
+    /* t_cost, m_cost and the lane count in turn. */
+    for (i = 1; i < 4; i++) {
+        unsigned long saved = param[i];
+
+        param[i] = 0xffffffffUL + 1UL;
+        ASSERT_ERR(GPG_ERR_INV_VALUE,
+                   gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param,
+                                 4, "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+        param[i] = 0xffffffffUL + 2UL;
+        ASSERT_ERR(GPG_ERR_INV_VALUE,
+                   gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param,
+                                 4, "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+        param[i] = saved;
+    }
+
+    /* Three parameters imply one lane; a wide t_cost is still caught. */
+    param[1] = 0xffffffffUL + 1UL;
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 3,
+                             "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+}
+
 TEST(argument_validation)
 {
     unsigned char out[32];
@@ -1129,6 +1163,7 @@ main(void)
     RUN_TEST(hkdf_vectors);
     RUN_TEST(x963_vectors);
     RUN_TEST(truncated_blake2);
+    RUN_TEST(argon2_wide_parameters);
     RUN_TEST(argument_validation);
     RUN_TEST(null_buffer_arguments);
     return TEST_RESULT();

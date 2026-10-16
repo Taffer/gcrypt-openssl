@@ -1193,18 +1193,17 @@ TEST(hmac_unkeyed_and_key_lengths)
 
     /* Without setkey the reference library computes with an empty key.
      * The FIPS provider refuses an empty key, so there such a handle has
-     * nothing to return and hands out zeros. */
+     * nothing to return and reading it is fatal (see hmac_never_keyed);
+     * writing to it is not. */
     ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
     gcry_md_write(hd, "abc", 3);
 
-    if (gcry_fips_mode_active()) {
-        memset(expect, 0, sizeof expect);
-    } else {
+    if (!gcry_fips_mode_active()) {
         unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
               expect, sizeof expect);
+        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
     }
 
-    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
     /* Keying afterwards makes it a proper HMAC handle. */
     ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
     gcry_md_write(hd, hi, 8);
@@ -1422,6 +1421,112 @@ TEST(buffer_argument_checks)
                gcry_md_hash_buffers(GCRY_MD_SHA256, 0, out, NULL, 0));
 }
 
+/* The never-keyed HMAC children: each reads a digest from a handle whose
+ * key was never accepted, which is fatal where the provider refuses the
+ * empty key (FIPS mode) and the empty-key HMAC otherwise. */
+static void
+never_keyed_read(void)
+{
+    gcry_md_hd_t hd;
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC)) {
+        test_child_exit(98);
+    }
+
+    gcry_md_write(hd, "abc", 3);
+    gcry_md_read(hd, 0);
+    test_child_exit(0);
+}
+
+static void
+never_keyed_null_key_read(void)
+{
+    gcry_md_hd_t hd;
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC)) {
+        test_child_exit(98);
+    }
+
+    (void)gcry_md_setkey(hd, NULL, 0);
+    gcry_md_write(hd, "abc", 3);
+    gcry_md_read(hd, 0);
+    test_child_exit(0);
+}
+
+static void
+never_keyed_empty_key_read(void)
+{
+    gcry_md_hd_t hd;
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC)) {
+        test_child_exit(98);
+    }
+
+    (void)gcry_md_setkey(hd, "", 0);
+    gcry_md_write(hd, "abc", 3);
+    gcry_md_read(hd, 0);
+    test_child_exit(0);
+}
+
+/* Finalising is harmless; it is the read that has nothing to give. */
+static void
+never_keyed_finalize_then_read(void)
+{
+    gcry_md_hd_t hd;
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC)) {
+        test_child_exit(98);
+    }
+
+    gcry_md_write(hd, "abc", 3);
+
+    if (gcry_md_ctl(hd, GCRYCTL_FINALIZE, NULL, 0)) {
+        test_child_exit(97);
+    }
+
+    gcry_md_read(hd, 0);
+    test_child_exit(0);
+}
+
+/* A copy of an unkeyed handle is just as unkeyed. */
+static void
+never_keyed_copy_read(void)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC)) {
+        test_child_exit(98);
+    }
+
+    gcry_md_write(hd, "abc", 3);
+
+    if (gcry_md_copy(&copy, hd)) {
+        test_child_exit(97);
+    }
+
+    gcry_md_close(hd);
+    gcry_md_read(copy, 0);
+    test_child_exit(0);
+}
+
+/* The fatal error handler, where honoured, sees the missing key. */
+static void
+never_keyed_handler_exit(void *opaque, int rc, const char *text)
+{
+    (void)opaque;
+    test_child_exit(rc == GPG_ERR_NO_KEY
+                    && strstr(text, "HMAC-SHA256 handle was never keyed")
+                    ? 45 : 44);
+}
+
+static void
+never_keyed_read_with_handler(void)
+{
+    gcry_set_fatalerror_handler(never_keyed_handler_exit, NULL);
+    never_keyed_read();
+}
+
 TEST(hmac_never_keyed)
 {
     gcry_md_hd_t hd;
@@ -1433,44 +1538,48 @@ TEST(hmac_never_keyed)
     memset(key, 0x0b, sizeof key);
     unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
           tc1, sizeof tc1);
+    /* HMAC-SHA256 with the empty key, as the reference library has it. */
+    unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
+          expect, sizeof expect);
 
-    if (fips) {
-        /* The provider refuses the empty key the reference library would
-         * compute with, so a handle that was never keyed has nothing to
-         * hand out: all zeros, with an error on the log. */
-        memset(expect, 0, sizeof expect);
-    } else {
-        /* HMAC-SHA256 with the empty key, as the reference library has
-         * it. */
-        unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
-              expect, sizeof expect);
-    }
+    /* The provider in FIPS mode refuses the empty key the reference
+     * library would compute with, so a handle that was never keyed has
+     * nothing to hand out: reading it is fatal rather than a MAC of
+     * zeros an application that forgot gcry_md_setkey would accept.
+     * Outside FIPS mode the reads succeed and the children exit
+     * normally.  The handler is honoured outside FIPS mode only, so in
+     * FIPS mode even the child that sets one aborts. */
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0, run_child(never_keyed_read));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0, run_child(never_keyed_null_key_read));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0,
+              run_child(never_keyed_empty_key_read));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0,
+              run_child(never_keyed_finalize_then_read));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0, run_child(never_keyed_copy_read));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 0,
+              run_child(never_keyed_read_with_handler));
 
     log_reset();
     gcry_set_log_handler(capture_log, NULL);
     ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
     gcry_md_write(hd, "abc", 3);
-    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
-    ASSERT_EQ(fips ? 1 : 0, logcalls);
 
-    if (fips) {
-        ASSERT_EQ(GCRY_LOG_ERROR, loglevel);
-        ASSERT_NOT_NULL(strstr(logbuf, "HMAC-SHA256 handle was never keyed"));
+    if (!fips) {
+        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+        ASSERT_EQ(0, logcalls);
     }
 
     /* An explicit empty key, as NULL or as an empty buffer, is the same
      * thing: outside FIPS mode it is the key the handle computed with
      * anyway, inside it is refused and the handle stays unkeyed. */
-    log_reset();
     ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, NULL, 0));
-    gcry_md_write(hd, "abc", 3);
-    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
-    ASSERT_EQ(fips ? 1 : 0, logcalls);
-    log_reset();
     ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, "", 0));
-    gcry_md_write(hd, "abc", 3);
-    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
-    ASSERT_EQ(fips ? 1 : 0, logcalls);
+
+    if (!fips) {
+        gcry_md_write(hd, "abc", 3);
+        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+        ASSERT_EQ(0, logcalls);
+    }
 
     /* A NULL key with a length is an argument error in both modes. */
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_setkey(hd, NULL, 5));
@@ -1483,6 +1592,52 @@ TEST(hmac_never_keyed)
     ASSERT_EQ(0, logcalls);
     gcry_set_log_handler(NULL, NULL);
     gcry_md_close(hd);
+}
+
+/* The slicing-by-8 CRC-32 loop must read its words little-endian on every
+ * host, so it agrees with the bytewise loop (and the reference library)
+ * on a buffer long enough to run it, starting at an odd address. */
+TEST(crc_wide_path_matches_bytewise)
+{
+    static const struct {
+        int algo;
+        const char *hex;
+    } tv[] = {
+        { GCRY_MD_CRC32, "bda1d3fe" },
+        { GCRY_MD_CRC32_RFC1510, "bbaac47e" },
+        { GCRY_MD_CRC24_RFC2440, "9ba5ba" },
+    };
+    unsigned char data[1000 + 8];
+    size_t i;
+
+    for (i = 0; i < sizeof data; i++) {
+        data[i] = (unsigned char)(i * 131 + 7);
+    }
+
+    for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
+        unsigned char want[4];
+        unsigned char wide[4];
+        gcry_md_hd_t hd;
+        size_t off;
+        unsigned int dlen = gcry_md_get_algo_dlen(tv[i].algo);
+
+        /* The reference library's value, computed on x86. */
+        unhex(tv[i].hex, want, sizeof want);
+
+        /* The wide path: one unaligned write of all 1000 bytes. */
+        gcry_md_hash_buffer(tv[i].algo, wide, data + 1, 1000);
+        ASSERT_MEM_EQ(want, wide, dlen);
+
+        /* The bytewise path: one byte at a time never reaches it. */
+        ASSERT_OK(gcry_md_open(&hd, tv[i].algo, 0));
+
+        for (off = 0; off < 1000; off++) {
+            gcry_md_write(hd, data + 1 + off, 1);
+        }
+
+        ASSERT_MEM_EQ(want, gcry_md_read(hd, tv[i].algo), dlen);
+        gcry_md_close(hd);
+    }
 }
 
 TEST(keyed_blake2_reset_and_rekey)
@@ -1895,6 +2050,7 @@ main(void)
     RUN_TEST(hash_buffers_edges);
     RUN_TEST(buffer_argument_checks);
     RUN_TEST(hmac_never_keyed);
+    RUN_TEST(crc_wide_path_matches_bytewise);
     RUN_TEST(keyed_blake2_reset_and_rekey);
     RUN_TEST(cshake_function_name);
     RUN_TEST(hmac_blake2_and_misc_edges);
