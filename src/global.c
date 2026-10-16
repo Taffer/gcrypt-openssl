@@ -18,6 +18,7 @@ static int any_init_done;
 static int init_finished;
 static int force_fips_mode = -1; /* -1 undecided, 0 off, 1 on. */
 static int fips_mode;
+static int fips_error_state; /* FIPS mode required but not established. */
 static int no_fips_mode_required;
 static unsigned int debug_flags;
 static int preferred_rng_type;
@@ -90,6 +91,30 @@ fips_provider_only(void)
            && !OSSL_PROVIDER_available(libctx, "default");
 }
 
+/* FIPS mode was required (by the system, the build, the application or
+ * a FIPS-only provider set) but the FIPS provider cannot be activated.
+ * The reference library then enters an error state in which it is not
+ * operational: the self test reports a failure and every cryptographic
+ * operation is refused.  The library stays in FIPS mode, so the policy
+ * checks of the algorithm modules remain in force, and the fips=yes
+ * property query is kept as the default: no algorithm of the providers
+ * that are present satisfies it, so every fetch fails and nothing runs on
+ * a non-validated implementation.  _gcry_fips_error_state() lets the
+ * modules report GPG_ERR_NOT_OPERATIONAL explicitly. */
+static void
+enter_fips_error_state(void)
+{
+    fips_error_state = 1;
+    fips_mode = 1;
+
+    if (!EVP_default_properties_enable_fips(libctx, 1)) {
+        ERR_clear_error();
+    }
+
+    log_error("FIPS mode is required but no FIPS provider could be "
+              "activated: the library is not operational\n");
+}
+
 static void
 do_global_init(void)
 {
@@ -122,12 +147,20 @@ do_global_init(void)
 
     if (want_fips && !no_fips_mode_required) {
         fips_mode = try_enable_fips();
+
+        if (!fips_mode) {
+            enter_fips_error_state();
+        }
     } else if (EVP_default_properties_is_fips_enabled(libctx) > 0) {
         fips_mode = 1;
     } else if (fips_provider_only()) {
         /* Make the property explicit so that the legacy provider loaded
          * above cannot supply non-approved algorithms either. */
         fips_mode = try_enable_fips();
+
+        if (!fips_mode) {
+            enter_fips_error_state();
+        }
     }
 
     any_init_done = 1;
@@ -160,6 +193,16 @@ _gcry_fips_mode(void)
     }
 
     return fips_mode;
+}
+
+int
+_gcry_fips_error_state(void)
+{
+    if (!any_init_done) {
+        return 0;
+    }
+
+    return fips_error_state;
 }
 
 unsigned int
@@ -395,41 +438,49 @@ strbuf_addf(struct strbuf *sb, const char *fmt, ...)
     }
 }
 
-static const char *
-fips_provider_version(void)
+static pthread_once_t fips_version_once = PTHREAD_ONCE_INIT;
+static char fips_version[64]; /* Empty until known. */
+
+static void
+fips_version_init(void)
 {
-    OSSL_PROVIDER *prov;
-
-    if (!_gcry_fips_mode()) {
-        return "";
-    }
-
-    prov = OSSL_PROVIDER_load(libctx, "fips");
+    OSSL_PROVIDER *prov = OSSL_PROVIDER_load(libctx, "fips");
+    OSSL_PARAM params[2];
+    char *ptr = NULL;
 
     if (!prov) {
         ERR_clear_error();
-        return "";
+        return;
     }
 
     /* The provider answers with a pointer to its own static string; copy
      * it so that the result does not depend on the provider's lifetime. */
-    {
-        OSSL_PARAM params[2];
-        char *ptr = NULL;
-        static char version[64];
+    params[0] = OSSL_PARAM_construct_utf8_ptr("version", &ptr, 0);
+    params[1] = OSSL_PARAM_construct_end();
 
-        params[0] = OSSL_PARAM_construct_utf8_ptr("version", &ptr, 0);
-        params[1] = OSSL_PARAM_construct_end();
-
-        if (OSSL_PROVIDER_get_params(prov, params) && ptr) {
-            snprintf(version, sizeof version, "%s", ptr);
-            return version;
-        }
-
+    if (OSSL_PROVIDER_get_params(prov, params) && ptr) {
+        snprintf(fips_version, sizeof fips_version, "%s", ptr);
+    } else {
         ERR_clear_error();
     }
 
-    return "";
+    /* Drop the reference taken above; whoever activated the provider in
+     * the first place keeps it loaded. */
+    OSSL_PROVIDER_unload(prov);
+}
+
+/* The FIPS provider's version in FIPS mode, "" otherwise.  Computed once:
+ * the string is static and the provider's reference count must not grow
+ * with every configuration report. */
+static const char *
+fips_provider_version(void)
+{
+    if (!_gcry_fips_mode()) {
+        return "";
+    }
+
+    pthread_once(&fips_version_once, fips_version_init);
+    return fips_version;
 }
 
 static void
@@ -511,6 +562,12 @@ print_config(const char *what, struct strbuf *sb)
     if (!what || !strcmp(what, "fips-mode")) {
         strbuf_addf(sb, "fips-mode:%c::%s:\n", _gcry_fips_mode() ? 'y' : 'n',
                     fips_provider_version());
+    }
+
+    /* Not a reference item: whether FIPS mode was required but could not
+     * be established, in which case the library is not operational. */
+    if (!what || !strcmp(what, "fips-error")) {
+        strbuf_addf(sb, "fips-error:%c:\n", fips_error_state ? 'y' : 'n');
     }
 
     if (!what || !strcmp(what, "rng-type")) {
@@ -783,14 +840,26 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_DISABLE_SECMEM_WARN:
+        _gcry_secmem_set_flags(_gcry_secmem_get_flags()
+                               | GCRY_SECMEM_FLAG_NO_WARNING);
+        break;
+
     case GCRYCTL_SUSPEND_SECMEM_WARN:
+        _gcry_secmem_set_flags(_gcry_secmem_get_flags()
+                               | GCRY_SECMEM_FLAG_SUSPEND_WARNING);
+        break;
+
     case GCRYCTL_RESUME_SECMEM_WARN:
+        _gcry_secmem_set_flags(_gcry_secmem_get_flags()
+                               & ~GCRY_SECMEM_FLAG_SUSPEND_WARNING);
+        break;
+
     case GCRYCTL_DISABLE_LOCKED_SECMEM:
     case GCRYCTL_DISABLE_PRIV_DROP:
         break;
 
     case GCRYCTL_AUTO_EXPAND_SECMEM:
-        (void)va_arg(arg_ptr, unsigned int);
+        _gcry_secmem_set_auto_expand(va_arg(arg_ptr, unsigned int));
         break;
 
     case GCRYCTL_USE_SECURE_RNDPOOL:
@@ -884,8 +953,10 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
     }
 
     case GCRYCTL_OPERATIONAL_P:
+        /* "True" (an error code) unless FIPS mode was required and could
+         * not be established. */
         _gcry_global_init();
-        rc = GPG_ERR_GENERAL; /* Always operational. */
+        rc = fips_error_state ? 0 : GPG_ERR_GENERAL;
         break;
 
     case GCRYCTL_FIPS_MODE_P:
@@ -909,9 +980,13 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
     case GCRYCTL_NO_FIPS_MODE:
         if (!any_init_done) {
             force_fips_mode = 0;
-        } else if (!init_finished) {
+        } else if (!init_finished && !fips_mode) {
+            /* Before INITIALIZATION_FINISHED the request may still be
+             * withdrawn, but only while nothing has established FIPS
+             * mode: the OpenSSL context cannot leave it once the fips=yes
+             * property is in force or only the FIPS provider is there,
+             * and the policy checks must not come apart from it. */
             no_fips_mode_required = 1;
-            fips_mode = 0;
         } else {
             rc = GPG_ERR_GENERAL;
         }
@@ -919,7 +994,8 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_SELFTEST:
-        rc = run_selftests();
+        _gcry_global_init();
+        rc = fips_error_state ? GPG_ERR_SELFTEST_FAILED : run_selftests();
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR:

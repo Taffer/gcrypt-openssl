@@ -481,6 +481,142 @@ TEST(secure_and_random)
     gcry_mpi_release(b);
 }
 
+/* Scanning from secure memory gives a secure MPI in every format, the
+ * hex format included (it is parsed through a temporary) and the two's
+ * complement formats with a negative value (they go through an inverted
+ * copy of the input, which must be secure and wiped as well). */
+TEST(scan_from_secure_memory)
+{
+    static const unsigned char neg[] = { 0xff, 0x00, 0x01 };
+    static const unsigned char ssh[] = { 0, 0, 0, 3, 0xff, 0x00, 0x01 };
+    gcry_mpi_t m = NULL;
+    gcry_mpi_t plain;
+    unsigned char *sec;
+    unsigned char *buf = NULL;
+    size_t n = 0;
+    char *hex;
+
+    gcry_control(GCRYCTL_INIT_SECMEM, 16384u, 0);
+    sec = gcry_malloc_secure(32);
+    ASSERT_NOT_NULL(sec);
+
+    strcpy((char *)sec, "-0x0123456789abcdef");
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, sec, 0, NULL));
+    ASSERT_TRUE(gcry_mpi_get_flag(m, GCRYMPI_FLAG_SECURE));
+    ASSERT_TRUE(gcry_mpi_is_neg(m));
+    hex = to_hex(m);
+    ASSERT_STR_EQ("-0123456789ABCDEF", hex);
+    ASSERT_TRUE(gcry_is_secure(hex));
+    gcry_free(hex);
+    gcry_mpi_release(m);
+    m = NULL;
+
+    memcpy(sec, neg, sizeof neg);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_STD, sec, sizeof neg, NULL));
+    ASSERT_TRUE(gcry_mpi_get_flag(m, GCRYMPI_FLAG_SECURE));
+    plain = from_hex("-FFFF");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_EQ(0, gcry_mpi_cmp(m, plain));
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_STD, &buf, &n, m));
+    ASSERT_TRUE(gcry_is_secure(buf));
+    ASSERT_EQ(sizeof neg, n);
+    ASSERT_MEM_EQ(neg, buf, n);
+    gcry_free(buf);
+    gcry_mpi_release(m);
+    m = NULL;
+
+    memcpy(sec, ssh, sizeof ssh);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_SSH, sec, sizeof ssh, NULL));
+    ASSERT_TRUE(gcry_mpi_get_flag(m, GCRYMPI_FLAG_SECURE));
+    ASSERT_EQ(0, gcry_mpi_cmp(m, plain));
+    gcry_mpi_release(m);
+    gcry_mpi_release(plain);
+    gcry_free(sec);
+}
+
+/* Modular exponentiation and inversion with secret operands take
+ * OpenSSL's constant-time paths; the results are the same as with plain
+ * operands, whichever operand is the secure one. */
+TEST(secure_powm_and_invm)
+{
+    static const char *const bases[] = { "2", "3", "0123456789ABCDEF",
+                                         "FFFFFFFFFFFFFFFFFFFFFFFF", "0"
+                                       };
+    static const char *const mods[] = {
+        "7", "3E8", "FFFFFFFFFFFFFFC5", "10000000000000000",
+        "D2A3E29F53B9A1D7CA5C04D6E4A9F2B1C7E8D9F0A1B2C3D4E5F60718293A4B5F"
+    };
+    size_t i;
+    size_t j;
+    int which;
+
+    for (i = 0; i < sizeof bases / sizeof bases[0]; i++) {
+        for (j = 0; j < sizeof mods / sizeof mods[0]; j++) {
+            gcry_mpi_t b = from_hex(bases[i]);
+            gcry_mpi_t e = from_hex("1F3B9D5C7E1A2B4C6D8E9F00112233445566778899AA");
+            gcry_mpi_t m = from_hex(mods[j]);
+            gcry_mpi_t want = gcry_mpi_new(0);
+            gcry_mpi_t want_inv = gcry_mpi_new(0);
+            int have_inv;
+
+            ASSERT_NOT_NULL(b);
+            ASSERT_NOT_NULL(e);
+            ASSERT_NOT_NULL(m);
+            gcry_mpi_powm(want, b, e, m);
+            have_inv = gcry_mpi_invm(want_inv, b, m);
+
+            /* Each operand secure in turn, then the result only. */
+            for (which = 0; which < 4; which++) {
+                gcry_mpi_t sb = gcry_mpi_copy(b);
+                gcry_mpi_t se = gcry_mpi_copy(e);
+                gcry_mpi_t sm = gcry_mpi_copy(m);
+                gcry_mpi_t r = which == 3 ? gcry_mpi_snew(0) : gcry_mpi_new(0);
+                gcry_mpi_t inv = which == 3 ? gcry_mpi_snew(0)
+                                 : gcry_mpi_new(0);
+
+                gcry_mpi_set_flag(which == 0 ? sb : which == 1 ? se : sm,
+                                  GCRYMPI_FLAG_SECURE);
+                gcry_mpi_powm(r, sb, se, sm);
+                ASSERT_EQ(0, gcry_mpi_cmp(want, r));
+                ASSERT_EQ(have_inv, gcry_mpi_invm(inv, sb, sm));
+
+                if (have_inv) {
+                    ASSERT_EQ(0, gcry_mpi_cmp(want_inv, inv));
+                }
+
+                gcry_mpi_release(sb);
+                gcry_mpi_release(se);
+                gcry_mpi_release(sm);
+                gcry_mpi_release(r);
+                gcry_mpi_release(inv);
+            }
+
+            gcry_mpi_release(b);
+            gcry_mpi_release(e);
+            gcry_mpi_release(m);
+            gcry_mpi_release(want);
+            gcry_mpi_release(want_inv);
+        }
+    }
+
+    /* The result may alias an operand. */
+    {
+        gcry_mpi_t a = gcry_mpi_snew(0);
+        gcry_mpi_t m = from_hex("FFFFFFFFFFFFFFC5");
+        gcry_mpi_t want = from_hex("FFFFFFFFFFFFFFC5");
+
+        gcry_mpi_set_ui(a, 3);
+        gcry_mpi_powm(a, a, a, m);
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(a, 27));
+        gcry_mpi_sub_ui(want, want, 1);
+        gcry_mpi_powm(a, a, want, m); /* Fermat: a^(p-1) = 1 mod p. */
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(a, 1));
+        gcry_mpi_release(a);
+        gcry_mpi_release(m);
+        gcry_mpi_release(want);
+    }
+}
+
 TEST(points)
 {
     gcry_mpi_point_t p = gcry_mpi_point_new(0);
@@ -1558,6 +1694,8 @@ main(void)
     RUN_TEST(formats_pgp_ssh);
     RUN_TEST(opaque_and_flags);
     RUN_TEST(secure_and_random);
+    RUN_TEST(scan_from_secure_memory);
+    RUN_TEST(secure_powm_and_invm);
     RUN_TEST(points);
     RUN_TEST(scan_edge_cases);
     RUN_TEST(print_edge_cases);
