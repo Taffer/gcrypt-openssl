@@ -129,6 +129,73 @@ genkey(const char *parms)
     return key;
 }
 
+/* Success normally, the error CODE in FIPS mode (test_common.h may
+ * provide the same macro). */
+#ifndef ASSERT_OK_OR_FIPS_ERR
+#define ASSERT_OK_OR_FIPS_ERR(code, expr)   \
+    do {                                    \
+        if (gcry_fips_mode_active()) {      \
+            ASSERT_ERR(code, expr);         \
+        } else {                            \
+            ASSERT_OK(expr);                \
+        }                                   \
+    } while (0)
+#endif
+
+/* "(sig-val (ALGO RS))", optionally with a leading empty flags list, so
+ * that the same checks run with a DSA key or (in FIPS mode) an ECDSA key. */
+static const char *
+sigval_text(const char *algo, const char *rs, int with_flags)
+{
+    static char buf[256];
+
+    if (with_flags) {
+        snprintf(buf, sizeof buf, "(sig-val (flags) (%s %s))", algo, rs);
+    } else {
+        snprintf(buf, sizeof buf, "(sig-val (%s %s))", algo, rs);
+    }
+
+    return buf;
+}
+
+/* In FIPS mode a non-approved algorithm (DSA, ElGamal) is refused by
+ * every operation, as in the reference library; only the keygrip, a pure
+ * function of the key material, is still computed. */
+static void
+expect_fips_refusal(const char *genparms, const char *keytext,
+                    const char *datatext, const char *sigtext,
+                    const char *enctext)
+{
+    gcry_sexp_t parms = sexp(genparms);
+    gcry_sexp_t key = sexp(keytext);
+    gcry_sexp_t data = sexp(datatext);
+    gcry_sexp_t sig = sexp(sigtext);
+    gcry_sexp_t enc = sexp(enctext);
+    gcry_sexp_t out = NULL;
+    unsigned char grip[20];
+
+    ASSERT_NOT_NULL(parms);
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(data);
+    ASSERT_NOT_NULL(sig);
+    ASSERT_NOT_NULL(enc);
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&out, parms));
+    ASSERT_NULL(out);
+    ASSERT_EQ(0, gcry_pk_get_nbits(key));
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_testkey(key));
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_sign(&out, data, key));
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_verify(sig, data, key));
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_encrypt(&out, data, key));
+    ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_decrypt(&out, enc, key));
+    ASSERT_NULL(out);
+    ASSERT_NOT_NULL(gcry_pk_get_keygrip(key, grip));
+    gcry_sexp_release(parms);
+    gcry_sexp_release(key);
+    gcry_sexp_release(data);
+    gcry_sexp_release(sig);
+    gcry_sexp_release(enc);
+}
+
 /* ------------------------------------------------------------------ */
 /* Keygrips (vectors from the reference test suite)                    */
 /* ------------------------------------------------------------------ */
@@ -670,7 +737,10 @@ TEST(rsa_encrypt_decrypt)
 
 TEST(rsa_keygen)
 {
-    gcry_sexp_t key = genkey("(genkey (rsa (nbits 4:2048) (rsa-use-e 1:3)))");
+    /* FIPS 186 (and so the FIPS provider) wants e >= 65537. */
+    gcry_sexp_t key = genkey(gcry_fips_mode_active()
+                             ? "(genkey (rsa (nbits 4:2048) (rsa-use-e 1:1)))"
+                             : "(genkey (rsa (nbits 4:2048) (rsa-use-e 1:3)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_mpi_t n;
@@ -703,7 +773,7 @@ TEST(rsa_keygen)
     p = param_mpi(priv, "p");
     q = param_mpi(priv, "q");
     u = param_mpi(priv, "u");
-    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 3));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, gcry_fips_mode_active() ? 65537 : 3));
     ASSERT_TRUE(gcry_mpi_cmp(p, q) < 0);
     t = gcry_mpi_new(0);
     gcry_mpi_mul(t, p, q);
@@ -738,6 +808,12 @@ TEST(rsa_keygen)
         parms = sexp("(genkey (foo (nbits 4:1024)))");
         ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&k, parms));
         gcry_sexp_release(parms);
+
+        if (gcry_fips_mode_active()) {
+            parms = sexp("(genkey (rsa (nbits 4:2048) (rsa-use-e 1:3)))");
+            ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&k, parms));
+            gcry_sexp_release(parms);
+        }
     }
 }
 
@@ -787,7 +863,7 @@ TEST(rsa_testkey_detects_corruption)
 
 TEST(dsa)
 {
-    gcry_sexp_t key = genkey("(genkey (dsa (nbits 4:2048) (qbits 3:256)))");
+    gcry_sexp_t key;
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t data = NULL;
@@ -799,6 +875,16 @@ TEST(dsa)
     unsigned char grip1[20];
     unsigned char grip2[20];
 
+    if (gcry_fips_mode_active()) {
+        expect_fips_refusal("(genkey (dsa (nbits 4:2048) (qbits 3:256)))",
+                            key_grips[2].key,
+                            "(data (flags raw) (hash sha256 #" RSA_DIGEST "#))",
+                            "(sig-val (dsa (r #01#) (s #02#)))",
+                            "(enc-val (dsa (a #01#)))");
+        return;
+    }
+
+    key = genkey("(genkey (dsa (nbits 4:2048) (qbits 3:256)))");
     ASSERT_NOT_NULL(key);
     priv = gcry_sexp_find_token(key, "private-key", 0);
     pub = gcry_sexp_find_token(key, "public-key", 0);
@@ -861,7 +947,7 @@ TEST(dsa)
 
 TEST(elgamal)
 {
-    gcry_sexp_t key = genkey("(genkey (elg (nbits 4:1024)))");
+    gcry_sexp_t key;
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t data = NULL;
@@ -872,6 +958,17 @@ TEST(elgamal)
     gcry_mpi_t p;
     gcry_mpi_t factor;
 
+    if (gcry_fips_mode_active()) {
+        expect_fips_refusal("(genkey (elg (nbits 4:1024)))",
+                            "(private-key (elg (p #0b#) (g #02#) (y #04#)"
+                            " (x #03#)))",
+                            "(data (flags raw) (value #01#))",
+                            "(sig-val (elg (r #01#) (s #02#)))",
+                            "(enc-val (elg (a #01#) (b #02#)))");
+        return;
+    }
+
+    key = genkey("(genkey (elg (nbits 4:1024)))");
     ASSERT_NOT_NULL(key);
     priv = gcry_sexp_find_token(key, "private-key", 0);
     pub = gcry_sexp_find_token(key, "public-key", 0);
@@ -1097,10 +1194,54 @@ TEST(ecc_keygen_and_ecdh)
     ASSERT_TRUE(strstr(txt, "(h \"1\")") != NULL);
     free(txt);
     ASSERT_STR_EQ("NIST P-384", gcry_pk_get_curve(pub, 0, NULL));
+    priv = gcry_sexp_find_token(key, "private-key", 0);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags rfc6979 prehash) (hash-algo sha384) (value %s))",
+                              "sample"));
+    ASSERT_OK(gcry_pk_sign(&ciph, data, priv));
+    ASSERT_OK(gcry_pk_verify(ciph, data, pub));
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    gcry_sexp_release(priv);
     gcry_sexp_release(pub);
     gcry_sexp_release(key);
 
-    /* A GOST curve has no OpenSSL NID but works from explicit params. */
+    /* P-521 with SHA-512. */
+    key = genkey("(genkey (ecc (curve \"NIST P-521\")))");
+    ASSERT_NOT_NULL(key);
+    priv = gcry_sexp_find_token(key, "private-key", 0);
+    pub = gcry_sexp_find_token(key, "public-key", 0);
+    ASSERT_EQ(521, gcry_pk_get_nbits(pub));
+    ASSERT_OK(gcry_pk_testkey(priv));
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags rfc6979 prehash) (hash-algo sha512) (value %s))",
+                              "sample"));
+    ASSERT_OK(gcry_pk_sign(&ciph, data, priv));
+    ASSERT_OK(gcry_pk_verify(ciph, data, pub));
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    gcry_sexp_release(priv);
+    gcry_sexp_release(pub);
+    gcry_sexp_release(key);
+
+    /* A GOST curve has no OpenSSL NID but works from explicit params;
+     * FIPS mode does not know it at all (as in the reference library). */
+    if (gcry_fips_mode_active()) {
+        gcry_sexp_t parms = sexp("(genkey (ecc (curve GOST2001-CryptoPro-A)))");
+
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        pub = sexp("(public-key (ecc (curve GOST2001-CryptoPro-A) (q #04#)))");
+        ASSERT_NULL(gcry_pk_get_curve(pub, 0, NULL));
+        ASSERT_EQ(0, gcry_pk_get_nbits(pub));
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags raw) (value #" P256_D "#))"));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_encrypt(&ciph, data, pub));
+        gcry_sexp_release(data);
+        gcry_sexp_release(pub);
+        return;
+    }
+
     key = genkey("(genkey (ecc (curve GOST2001-CryptoPro-A)))");
     ASSERT_NOT_NULL(key);
     priv = gcry_sexp_find_token(key, "private-key", 0);
@@ -1297,11 +1438,18 @@ TEST(ed25519_keygen_and_ed448)
     gcry_sexp_release(sig);
     gcry_sexp_release(data);
 
-    /* Ed25519ctx and Ed25519ph. */
+    /* Ed25519ctx (not approved by FIPS 186-5) and Ed25519ph. */
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags eddsa) (label %s) (value %s))", "ctx", "msg"));
-    ASSERT_OK(gcry_pk_sign(&sig, data, priv));
-    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_sign(&sig, data, priv));
+
+    if (gcry_fips_mode_active()) {
+        sig = sexp("(sig-val (eddsa (r #" RSA_DIGEST "#) (s #" RSA_DIGEST "#)))");
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_verify(sig, data, pub));
+    } else {
+        ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    }
+
     gcry_sexp_release(sig);
     gcry_sexp_release(data);
     ASSERT_OK(gcry_sexp_build(&data, NULL,
@@ -1401,12 +1549,53 @@ TEST(curve25519)
 
     hex_to_bytes(X25519_V1_SCALAR, scalar);
     hex_to_bytes(X25519_V1_U, point);
+    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_ecc_mul_point(7, result, scalar, NULL));
+
+    /* Curve25519 and X448 are not approved: nothing but the keygrip works
+     * in FIPS mode, as in the reference library. */
+    if (gcry_fips_mode_active()) {
+        gcry_sexp_t parms;
+
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result, scalar,
+                                      point));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_ecc_mul_point(GCRY_ECC_CURVE448, result, scalar, NULL));
+        pkey = sexp("(public-key (ecc (curve Curve25519) (flags djb-tweak)"
+                    " (q #40" X25519_BOB_PK "#)))");
+        skey = sexp("(private-key (ecc (curve Curve25519) (flags djb-tweak)"
+                    " (q #40" X25519_BOB_PK "#) (d #" X25519_BOB_SK_CLAMPED "#)))");
+        ASSERT_NOT_NULL(pkey);
+        ASSERT_NOT_NULL(skey);
+        ASSERT_NULL(gcry_pk_get_curve(pkey, 0, NULL));
+        ASSERT_EQ(0, gcry_pk_get_nbits(pkey));
+        ASSERT_NOT_NULL(gcry_pk_get_keygrip(pkey, be));
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags raw) (value #" P256_D "#))"));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_encrypt(&ciph, data, pkey));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_testkey(skey));
+        ASSERT_OK(gcry_sexp_build(&ciph, NULL,
+                                  "(enc-val (ecdh (s #40" X25519_SHARED "#)"
+                                  " (e #40" X25519_ALICE_PK "#)))"));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_decrypt(&plain, ciph, skey));
+        parms = sexp("(genkey (ecc (curve Curve25519) (flags djb-tweak)))");
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_genkey(&plain, parms));
+        gcry_sexp_release(parms);
+        parms = sexp("(genkey (ecc (curve X448)))");
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_genkey(&plain, parms));
+        gcry_sexp_release(parms);
+        gcry_sexp_release(ciph);
+        gcry_sexp_release(data);
+        gcry_sexp_release(skey);
+        gcry_sexp_release(pkey);
+        return;
+    }
+
     ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result, scalar, point));
     ASSERT_TRUE(bytes_eq_hex(result, 32, X25519_V1_OUT));
     hex_to_bytes(X25519_ALICE_SK, scalar);
     ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result, scalar, NULL));
     ASSERT_TRUE(bytes_eq_hex(result, 32, X25519_ALICE_PK));
-    ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_ecc_mul_point(7, result, scalar, NULL));
 
     /* ECDH through gcry_pk_encrypt: Alice's scalar against Bob's key. */
     pkey = sexp("(public-key (ecc (curve Curve25519) (flags djb-tweak)"
@@ -1523,9 +1712,12 @@ TEST(names_and_info)
     ASSERT_EQ(GCRY_PK_RSA, gcry_pk_map_name("RSA"));
     ASSERT_EQ(GCRY_PK_RSA, gcry_pk_map_name("openpgp-rsa"));
     ASSERT_EQ(GCRY_PK_RSA, gcry_pk_map_name("oid.1.2.840.113549.1.1.1"));
-    ASSERT_EQ(GCRY_PK_DSA, gcry_pk_map_name("dsa"));
-    ASSERT_EQ(GCRY_PK_ELG, gcry_pk_map_name("elg"));
-    ASSERT_EQ(GCRY_PK_ELG, gcry_pk_map_name("openpgp-elg-sig"));
+    /* Like the reference library, FIPS mode does not map the names of
+     * non-approved algorithms. */
+    ASSERT_EQ(gcry_fips_mode_active() ? 0 : GCRY_PK_DSA, gcry_pk_map_name("dsa"));
+    ASSERT_EQ(gcry_fips_mode_active() ? 0 : GCRY_PK_ELG, gcry_pk_map_name("elg"));
+    ASSERT_EQ(gcry_fips_mode_active() ? 0 : GCRY_PK_ELG,
+              gcry_pk_map_name("openpgp-elg-sig"));
     ASSERT_EQ(GCRY_PK_ECC, gcry_pk_map_name("ecc"));
     ASSERT_EQ(GCRY_PK_ECC, gcry_pk_map_name("ecdsa"));
     ASSERT_EQ(GCRY_PK_ECC, gcry_pk_map_name("eddsa"));
@@ -1542,12 +1734,16 @@ TEST(names_and_info)
 
     ASSERT_OK(gcry_pk_test_algo(GCRY_PK_RSA));
     ASSERT_OK(gcry_pk_test_algo(GCRY_PK_ECDH));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_test_algo(GCRY_PK_DSA));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_test_algo(GCRY_PK_ELG));
     ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_test_algo(4711));
     n = GCRY_PK_USAGE_ENCR;
     ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_algo_info(GCRY_PK_DSA,
                                                       GCRYCTL_TEST_ALGO, NULL, &n));
     n = GCRY_PK_USAGE_SIGN;
-    ASSERT_OK(gcry_pk_algo_info(GCRY_PK_DSA, GCRYCTL_TEST_ALGO, NULL, &n));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_PUBKEY_ALGO,
+                          gcry_pk_algo_info(GCRY_PK_DSA, GCRYCTL_TEST_ALGO, NULL,
+                                            &n));
     ASSERT_OK(gcry_pk_algo_info(GCRY_PK_RSA, GCRYCTL_GET_ALGO_USAGE, NULL, &n));
     ASSERT_EQ(GCRY_PK_USAGE_SIGN | GCRY_PK_USAGE_ENCR, n);
     ASSERT_OK(gcry_pk_algo_info(GCRY_PK_RSA, GCRYCTL_GET_ALGO_NPKEY, NULL, &n));
@@ -1580,7 +1776,16 @@ TEST(curve_queries)
     ASSERT_EQ(384, nbits);
     gcry_sexp_release(key);
     key = sexp("(public-key (ecc (curve \"1.3.36.3.3.2.8.1.1.7\") (q #04#)))");
-    ASSERT_STR_EQ("brainpoolP256r1", gcry_pk_get_curve(key, 0, NULL));
+
+    if (gcry_fips_mode_active()) {
+        /* Non-approved curves are unknown to the queries, as in the
+         * reference library. */
+        ASSERT_NULL(gcry_pk_get_curve(key, 0, NULL));
+        ASSERT_EQ(0, gcry_pk_get_nbits(key));
+    } else {
+        ASSERT_STR_EQ("brainpoolP256r1", gcry_pk_get_curve(key, 0, NULL));
+    }
+
     gcry_sexp_release(key);
     key = sexp("(public-key (ecc (curve nowhere) (q #04#)))");
     ASSERT_NULL(gcry_pk_get_curve(key, 0, NULL));
@@ -1783,7 +1988,9 @@ TEST(algo_info_and_ctl)
     ASSERT_ERR(GPG_ERR_INV_FLAG, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     parms = sexp("(genkey (dsa (nbits 4:1024) (qbits)))");
-    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_genkey(&key, parms));
+    /* FIPS mode refuses the algorithm before looking at the parameters. */
+    ASSERT_ERR(gcry_fips_mode_active() ? GPG_ERR_PUBKEY_ALGO : GPG_ERR_INV_OBJ,
+               gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     ASSERT_NULL(key);
 
@@ -1795,8 +2002,19 @@ TEST(algo_info_and_ctl)
     ASSERT_NULL(gcry_pk_get_param(GCRY_PK_RSA, "NIST P-256"));
     ASSERT_NULL(gcry_pk_get_param(GCRY_PK_ECC, "foo"));
 
-    /* The parameter S-expression of a curve names the curve again. */
+    /* The parameter S-expression of a curve names the curve again; a
+     * non-approved curve has no parameters in FIPS mode. */
     param = gcry_pk_get_param(GCRY_PK_ECC, "secp256k1");
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_NULL(param);
+        param = gcry_pk_get_param(GCRY_PK_ECC, "NIST P-256");
+        ASSERT_NOT_NULL(param);
+        ASSERT_STR_EQ("NIST P-256", gcry_pk_get_curve(param, 0, NULL));
+        gcry_sexp_release(param);
+        return;
+    }
+
     ASSERT_NOT_NULL(param);
     ASSERT_STR_EQ("secp256k1", gcry_pk_get_curve(param, 0, NULL));
     {
@@ -1820,17 +2038,34 @@ TEST(rsa_genkey_flags)
     gcry_sexp_t key;
     gcry_mpi_t e;
 
-    /* Generation flags are accepted; rsa-use-e 0 means 41, 1 means 65537. */
-    key = genkey("(genkey (rsa (nbits 4:1024) (flags transient-key no-keytest"
-                 " no-blinding use-x931) (rsa-use-e 1:0)))");
-    ASSERT_NOT_NULL(key);
-    e = param_mpi(key, "e");
-    ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 41));
+    /* Generation flags are accepted; rsa-use-e 0 means 41, 1 means 65537.
+     * FIPS mode needs 2048 bits and refuses the small exponent. */
+    if (gcry_fips_mode_active()) {
+        gcry_sexp_t parms = sexp("(genkey (rsa (nbits 4:2048) (flags transient-key"
+                                 " no-keytest no-blinding use-x931) (rsa-use-e 1:0)))");
+
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        key = genkey("(genkey (rsa (nbits 4:2048) (flags transient-key no-keytest"
+                     " no-blinding use-x931) (rsa-use-e 1:1)))");
+        ASSERT_NOT_NULL(key);
+        e = param_mpi(key, "e");
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 65537));
+    } else {
+        key = genkey("(genkey (rsa (nbits 4:1024) (flags transient-key no-keytest"
+                     " no-blinding use-x931) (rsa-use-e 1:0)))");
+        ASSERT_NOT_NULL(key);
+        e = param_mpi(key, "e");
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 41));
+    }
+
     gcry_mpi_release(e);
     ASSERT_OK(gcry_pk_testkey(key));
     gcry_sexp_release(key);
 
-    key = genkey("(genkey (rsa (nbits 4:1024) (rsa-use-e 1:1)))");
+    key = genkey(gcry_fips_mode_active()
+                 ? "(genkey (rsa (nbits 4:2048) (rsa-use-e 1:1)))"
+                 : "(genkey (rsa (nbits 4:1024) (rsa-use-e 1:1)))");
     ASSERT_NOT_NULL(key);
     e = param_mpi(key, "e");
     ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 65537));
@@ -1851,6 +2086,25 @@ TEST(dsa_parameters)
     gcry_mpi_t q;
     gcry_mpi_t g;
     gcry_mpi_t p2;
+
+    if (gcry_fips_mode_active()) {
+        /* Given domain parameters do not make DSA acceptable either. */
+        key = sexp(key_grips[1].key);
+        p = param_mpi(key, "p");
+        q = param_mpi(key, "q");
+        g = param_mpi(key, "g");
+        ASSERT_OK(gcry_sexp_build(&parms, NULL,
+                                  "(genkey (dsa (domain (p %m) (q %m) (g %m))))",
+                                  p, q, g));
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key2, parms));
+        ASSERT_NULL(key2);
+        gcry_sexp_release(parms);
+        gcry_mpi_release(p);
+        gcry_mpi_release(q);
+        gcry_mpi_release(g);
+        gcry_sexp_release(key);
+        return;
+    }
 
     /* Default q size for 1024 bits. */
     key = genkey("(genkey (dsa (nbits 4:1024)))");
@@ -1912,7 +2166,12 @@ TEST(dsa_parameters)
 
 TEST(dsa_data_errors)
 {
-    gcry_sexp_t key = genkey("(genkey (dsa (nbits 4:1024)))");
+    /* The data and signature parsing is shared, so FIPS mode runs the
+     * same checks with an ECDSA key. */
+    int fips = gcry_fips_mode_active();
+    const char *algo = fips ? "ecdsa" : "dsa";
+    gcry_sexp_t key = genkey(fips ? "(genkey (ecc (curve \"NIST P-256\")))"
+                             : "(genkey (dsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t sig = NULL;
@@ -1925,9 +2184,9 @@ TEST(dsa_data_errors)
 
     /* Signature value checks. */
     ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
-               verify_text("(sig-val (dsa (r #00#) (s #01#)))", data, pub));
+               verify_text(sigval_text(algo, "(r #00#) (s #01#)", 0), data, pub));
     ASSERT_ERR(GPG_ERR_NO_OBJ,
-               verify_text("(sig-val (dsa (r #01#)))", data, pub));
+               verify_text(sigval_text(algo, "(r #01#)", 0), data, pub));
     ASSERT_ERR(GPG_ERR_NO_OBJ, verify_text("(sig-val)", data, pub));
     ASSERT_ERR(GPG_ERR_INV_OBJ, verify_text("(foo)", data, pub));
     ASSERT_ERR(GPG_ERR_INV_OBJ, verify_text("(sig-val ((a) b))", data, pub));
@@ -1935,7 +2194,7 @@ TEST(dsa_data_errors)
                verify_text("(sig-val (rsa (s #01#)))", data, pub));
     /* A flags list may precede the algorithm. */
     ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
-               verify_text("(sig-val (flags) (dsa (r #01#) (s #02#)))", data,
+               verify_text(sigval_text(algo, "(r #01#) (s #02#)", 1), data,
                            pub));
     ASSERT_ERR(GPG_ERR_INV_OBJ, verify_text("(sig-val (flags))", data, pub));
 
@@ -1979,13 +2238,18 @@ TEST(dsa_data_errors)
         gcry_sexp_release(d);
     }
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw prehash) (hash-algo rmd160)"
-                        " (value #0102#))", priv));
+    /* RIPEMD-160 is not available in FIPS mode. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw prehash)"
+                                    " (hash-algo rmd160) (value #0102#))", priv));
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw) (hash rmd160 #" D20 "#))", priv));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw) (hash rmd160 #" D20
+                                    "#))", priv));
     gcry_sexp_release(sig);
-    ASSERT_OK(sign_text(&sig, "(data (flags raw) (hash ripemd160 #" D20 "#))",
-                        priv));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags raw) (hash ripemd160 #"
+                                    D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags raw) (value #01#)"
                         " (hash sha256 #" D32 "#))", priv));
@@ -1996,7 +2260,8 @@ TEST(dsa_data_errors)
 
     /* A key whose y does not match x. */
     bad = sexp("(private-key (dsa (p #0b#) (q #05#) (g #02#) (y #04#) (x #03#)))");
-    ASSERT_ERR(GPG_ERR_BAD_SECKEY, gcry_pk_testkey(bad));
+    ASSERT_ERR(fips ? GPG_ERR_PUBKEY_ALGO : GPG_ERR_BAD_SECKEY,
+               gcry_pk_testkey(bad));
     gcry_sexp_release(bad);
 
     gcry_sexp_release(priv);
@@ -2006,7 +2271,11 @@ TEST(dsa_data_errors)
 
 TEST(hash_sign_templates)
 {
-    gcry_sexp_t key = genkey("(genkey (dsa (nbits 4:1024)))");
+    /* The templates work the same for every signing algorithm; FIPS mode
+     * uses ECDSA. */
+    gcry_sexp_t key = genkey(gcry_fips_mode_active()
+                             ? "(genkey (ecc (curve \"NIST P-256\")))"
+                             : "(genkey (dsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t sig = NULL;
@@ -2079,7 +2348,9 @@ TEST(hash_sign_templates)
 
 TEST(rsa_data_errors)
 {
-    gcry_sexp_t key = genkey("(genkey (rsa (nbits 4:1024)))");
+    gcry_sexp_t key = genkey(gcry_fips_mode_active()
+                             ? "(genkey (rsa (nbits 4:2048)))"
+                             : "(genkey (rsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t sig = NULL;
@@ -2140,9 +2411,11 @@ TEST(rsa_data_errors)
                sign_text(&sig, "(data (flags pss) (hash md2"
                          " #0102030405060708091011121314151617#))", priv));
 
-    /* PKCS#1 with other digests and with prehashing. */
-    ASSERT_OK(sign_text(&sig, "(data (flags pkcs1) (hash rmd160 #" D20 "#))",
-                        priv));
+    /* PKCS#1 with other digests (RIPEMD-160 is not available in FIPS
+     * mode) and with prehashing. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          sign_text(&sig, "(data (flags pkcs1) (hash rmd160 #"
+                                    D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags pkcs1 prehash) (hash-algo sha256)"
                         " (value #0102#))", priv));
@@ -2225,7 +2498,7 @@ TEST(rsa_data_errors)
         gcry_mpi_t big = gcry_mpi_new(0);
 
         gcry_mpi_set_ui(big, 1);
-        gcry_mpi_mul_2exp(big, big, 1030);
+        gcry_mpi_mul_2exp(big, big, gcry_pk_get_nbits(pub) + 6);
         ASSERT_OK(gcry_sexp_build(&enc, NULL, "(enc-val (rsa (a %m)))", big));
         ASSERT_OK(gcry_pk_decrypt(&plain, enc, priv));
         gcry_sexp_release(plain);
@@ -2294,7 +2567,7 @@ TEST(rsa_data_errors)
 
 TEST(elgamal_edge_cases)
 {
-    gcry_sexp_t key = genkey("(genkey (elg (nbits 4:1024)))");
+    gcry_sexp_t key;
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t enc = NULL;
@@ -2304,6 +2577,19 @@ TEST(elgamal_edge_cases)
     gcry_sexp_t bad;
     gcry_mpi_t big = gcry_mpi_new(0);
 
+    if (gcry_fips_mode_active()) {
+        /* Not even a malformed ElGamal key gets as far as a check. */
+        bad = sexp("(private-key (elg (p #0b#) (g #02#) (y #04#) (x #03#)))");
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_testkey(bad));
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO,
+                   encrypt_text(&enc, "(data (flags raw) (value #00#))", bad));
+        ASSERT_NULL(enc);
+        gcry_sexp_release(bad);
+        gcry_mpi_release(big);
+        return;
+    }
+
+    key = genkey("(genkey (elg (nbits 4:1024)))");
     ASSERT_NOT_NULL(key);
     priv = gcry_sexp_find_token(key, "private-key", 0);
     pub = gcry_sexp_find_token(key, "public-key", 0);
@@ -2614,17 +2900,25 @@ TEST(genkey_flag_variants)
     gcry_sexp_t parms;
     gcry_mpi_t q;
 
-    /* 2048-bit DSA defaults to a 224-bit q, with or without the FIPS flag. */
-    key = genkey("(genkey (dsa (nbits 4:2048) (flags use-fips186)))");
-    ASSERT_NOT_NULL(key);
-    q = param_mpi(key, "q");
-    ASSERT_EQ(224, gcry_mpi_get_nbits(q));
-    gcry_mpi_release(q);
-    gcry_sexp_release(key);
-    key = NULL;
+    /* 2048-bit DSA defaults to a 224-bit q, with or without the FIPS flag;
+     * FIPS mode itself has no DSA at all. */
+    if (gcry_fips_mode_active()) {
+        parms = sexp("(genkey (dsa (nbits 4:2048) (flags use-fips186)))");
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+    } else {
+        key = genkey("(genkey (dsa (nbits 4:2048) (flags use-fips186)))");
+        ASSERT_NOT_NULL(key);
+        q = param_mpi(key, "q");
+        ASSERT_EQ(224, gcry_mpi_get_nbits(q));
+        gcry_mpi_release(q);
+        gcry_sexp_release(key);
+        key = NULL;
+    }
 
     parms = sexp("(genkey (dsa (nbits 4:1024) (flags bogus)))");
-    ASSERT_ERR(GPG_ERR_INV_FLAG, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(gcry_fips_mode_active() ? GPG_ERR_PUBKEY_ALGO : GPG_ERR_INV_FLAG,
+               gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     parms = sexp("(genkey (rsa (nbits 4:1024) (rsa-use-e)))");
     ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_genkey(&key, parms));
@@ -2638,7 +2932,9 @@ TEST(genkey_flag_variants)
 
 TEST(dsa_more_data_handling)
 {
-    gcry_sexp_t key = genkey("(genkey (dsa (nbits 4:1024)))");
+    int fips = gcry_fips_mode_active();
+    gcry_sexp_t key = genkey(fips ? "(genkey (ecc (curve \"NIST P-256\")))"
+                             : "(genkey (dsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t sig = NULL;
@@ -2651,14 +2947,23 @@ TEST(dsa_more_data_handling)
     priv = gcry_sexp_find_token(key, "private-key", 0);
     pub = gcry_sexp_find_token(key, "public-key", 0);
 
-    /* The sm2 flag has no meaning for DSA and is ignored. */
-    ASSERT_OK(sign_text(&sig, "(data (flags sm2) (hash sha256 #" D32 "#))", priv));
+    /* The sm2 flag has no meaning for DSA and is ignored; ECDSA (used in
+     * FIPS mode) has no SM2 on its curves. */
+    if (fips) {
+        ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED,
+                   sign_text(&sig, "(data (flags sm2) (hash sha256 #" D32 "#))",
+                             priv));
+    } else {
+        ASSERT_OK(sign_text(&sig, "(data (flags sm2) (hash sha256 #" D32 "#))",
+                            priv));
+    }
+
     gcry_sexp_release(sig);
     ASSERT_ERR(GPG_ERR_INV_OBJ,
                verify_text("(sig-val (flags) ((x)))",
                            "(data (flags raw) (hash sha256 #" D32 "#))", pub));
     bad = sexp("(private-key (dsa (p #0b#) (q #05#) (g #02#) (y #04#)))");
-    ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_testkey(bad));
+    ASSERT_ERR(fips ? GPG_ERR_PUBKEY_ALGO : GPG_ERR_NO_OBJ, gcry_pk_testkey(bad));
     gcry_sexp_release(bad);
 
     /* Input data contexts: a named digest with a context, two contexts
@@ -2692,7 +2997,9 @@ TEST(dsa_more_data_handling)
 
 TEST(rsa_more_data_handling)
 {
-    gcry_sexp_t key = genkey("(genkey (rsa (nbits 4:1024)))");
+    gcry_sexp_t key = genkey(gcry_fips_mode_active()
+                             ? "(genkey (rsa (nbits 4:2048)))"
+                             : "(genkey (rsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t sig = NULL;
     gcry_sexp_t plain = NULL;
@@ -2798,7 +3105,11 @@ TEST(ecc_more_data_handling)
 TEST(disable_algorithm)
 {
     int algo = GCRY_PK_ELG;
-    gcry_sexp_t key = genkey("(genkey (elg (nbits 3:512)))");
+    /* FIPS mode cannot generate the key, but refuses a given one the same
+     * way as a disabled algorithm. */
+    gcry_sexp_t key = gcry_fips_mode_active()
+                      ? sexp("(private-key (elg (p #0b#) (g #02#) (y #04#) (x #03#)))")
+                      : genkey("(genkey (elg (nbits 3:512)))");
     gcry_sexp_t priv;
     gcry_sexp_t parms;
     gcry_sexp_t data = sexp("(data (flags raw) (value #01#))");
@@ -3023,10 +3334,22 @@ TEST(rsa_encoding_vectors)
     gcry_sexp_release(data);
     ov[7] = 8;
 
-    /* OAEP with the seed supplied by the caller. */
+    /* OAEP with the seed supplied by the caller.  The default digest is
+     * SHA-1, but SHA-256 in FIPS mode (as in the reference library), so
+     * the SHA-1 vector then needs the digest named and a 20 byte seed no
+     * longer fits the default. */
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags oaep) (value 3:abc)"
                               " (random-override %b))", 20, ov));
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_encrypt(&ciph, data, pkey));
+        gcry_sexp_release(data);
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags oaep) (hash-algo sha1) (value 3:abc)"
+                                  " (random-override %b))", 20, ov));
+    }
+
     ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
     ASSERT_TRUE(param_is_hex(ciph, "a", RSA_OAEP1_CT));
     gcry_sexp_release(ciph);
@@ -3181,6 +3504,37 @@ TEST(rsa_genkey_rules)
     gcry_sexp_t key;
     gcry_mpi_t e;
 
+    if (gcry_fips_mode_active()) {
+        /* FIPS mode: at least 2048 bits in steps of 512, and e >= 65537;
+         * an even exponent is still made odd. */
+        static const char *const refused[] = {
+            "(genkey (rsa (nbits 3:512)))",
+            "(genkey (rsa (nbits 3:767)))",
+            "(genkey (rsa (nbits 3:256)))",
+            "(genkey (rsa (nbits 4:2304)))",
+            "(genkey (rsa (nbits 4:2048) (rsa-use-e 1:4)))",
+            "(genkey (rsa (nbits 4:2048) (rsa-use-e 3:256)))",
+            NULL
+        };
+        size_t i;
+
+        for (i = 0; refused[i]; i++) {
+            gcry_sexp_t parms = sexp(refused[i]);
+
+            ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+            gcry_sexp_release(parms);
+        }
+
+        key = genkey("(genkey (rsa (nbits 4:2048) (rsa-use-e 5:65536)))");
+        ASSERT_NOT_NULL(key);
+        ASSERT_EQ(2048, gcry_pk_get_nbits(key));
+        e = param_mpi(key, "e");
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(e, 65537));
+        gcry_mpi_release(e);
+        gcry_sexp_release(key);
+        return;
+    }
+
     /* Odd sizes are rounded up; OpenSSL cannot go below 512 bits. */
     key = genkey("(genkey (rsa (nbits 3:512)))");
     ASSERT_NOT_NULL(key);
@@ -3214,7 +3568,7 @@ TEST(rsa_genkey_rules)
 
 TEST(elgamal_encodings)
 {
-    gcry_sexp_t key = genkey("(genkey (elg (nbits 4:1024)))");
+    gcry_sexp_t key;
     gcry_sexp_t pub;
     gcry_sexp_t sec;
     gcry_sexp_t data;
@@ -3226,6 +3580,18 @@ TEST(elgamal_encodings)
     gcry_mpi_t m;
     unsigned char digest[32];
 
+    if (gcry_fips_mode_active()) {
+        gcry_sexp_t parms = sexp("(genkey (elg (nbits 3:300)))");
+
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        parms = sexp("(genkey (elg (nbits 3:512) (xvalue #8000000000000000#)))");
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        return;
+    }
+
+    key = genkey("(genkey (elg (nbits 4:1024)))");
     ASSERT_NOT_NULL(key);
     pub = gcry_sexp_find_token(key, "public-key", 0);
     sec = gcry_sexp_find_token(key, "private-key", 0);
@@ -3326,27 +3692,40 @@ TEST(elgamal_encodings)
 
 TEST(dsa_sizes)
 {
-    gcry_sexp_t key;
+    gcry_sexp_t key = NULL;
     gcry_sexp_t parms;
+    /* In FIPS mode the algorithm is refused before any size is looked at. */
+    gcry_err_code_t bad = gcry_fips_mode_active() ? GPG_ERR_PUBKEY_ALGO
+                          : GPG_ERR_INV_VALUE;
 
     /* OpenSSL only knows the FIPS 186 sizes of q; the reference library
      * would accept 168 here. */
     parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:168)))");
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(bad, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
 
     /* FIPS 186-3 only allows its three size pairs, 186-2 just one. */
     parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
                  " (flags use-fips186)))");
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(bad, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:224) (use-fips186)))");
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(bad, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     parms = sexp("(genkey (dsa (nbits 4:2048) (qbits 3:224)"
                  " (flags use-fips186-2)))");
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(bad, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
+
+    if (gcry_fips_mode_active()) {
+        parms = sexp("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
+                     " (flags use-fips186-2)))");
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        ASSERT_NULL(key);
+        return;
+    }
+
     key = genkey("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
                  " (flags use-fips186-2)))");
     ASSERT_NOT_NULL(key);
@@ -3369,29 +3748,44 @@ TEST(ecc_sm2_and_curve_rules)
 
     memset(digest, 0x33, sizeof digest);
 
-    /* SM2 signatures on the SM2 curve, tagged "sm2". */
-    key = genkey("(genkey (ecc (curve sm2p256v1)))");
-    ASSERT_NOT_NULL(key);
-    pub = gcry_sexp_find_token(key, "public-key", 0);
-    sec = gcry_sexp_find_token(key, "private-key", 0);
-    ASSERT_OK(gcry_sexp_build(&data, NULL,
-                              "(data (flags sm2) (hash sha256 %b))", 32,
-                              digest));
-    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
-    ASSERT_TRUE(has_token(sig, "sm2"));
-    ASSERT_OK(gcry_pk_verify(sig, data, pub));
-    gcry_sexp_release(data);
-    digest[0] ^= 1;
-    ASSERT_OK(gcry_sexp_build(&data, NULL,
-                              "(data (flags sm2) (hash sha256 %b))", 32,
-                              digest));
-    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
-    gcry_sexp_release(data);
-    gcry_sexp_release(sig);
-    digest[0] ^= 1;
-    gcry_sexp_release(pub);
-    gcry_sexp_release(sec);
-    gcry_sexp_release(key);
+    /* SM2 signatures on the SM2 curve, tagged "sm2"; the curve is not
+     * approved, so FIPS mode refuses it. */
+    if (gcry_fips_mode_active()) {
+        parms = sexp("(genkey (ecc (curve sm2p256v1)))");
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_genkey(&key, parms));
+        gcry_sexp_release(parms);
+        sec = sexp("(private-key (ecc (curve sm2p256v1) (q #04#) (d #01#)))");
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags sm2) (hash sha256 %b))", 32,
+                                  digest));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_sign(&sig, data, sec));
+        ASSERT_NULL(gcry_pk_get_curve(sec, 0, NULL));
+        gcry_sexp_release(data);
+        gcry_sexp_release(sec);
+    } else {
+        key = genkey("(genkey (ecc (curve sm2p256v1)))");
+        ASSERT_NOT_NULL(key);
+        pub = gcry_sexp_find_token(key, "public-key", 0);
+        sec = gcry_sexp_find_token(key, "private-key", 0);
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags sm2) (hash sha256 %b))", 32,
+                                  digest));
+        ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+        ASSERT_TRUE(has_token(sig, "sm2"));
+        ASSERT_OK(gcry_pk_verify(sig, data, pub));
+        gcry_sexp_release(data);
+        digest[0] ^= 1;
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags sm2) (hash sha256 %b))", 32,
+                                  digest));
+        ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
+        gcry_sexp_release(data);
+        gcry_sexp_release(sig);
+        digest[0] ^= 1;
+        gcry_sexp_release(pub);
+        gcry_sexp_release(sec);
+        gcry_sexp_release(key);
+    }
 
     /* The sm2 and eddsa flags need their curves. */
     sec = sexp("(private-key (ecc (curve \"NIST P-256\")"
@@ -3410,7 +3804,8 @@ TEST(ecc_sm2_and_curve_rules)
     ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
     parms = sexp("(genkey (ecc (curve secp256k1) (flags eddsa)))");
-    ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED, gcry_pk_genkey(&key, parms));
+    ASSERT_ERR(gcry_fips_mode_active() ? GPG_ERR_NOT_SUPPORTED
+               : GPG_ERR_NOT_IMPLEMENTED, gcry_pk_genkey(&key, parms));
     gcry_sexp_release(parms);
 
     /* Signatures of other schemes: certainly bad when out of range. */
@@ -3465,9 +3860,13 @@ TEST(ecc_sm2_and_curve_rules)
         memset(point, 0, sizeof point);
         memset(zero, 0, sizeof zero);
         memset(result, 1, sizeof result);
-        ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result, scalar,
-                                     point));
-        ASSERT_MEM_EQ(zero, result, 32);
+        ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                              gcry_ecc_mul_point(GCRY_ECC_CURVE25519, result,
+                                                 scalar, point));
+
+        if (!gcry_fips_mode_active()) {
+            ASSERT_MEM_EQ(zero, result, 32);
+        }
     }
 
     /* The curve table matches the reference library's list. */
