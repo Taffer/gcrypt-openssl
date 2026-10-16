@@ -785,6 +785,40 @@ TEST(canon_len_errors)
                                      NULL, NULL));
 }
 
+/* A length prefix that does not fit the parser's limit is an error when
+ * the colon is reached; it must not wrap around and send the scan off
+ * into the wild (the reference library crashes on the last two). */
+TEST(canon_len_huge_prefix)
+{
+    static const struct {
+        const char *text;
+        size_t off;
+    } tv[] = {
+        { "(65536:)", 6 },
+        { "(100000:)", 7 },
+        { "(184467440737095516150:)", 22 },
+        { "(18446744073709551595:)", 21 },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
+        size_t erroff = 99;
+        gcry_error_t err = 99;
+        size_t n;
+
+        n = gcry_sexp_canon_len((const unsigned char *)tv[i].text,
+                                strlen(tv[i].text), &erroff, &err);
+        ASSERT_EQ(0, n);
+        ASSERT_ERR(GPG_ERR_SEXP_STRING_TOO_LONG, err);
+        ASSERT_EQ(tv[i].off, erroff);
+        n = gcry_sexp_canon_len((const unsigned char *)tv[i].text, 0,
+                                &erroff, &err);
+        ASSERT_EQ(0, n);
+        ASSERT_ERR(GPG_ERR_SEXP_STRING_TOO_LONG, err);
+        ASSERT_EQ(tv[i].off, erroff);
+    }
+}
+
 TEST(build_edge_cases)
 {
     gcry_sexp_t s = NULL;
@@ -1666,6 +1700,61 @@ TEST(navigation_past_the_end)
     gcry_sexp_release(s);
 }
 
+/* A failing extraction must release only what it stored itself: the
+ * arguments it never reached, and those that are not MPIs at all, are
+ * left untouched.  (The reference library crashes on both inputs.) */
+TEST(extract_param_failure_leaves_arguments)
+{
+    gcry_sexp_t s = scan("(key (n #01#))", 0);
+    unsigned char raw[16];
+    gcry_buffer_t buf = { sizeof raw, 0, 0, raw };
+    int count = 0x41414141;
+    char *str = (char *)&count; /* Not a pointer anyone may free. */
+    gcry_mpi_t m = NULL;
+    gcry_mpi_t m2 = NULL;
+
+    ASSERT_NOT_NULL(s);
+    memset(raw, 0x5a, sizeof raw);
+
+    /* The path does not exist: nothing has been looked at yet. */
+    ASSERT_ERR(GPG_ERR_NOT_FOUND,
+               gcry_sexp_extract_param(s, "nosuchpath", "&q %d'count' m",
+                                       &buf, &count, &m, NULL));
+    ASSERT_EQ(0x41414141, count);
+    ASSERT_EQ(sizeof raw, buf.size);
+    ASSERT_EQ(0, buf.len);
+    ASSERT_TRUE(buf.data == raw);
+    ASSERT_EQ(0x5a, raw[0]);
+    ASSERT_NULL(m);
+    ASSERT_ERR(GPG_ERR_NOT_FOUND,
+               gcry_sexp_extract_param(s, "nosuchpath", "%d'a' %s'b' &c",
+                                       &count, &str, &buf, NULL));
+    ASSERT_EQ(0x41414141, count);
+    ASSERT_TRUE(str == (char *)&count);
+
+    /* An optional buffer element is missing, then a mandatory one: the
+     * buffer argument is not an MPI to be released. */
+    buf.len = 7;
+    ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_sexp_extract_param(s, NULL, "&q? m",
+                                                       &buf, &m, NULL));
+    ASSERT_EQ(0, buf.len);
+    ASSERT_TRUE(buf.data == raw);
+    ASSERT_NULL(m);
+
+    /* Values stored before the failure are released and cleared, while
+     * the integer keeps the value that was parsed. */
+    count = -1;
+    ASSERT_ERR(GPG_ERR_NO_OBJ,
+               gcry_sexp_extract_param(s, NULL, "n %d'n' &n +q", &m, &count,
+                                       &buf, &m2, NULL));
+    ASSERT_NULL(m);
+    ASSERT_NULL(m2);
+    ASSERT_EQ(0, count);
+    ASSERT_EQ(0, buf.len);
+
+    gcry_sexp_release(s);
+}
+
 int
 main(void)
 {
@@ -1688,6 +1777,7 @@ main(void)
     RUN_TEST(length_prefix_variants);
     RUN_TEST(display_hints_and_punctuation);
     RUN_TEST(canon_len_errors);
+    RUN_TEST(canon_len_huge_prefix);
     RUN_TEST(build_edge_cases);
     RUN_TEST(navigation_edges);
     RUN_TEST(create_and_new_edges);
@@ -1697,5 +1787,6 @@ main(void)
     RUN_TEST(build_null_and_secure_arguments);
     RUN_TEST(display_hint_and_canon_len_errors);
     RUN_TEST(navigation_past_the_end);
+    RUN_TEST(extract_param_failure_leaves_arguments);
     return TEST_RESULT();
 }

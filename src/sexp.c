@@ -2149,7 +2149,11 @@ gcry_sexp_canon_len(const unsigned char *buffer, size_t length,
 
         if (datalen) {
             if (*p == ':') {
-                if (length && count + datalen >= length) {
+                /* No string may exceed the parser's limit, and with a
+                 * known LENGTH it must also fit in what is left (COUNT is
+                 * below LENGTH here, so the subtraction cannot wrap). */
+                if (datalen > MAX_DATALEN
+                    || (length && datalen >= length - count)) {
                     FAIL(GPG_ERR_SEXP_STRING_TOO_LONG);
                 }
 
@@ -2157,7 +2161,15 @@ gcry_sexp_canon_len(const unsigned char *buffer, size_t length,
                 p += datalen;
                 datalen = 0;
             } else if (digitp((const char *)p)) {
+                /* Keep accumulating so that the error is reported at the
+                 * colon, as the reference does, but never let the value
+                 * grow past the limit: a wrapped length would turn into
+                 * a wild pointer. */
                 datalen = datalen * 10 + (size_t)(*p - '0');
+
+                if (datalen > MAX_DATALEN) {
+                    datalen = MAX_DATALEN + 1;
+                }
             } else {
                 FAIL(GPG_ERR_SEXP_INV_LEN_SPEC);
             }
@@ -2281,6 +2293,61 @@ copy_value_string(const unsigned char *s, size_t n, int secure)
 
 static const unsigned char empty_list[1] = { ST_STOP };
 
+/* Interpret the extract_param format directive after a '%': *SP points
+ * at the character following the '%' and is left on the directive's last
+ * character.  MODE and SUBMODE are updated for the recognised directives
+ * and left alone for anything else. */
+static void
+extract_param_directive(const char **sp, int *mode, int *submode)
+{
+    const char *s = *sp;
+
+    if (*s == 's' || *s == 'd' || *s == 'u') {
+        *mode = *s;
+        *submode = 0;
+    } else if (*s == 'l' && (s[1] == 'u' || s[1] == 'd')) {
+        *mode = s[1];
+        *submode = 'l';
+        s++;
+    } else if (*s == 'z' && s[1] == 'u') {
+        *mode = s[1];
+        *submode = 'z';
+        s++;
+    } else if (*s == '#' && s[1] == 's') {
+        *mode = s[1];
+        *submode = '#';
+        s++;
+    }
+
+    *sp = s;
+}
+
+/* What an extract_param output argument is, so that the cleanup after a
+ * failure only ever touches what this call filled in:
+ *   'm'  gcry_mpi_t *, nothing stored yet;  'M'  an MPI we allocated
+ *   '&'  gcry_buffer_t *, nothing stored;   '1'  filled a caller buffer
+ *                                            '2'  allocated the buffer
+ *   's'  char **, nothing stored yet;       'S'  a string we allocated
+ *   'x'  a plain integer: nothing to release ever */
+static char
+extract_param_kind(int mode)
+{
+    switch (mode) {
+    case '&':
+        return '&';
+
+    case 's':
+        return 's';
+
+    case 'd':
+    case 'u':
+        return 'x';
+
+    default:
+        return 'm';
+    }
+}
+
 gcry_err_code_t
 _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                           const char *list, va_list arg_ptr)
@@ -2291,6 +2358,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
     void **array[20];
     char arrayisdesc[20];
     int idx;
+    int nargs;
     int mode = '+';
     int submode = 0;
     char *tmpstr = NULL;
@@ -2303,15 +2371,13 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         return GPG_ERR_INV_ARG;
     }
 
-    /* arrayisdesc: 0 MPI, 1 caller buffer, 2 our buffer, 's' string,
-     * 'x' plain integer (nothing to free). */
     memset(arrayisdesc, 0, sizeof arrayisdesc);
 
-    /* Collect all output pointers first, so that on error everything
-     * allocated so far can be released. */
+    /* Collect all output pointers first, remembering what each one is,
+     * so that on error everything stored so far can be released. */
     for (s = list, idx = 0; *s && idx < (int)DIM(array); s++) {
-        if (*s == '&' || *s == '+' || *s == '-' || *s == '/' || *s == '?') {
-            ;
+        if (*s == '&' || *s == '+' || *s == '-' || *s == '/') {
+            mode = *s;
         } else if (*s == '%') {
             s++;
 
@@ -2319,16 +2385,9 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                 break; /* A trailing '%' ends the list, as below. */
             }
 
-            if (*s == 'l' && (s[1] == 'u' || s[1] == 'd')) {
-                s++;
-            } else if (*s == 'z' && s[1] == 'u') {
-                s++;
-            } else if (*s == '#' && s[1] == 's') {
-                s++;
-            }
-
+            extract_param_directive(&s, &mode, &submode);
             continue;
-        } else if (whitespacep(s)) {
+        } else if (whitespacep(s) || *s == '?') {
             ;
         } else {
             if (*s == '\'') {
@@ -2348,6 +2407,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                 return GPG_ERR_MISSING_VALUE;
             }
 
+            arrayisdesc[idx] = extract_param_kind(mode);
             idx++;
         }
     }
@@ -2355,6 +2415,10 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
     if (*s) {
         return GPG_ERR_LIMIT_REACHED;
     }
+
+    nargs = idx;
+    mode = '+';
+    submode = 0;
 
     if (va_arg(arg_ptr, gcry_mpi_t *)) {
         return GPG_ERR_INV_ARG;
@@ -2395,7 +2459,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         }
     }
 
-    for (s = list, idx = 0; *s; s++) {
+    for (s = list, idx = 0; *s && idx < nargs; s++) {
         if (*s == '&' || *s == '+' || *s == '-' || *s == '/') {
             mode = *s;
         } else if (*s == '%') {
@@ -2405,27 +2469,9 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                 break;
             }
 
-            if (*s == 's' || *s == 'd' || *s == 'u') {
-                mode = *s;
-                submode = 0;
-            } else if (*s == 'l' && (s[1] == 'u' || s[1] == 'd')) {
-                mode = s[1];
-                submode = 'l';
-                s++;
-            } else if (*s == 'z' && s[1] == 'u') {
-                mode = s[1];
-                submode = 'z';
-                s++;
-            } else if (*s == '#' && s[1] == 's') {
-                mode = s[1];
-                submode = '#';
-                s++;
-            }
-
+            extract_param_directive(&s, &mode, &submode);
             continue;
-        } else if (whitespacep(s)) {
-            ;
-        } else if (*s == '?') {
+        } else if (whitespacep(s) || *s == '?') {
             ;
         } else {
             const unsigned char *val;
@@ -2503,7 +2549,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
 
                         memcpy((char *)spec->data + spec->off, val, vlen);
                         spec->len = vlen;
-                        arrayisdesc[idx] = 1;
+                        arrayisdesc[idx] = '1';
                     } else {
                         spec->data = secure ? _gcry_malloc_secure(vlen)
                                      : _gcry_malloc(vlen);
@@ -2517,7 +2563,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                         spec->size = vlen;
                         spec->len = vlen;
                         spec->off = 0;
-                        arrayisdesc[idx] = 2;
+                        arrayisdesc[idx] = '2';
                     }
                 } else if (mode == 's') {
                     if (submode == '#') {
@@ -2574,7 +2620,7 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                         goto cleanup;
                     }
 
-                    arrayisdesc[idx] = 's';
+                    arrayisdesc[idx] = 'S';
                 } else if (mode == 'd') {
                     long along;
 
@@ -2655,6 +2701,8 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                         rc = GPG_ERR_INV_OBJ;
                         goto cleanup;
                     }
+
+                    arrayisdesc[idx] = 'M';
                 } else {
                     gcry_mpi_t a = NULL;
                     enum gcry_mpi_format fmt = mode == '-' ? GCRYMPI_FMT_STD
@@ -2670,6 +2718,8 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
                         rc = GPG_ERR_INV_OBJ;
                         goto cleanup;
                     }
+
+                    arrayisdesc[idx] = 'M';
                 }
             }
 
@@ -2683,21 +2733,23 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
 cleanup:
     _gcry_free(tmpstr);
 
-    while (idx--) {
-        if (!arrayisdesc[idx]) {
+    /* Release what this call stored; arguments that were never reached,
+     * or that hold plain integers, are left exactly as they were. */
+    for (idx = 0; idx < nargs; idx++) {
+        if (arrayisdesc[idx] == 'M') {
             gcry_mpi_release(*array[idx]);
             *array[idx] = NULL;
-        } else if (arrayisdesc[idx] == 1) {
+        } else if (arrayisdesc[idx] == '1') {
             gcry_buffer_t *spec = (gcry_buffer_t *)array[idx];
 
             spec->len = 0;
-        } else if (arrayisdesc[idx] == 2) {
+        } else if (arrayisdesc[idx] == '2') {
             gcry_buffer_t *spec = (gcry_buffer_t *)array[idx];
 
             _gcry_free(spec->data);
             spec->data = NULL;
             spec->size = spec->off = spec->len = 0;
-        } else if (arrayisdesc[idx] == 's') {
+        } else if (arrayisdesc[idx] == 'S') {
             _gcry_free(*array[idx]);
             *array[idx] = NULL;
         }
