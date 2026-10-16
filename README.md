@@ -168,7 +168,10 @@ build-debug/tests/test_pk               # one program directly
 
 The shared library is linked with `--no-undefined`, which clashes with the
 sanitizer runtimes. To run the suite under ASan/UBSan, build the static
-library only:
+library only. CTest sets `LSAN_OPTIONS` to use `tests/lsan.supp` (OpenSSL
+keeps DRBG state in its secure heap, which LeakSanitizer cannot scan) and
+`ASAN_OPTIONS=fast_unwind_on_malloc=0` so that stacks through libcrypto
+are complete:
 
 ```sh
 CC=clang cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \

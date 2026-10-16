@@ -10,6 +10,17 @@
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Whether SEXP contains a list starting with TOKEN; the sublist that
+ * gcry_sexp_find_token returns is released, so this does not leak. */
+static int
+has_token(gcry_sexp_t sexp, const char *token)
+{
+    gcry_sexp_t l = gcry_sexp_find_token(sexp, token, 0);
+
+    gcry_sexp_release(l);
+    return l != NULL;
+}
+
 static gcry_sexp_t
 sexp(const char *text)
 {
@@ -899,7 +910,7 @@ TEST(elgamal)
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags raw) (value #0102030405060708#))"));
     ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
-    ASSERT_NOT_NULL(gcry_sexp_find_token(ciph, "elg", 0));
+    ASSERT_TRUE(has_token(ciph, "elg"));
     ASSERT_OK(gcry_pk_decrypt(&plain, ciph, priv));
     /* No flags in the enc-val: the legacy bare MPI result. */
     m = gcry_sexp_nth_mpi(plain, 0, GCRYMPI_FMT_STD);
@@ -916,7 +927,7 @@ TEST(elgamal)
     gcry_sexp_release(ciph);
 
     ASSERT_OK(gcry_pk_sign(&sig, data, priv));
-    ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "elg", 0));
+    ASSERT_TRUE(has_token(sig, "elg"));
     ASSERT_OK(gcry_pk_verify(sig, data, pub));
     gcry_sexp_release(data);
     ASSERT_OK(gcry_sexp_build(&data, NULL,
@@ -965,7 +976,7 @@ TEST(ecdsa_rfc6979_vector)
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags rfc6979) (hash sha256 #" SAMPLE_SHA256 "#))"));
     ASSERT_OK(gcry_pk_sign(&sig, data, skey));
-    ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "ecdsa", 0));
+    ASSERT_TRUE(has_token(sig, "ecdsa"));
     r = param_mpi(sig, "r");
     s = param_mpi(sig, "s");
     expect = hex_mpi(P256_SIG_R);
@@ -1183,7 +1194,7 @@ TEST(ed25519_vectors)
         data = sexp(text);
         ASSERT_NOT_NULL(data);
         ASSERT_OK(gcry_pk_sign(&sig, data, skey));
-        ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "eddsa", 0));
+        ASSERT_TRUE(has_token(sig, "eddsa"));
         r = param_bytes(sig, "r", &rlen);
         s = param_bytes(sig, "s", &slen);
         ASSERT_EQ(32, rlen);
@@ -1330,7 +1341,7 @@ TEST(ed25519_keygen_and_ed448)
     ASSERT_OK(gcry_pk_testkey(priv));
     ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (value %s))", "ed448 message"));
     ASSERT_OK(gcry_pk_sign(&sig, data, priv));
-    ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "eddsa", 0));
+    ASSERT_TRUE(has_token(sig, "eddsa"));
     q = param_bytes(sig, "r", &qlen);
     ASSERT_EQ(57, qlen);
     gcry_free(q);
@@ -2976,7 +2987,7 @@ TEST(rsa_encoding_vectors)
     for (i = 0; i < 32; i++) {
         unsigned int v;
 
-        sscanf(RSA_DIGEST + 2 * i, "%2x", &v);
+        sscanf(&RSA_DIGEST[2 * i], "%2x", &v);
         digest[i] = (unsigned char)v;
     }
 
@@ -3367,7 +3378,7 @@ TEST(ecc_sm2_and_curve_rules)
                               "(data (flags sm2) (hash sha256 %b))", 32,
                               digest));
     ASSERT_OK(gcry_pk_sign(&sig, data, sec));
-    ASSERT_NOT_NULL(gcry_sexp_find_token(sig, "sm2", 0));
+    ASSERT_TRUE(has_token(sig, "sm2"));
     ASSERT_OK(gcry_pk_verify(sig, data, pub));
     gcry_sexp_release(data);
     digest[0] ^= 1;

@@ -26,6 +26,14 @@ set(GCRYPT_OPENSSL_TESTS
 # from the shared library's export list are reachable.
 set(GCRYPT_OPENSSL_INTERNAL_TESTS test_curves test_internal)
 
+# Sanitizer settings for ASan/LSan builds; harmless otherwise. The leak
+# checker needs the slow unwinder to see through libcrypto (built without
+# frame pointers) so that the suppressions in lsan.supp can match.
+set(GCRYPT_OPENSSL_LSAN_ENV
+    "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp"
+    "ASAN_OPTIONS=fast_unwind_on_malloc=0"
+)
+
 foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
     add_executable(${test} ${test}.c)
     target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -33,6 +41,9 @@ foreach(test IN LISTS GCRYPT_OPENSSL_TESTS)
         ${test} PRIVATE gcrypt-openssl::gcrypt-openssl gcrypt-openssl::warnings
     )
     add_test(NAME ${test} COMMAND ${test})
+    set_tests_properties(
+        ${test} PROPERTIES ENVIRONMENT "${GCRYPT_OPENSSL_LSAN_ENV}"
+    )
 endforeach()
 
 if(GCRYPT_OPENSSL_BUILD_STATIC)
@@ -44,6 +55,9 @@ if(GCRYPT_OPENSSL_BUILD_STATIC)
             ${test} PRIVATE gcrypt-openssl::static gcrypt-openssl::warnings
         )
         add_test(NAME ${test} COMMAND ${test})
+        set_tests_properties(
+            ${test} PROPERTIES ENVIRONMENT "${GCRYPT_OPENSSL_LSAN_ENV}"
+        )
     endforeach()
 endif()
 
@@ -59,6 +73,9 @@ if(GCRYPT_OPENSSL_BUILD_SHARED AND GCRYPT_OPENSSL_BUILD_STATIC)
                                     gcrypt-openssl::warnings
     )
     add_test(NAME test_version_static COMMAND test_version_static)
+    set_tests_properties(
+        test_version_static PROPERTIES ENVIRONMENT "${GCRYPT_OPENSSL_LSAN_ENV}"
+    )
 endif()
 
 # The shared library must export exactly the reference library's symbols.

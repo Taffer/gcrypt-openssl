@@ -530,6 +530,21 @@ md_alloc(const struct gcry_md_context *ctx, size_t n)
     return ctx->secure ? _gcry_malloc_secure(n) : _gcry_malloc(n);
 }
 
+/* Copy of a cSHAKE customisation string with a terminating NUL, which
+ * OpenSSL expects even though it is also told the length. */
+static unsigned char *
+md_dup_string(const struct gcry_md_context *ctx, const void *s, size_t n)
+{
+    unsigned char *p = md_alloc(ctx, n + 1);
+
+    if (p) {
+        memcpy(p, s, n);
+        p[n] = 0;
+    }
+
+    return p;
+}
+
 /* ------------------------------------------------------------------ */
 /* Per algorithm state                                                 */
 /* ------------------------------------------------------------------ */
@@ -841,24 +856,22 @@ entry_dup(struct gcry_md_context *ctx, const struct md_entry *src)
     }
 
     if (src->cust_nlen) {
-        e->cust_n = md_alloc(ctx, src->cust_nlen);
+        e->cust_n = md_dup_string(ctx, src->cust_n, src->cust_nlen);
 
         if (!e->cust_n) {
             goto fail;
         }
 
-        memcpy(e->cust_n, src->cust_n, src->cust_nlen);
         e->cust_nlen = src->cust_nlen;
     }
 
     if (src->cust_slen) {
-        e->cust_s = md_alloc(ctx, src->cust_slen);
+        e->cust_s = md_dup_string(ctx, src->cust_s, src->cust_slen);
 
         if (!e->cust_s) {
             goto fail;
         }
 
-        memcpy(e->cust_s, src->cust_s, src->cust_slen);
         e->cust_slen = src->cust_slen;
     }
 
@@ -1328,26 +1341,24 @@ md_customize(gcry_md_hd_t hd, const void *buffer, size_t buflen)
         e->cust_slen = 0;
 
         if (c->n_len) {
-            e->cust_n = md_alloc(ctx, c->n_len);
+            e->cust_n = md_dup_string(ctx, c->n, c->n_len);
 
             if (!e->cust_n) {
                 rc = GPG_ERR_ENOMEM;
                 break;
             }
 
-            memcpy(e->cust_n, c->n, c->n_len);
             e->cust_nlen = c->n_len;
         }
 
         if (c->s_len) {
-            e->cust_s = md_alloc(ctx, c->s_len);
+            e->cust_s = md_dup_string(ctx, c->s, c->s_len);
 
             if (!e->cust_s) {
                 rc = GPG_ERR_ENOMEM;
                 break;
             }
 
-            memcpy(e->cust_s, c->s, c->s_len);
             e->cust_slen = c->s_len;
         }
 
@@ -1766,7 +1777,10 @@ gcry_md_algo_info(int algo, int what, void *buffer, size_t *nbytes)
             size_t asnlen = spec->asnlen;
 
             if (buffer && nbytes && *nbytes >= asnlen) {
-                memcpy(buffer, spec->asn, asnlen);
+                if (asnlen) {
+                    memcpy(buffer, spec->asn, asnlen);
+                }
+
                 *nbytes = asnlen;
             } else if (!buffer && nbytes) {
                 *nbytes = asnlen;

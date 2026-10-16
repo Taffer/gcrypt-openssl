@@ -530,7 +530,7 @@ TEST(hkdf_vectors)
         "\xda\x32\x75\x60\x0c\x2f\x09\xb8\x36\x77\x93\xa9\xac\xa3\xdb\x71"
         "\xcc\x30\xc5\x81\x79\xec\x3e\x87\xc1\x4c\x01\xd5\xc1\xf3\x43\x4f"
         "\x1d\x87";
-    unsigned long param[2];
+    unsigned long param[3]; /* Three for the paramlen rejection case. */
     unsigned char out[82];
     gcry_kdf_hd_t hd;
     int i;

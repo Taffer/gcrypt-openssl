@@ -321,7 +321,12 @@ TEST(context_from_key_and_get_sexp)
     q = gcry_mpi_ec_get_mpi("q.x", ctx, 1);
     ASSERT_TRUE(mpi_eq_hex(q, P256_QX));
     gcry_mpi_release(q);
-    ASSERT_TRUE(gcry_mpi_ec_curve_point(gcry_mpi_ec_get_point("q", ctx, 1), ctx));
+    {
+        gcry_mpi_point_t pt = gcry_mpi_ec_get_point("q", ctx, 1);
+
+        ASSERT_TRUE(gcry_mpi_ec_curve_point(pt, ctx));
+        gcry_mpi_point_release(pt);
+    }
     gcry_ctx_release(ctx);
     gcry_sexp_release(key);
 }
@@ -697,8 +702,8 @@ TEST(context_from_odd_keys)
     gcry_sexp_t key;
     gcry_mpi_point_t Q;
     unsigned char out[64];
-    unsigned char scalar[32] = { 9 };
-    unsigned char point[32] = { 9 };
+    unsigned char scalar[56] = { 9 }; /* Large enough for X448. */
+    unsigned char point[56] = { 9 };
 
     /* A truncated q is accepted when the context is built; the error
      * surfaces later when the point is used. */

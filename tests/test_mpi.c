@@ -813,6 +813,10 @@ TEST(immutable_arithmetic)
     gcry_mpi_release(q);
 }
 
+/* An MPI turned into a constant can never be released; keeping it
+ * reachable from here stops leak checkers from reporting it. */
+static gcry_mpi_t kept_constant;
+
 TEST(immutable_refusals)
 {
     gcry_mpi_t r = from_hex("01");
@@ -847,6 +851,7 @@ TEST(immutable_refusals)
     gcry_mpi_set_ui(q, 77);
     ASSERT_EQ(0, gcry_mpi_cmp_ui(q, 2));
     /* A constant is never released, so Q is deliberately kept. */
+    kept_constant = q;
 }
 
 TEST(arithmetic_edges)
