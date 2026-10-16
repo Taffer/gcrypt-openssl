@@ -153,10 +153,20 @@ TEST(allocation_handler)
     gcry_free(p);
     p = gcry_malloc_secure(8);
     ASSERT_NOT_NULL(p);
-    ASSERT_FALSE(gcry_is_secure(p));
-    gcry_free(p);
-    ASSERT_EQ(2, custom_alloc_calls);
-    ASSERT_EQ(2, custom_free_calls);
+
+    if (gcry_fips_mode_active()) {
+        /* Custom allocators are ignored in FIPS mode, as in the
+         * reference: the built-in ones stay in charge. */
+        ASSERT_TRUE(gcry_is_secure(p));
+        gcry_free(p);
+        ASSERT_EQ(0, custom_alloc_calls);
+        ASSERT_EQ(0, custom_free_calls);
+    } else {
+        ASSERT_FALSE(gcry_is_secure(p));
+        gcry_free(p);
+        ASSERT_EQ(2, custom_alloc_calls);
+        ASSERT_EQ(2, custom_free_calls);
+    }
 }
 
 int

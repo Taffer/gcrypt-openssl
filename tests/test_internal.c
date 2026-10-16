@@ -184,7 +184,8 @@ TEST(flags)
     ASSERT_EQ(3, _gcry_log_verbosity());
     ASSERT_OK(gcry_control(GCRYCTL_SET_VERBOSITY, 0));
     ASSERT_EQ(0, _gcry_log_verbosity());
-    ASSERT_EQ(0, _gcry_fips_mode());
+    /* The internal flag is what the public query reports. */
+    ASSERT_EQ(gcry_fips_mode_active() ? 1 : 0, _gcry_fips_mode());
 }
 
 TEST(printhex)
@@ -288,7 +289,10 @@ child_log_unknown_level(void)
 
 TEST(fatal_paths)
 {
-    ASSERT_EQ(42, run_child(child_fatal_with_handler));
+    /* The fatal error handler is ignored in FIPS mode, as in the
+     * reference: the message goes to stderr and the process aborts. */
+    ASSERT_EQ(gcry_fips_mode_active() ? 1000 + SIGABRT : 42,
+              run_child(child_fatal_with_handler));
     ASSERT_EQ(1000 + SIGABRT, run_child(child_fatal_without_handler));
     ASSERT_EQ(1000 + SIGABRT, run_child(child_bug));
     ASSERT_EQ(1000 + SIGABRT, run_child(child_log_fatal));

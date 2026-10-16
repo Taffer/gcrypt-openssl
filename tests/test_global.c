@@ -219,11 +219,16 @@ TEST(control_argument_checks)
     gcry_ctx_release(NULL);
 }
 
-TEST(fips_mode_off)
+TEST(fips_mode_state)
 {
-    /* This test suite does not run in FIPS mode. */
-    ASSERT_OK(gcry_control(GCRYCTL_FIPS_MODE_P));
-    ASSERT_FALSE(gcry_fips_mode_active());
+    /* The mode is whatever the OpenSSL configuration made it; the control
+     * command (an error code means "yes") and the macro must agree. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_GENERAL, gcry_control(GCRYCTL_FIPS_MODE_P));
+    } else {
+        ASSERT_OK(gcry_control(GCRYCTL_FIPS_MODE_P));
+    }
+
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_REJECT_NON_FIPS, 0u));
     ASSERT_OK(gcry_control(GCRYCTL_FIPS_REJECT_NON_FIPS,
                            (unsigned int)GCRY_FIPS_FLAG_REJECT_DEFAULT));
@@ -345,27 +350,33 @@ TEST(fips_service_indicators)
 
 TEST(selftest)
 {
+    /* In FIPS mode this runs the FIPS provider's known answer tests on
+     * demand; they must pass whatever size of secure memory pool the
+     * program asked for. */
     ASSERT_OK(gcry_control(GCRYCTL_SELFTEST));
 }
 
 TEST(rng_type)
 {
+    /* The FIPS DRBG is the generator in FIPS mode, as in the reference. */
+    int expected = gcry_fips_mode_active() ? GCRY_RNG_TYPE_FIPS
+                   : GCRY_RNG_TYPE_STANDARD;
     int type = -1;
 
     ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
-    ASSERT_EQ(GCRY_RNG_TYPE_STANDARD, type);
+    ASSERT_EQ(expected, type);
     ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE,
                            GCRY_RNG_TYPE_STANDARD));
     ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE, 0));
     type = -1;
     ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
-    ASSERT_EQ(GCRY_RNG_TYPE_STANDARD, type);
+    ASSERT_EQ(expected, type);
     /* After initialisation a preference is accepted but ignored. */
     ASSERT_OK(gcry_control(GCRYCTL_SET_PREFERRED_RNG_TYPE,
                            GCRY_RNG_TYPE_SYSTEM));
     type = -1;
     ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
-    ASSERT_EQ(GCRY_RNG_TYPE_STANDARD, type);
+    ASSERT_EQ(expected, type);
 }
 
 TEST(config_items)
@@ -390,11 +401,26 @@ TEST(config_items)
         char *line = gcry_get_config(0, "fips-mode");
 
         ASSERT_NOT_NULL(line);
-        ASSERT_TRUE(strncmp(line, "fips-mode:n:", 12) == 0);
+
+        if (gcry_fips_mode_active()) {
+            /* "fips-mode:y::VERSION:" with the FIPS provider's version. */
+            ASSERT_TRUE(strncmp(line, "fips-mode:y::", 13) == 0);
+            ASSERT_TRUE(strlen(line) > 14);
+            ASSERT_EQ(':', line[strlen(line) - 1]);
+        } else {
+            ASSERT_TRUE(strncmp(line, "fips-mode:n:", 12) == 0);
+        }
+
         gcry_free(line);
         line = gcry_get_config(0, "rng-type");
         ASSERT_NOT_NULL(line);
-        ASSERT_TRUE(strncmp(line, "rng-type:standard:1:", 20) == 0);
+
+        if (gcry_fips_mode_active()) {
+            ASSERT_TRUE(strncmp(line, "rng-type:fips:2:", 16) == 0);
+        } else {
+            ASSERT_TRUE(strncmp(line, "rng-type:standard:1:", 20) == 0);
+        }
+
         gcry_free(line);
     }
 }
@@ -688,7 +714,7 @@ main(void)
     RUN_TEST(control_noops);
     RUN_TEST(control_unsupported);
     RUN_TEST(control_argument_checks);
-    RUN_TEST(fips_mode_off);
+    RUN_TEST(fips_mode_state);
     RUN_TEST(fips_service_indicators);
     RUN_TEST(selftest);
     RUN_TEST(rng_type);

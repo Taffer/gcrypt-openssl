@@ -181,12 +181,53 @@ TEST(free_keeps_errno)
     errno = 0;
 }
 
+/* In FIPS mode neither handler is installed, as in the reference: the
+ * built-in allocator stays in charge, so nothing ever runs out of core
+ * and the secure allocations really are secure. */
+static void
+outofcore_handlers_ignored(void)
+{
+    int hits = 0;
+    void *p;
+    char *s;
+
+    gcry_set_outofcore_handler(oom_retry, &hits);
+    gcry_set_allocation_handler(failing_alloc, failing_alloc, never_secure,
+                                plain_realloc, plain_free);
+
+    fails_left = 1;
+    p = gcry_xmalloc(16);
+    ASSERT_NOT_NULL(p);
+    ASSERT_FALSE(gcry_is_secure(p));
+    gcry_free(p);
+    p = gcry_xmalloc_secure(24);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(gcry_is_secure(p));
+    gcry_free(p);
+    p = gcry_xcalloc_secure(3, 8);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(gcry_is_secure(p));
+    gcry_free(p);
+    s = gcry_xstrdup("retry");
+    ASSERT_STR_EQ("retry", s);
+    gcry_free(s);
+    ASSERT_EQ(1, fails_left); /* The failing allocator never ran. */
+    ASSERT_EQ(0, oom_calls);
+    ASSERT_EQ(0, hits);
+    gcry_set_outofcore_handler(NULL, NULL);
+}
+
 TEST(outofcore_handler_retries)
 {
     int hits = 0;
     void *p;
     char *s;
     unsigned char *r;
+
+    if (gcry_fips_mode_active()) {
+        outofcore_handlers_ignored();
+        return;
+    }
 
     gcry_set_outofcore_handler(oom_retry, &hits);
     gcry_set_allocation_handler(failing_alloc, failing_alloc, never_secure,
@@ -241,11 +282,57 @@ TEST(outofcore_handler_retries)
 
 /* --- children --------------------------------------------------------------- */
 
+/* GCRYCTL_DISABLE_SECMEM is ignored in FIPS mode, as in the reference:
+ * the command succeeds and secure memory stays secure. */
+static void
+child_disable_secmem_fips(void)
+{
+    void *p;
+    char *s;
+
+    if (gcry_control(GCRYCTL_DISABLE_SECMEM)) {
+        _exit(20);
+    }
+
+    p = gcry_malloc_secure(32);
+
+    if (!p || !gcry_is_secure(p)) {
+        _exit(21);
+    }
+
+    memcpy(p, "still", 6);
+    s = gcry_strdup(p);
+
+    if (!s || !gcry_is_secure(s) || strcmp(s, "still")) {
+        _exit(22);
+    }
+
+    gcry_free(s);
+    gcry_free(p);
+    p = gcry_xmalloc_secure(8);
+
+    if (!p || !gcry_is_secure(p)) {
+        _exit(23);
+    }
+
+    gcry_free(p);
+
+    if (gcry_control(GCRYCTL_TERM_SECMEM)) {
+        _exit(24);
+    }
+
+    _exit(0);
+}
+
 static void
 child_disable_secmem(void)
 {
     void *p;
     char *s;
+
+    if (gcry_fips_mode_active()) {
+        child_disable_secmem_fips();
+    }
 
     if (gcry_control(GCRYCTL_DISABLE_SECMEM)) {
         _exit(10);
@@ -293,6 +380,9 @@ TEST(disable_secmem_in_child)
     ASSERT_EQ(0, run_child(child_disable_secmem));
 }
 
+/* In FIPS mode the failing allocator is never installed, so the
+ * allocation succeeds; a NULL argument to an x-function is fatal all the
+ * same and shows that the fatal error handler is ignored too. */
 static void
 child_fatal_handler(void)
 {
@@ -303,13 +393,25 @@ child_fatal_handler(void)
                                 plain_realloc, plain_free);
     fails_left = 1000; /* Never succeeds: out of core is fatal. */
     p = gcry_xmalloc(16);
+
+    if (gcry_fips_mode_active()) {
+        if (!p || fails_left != 1000) {
+            _exit(2);
+        }
+
+        gcry_free(p);
+        p = gcry_xstrdup(NULL);
+    }
+
     free(p);
     _exit(1); /* Unreachable. */
 }
 
 TEST(fatal_handler_called)
 {
-    ASSERT_EQ(42, run_child(child_fatal_handler));
+    /* The handler is ignored in FIPS mode: the default path aborts. */
+    ASSERT_EQ(gcry_fips_mode_active() ? 1000 + SIGABRT : 42,
+              run_child(child_fatal_handler));
 }
 
 static void
@@ -321,12 +423,23 @@ child_fatal_abort(void)
                                 plain_realloc, plain_free);
     fails_left = 1000;
     s = gcry_xstrdup("doomed");
+
+    if (gcry_fips_mode_active()) {
+        if (!s || fails_left != 1000) {
+            _exit(2);
+        }
+
+        gcry_free(s);
+        s = gcry_xstrdup(NULL);
+    }
+
     free(s);
     _exit(1); /* Unreachable. */
 }
 
 TEST(fatal_without_handler_aborts)
 {
+    /* The same in both modes: a message on stderr, then abort(). */
     ASSERT_EQ(1000 + SIGABRT, run_child(child_fatal_abort));
 }
 
@@ -356,8 +469,10 @@ child_xstrdup_null(void)
 TEST(xstrdup_null_is_fatal)
 {
     /* The x-functions never return NULL, so a NULL input is reported
-     * through the fatal error handler instead. */
-    ASSERT_EQ(44, run_child(child_xstrdup_null));
+     * through the fatal error handler instead; in FIPS mode the handler
+     * is ignored and the default path aborts. */
+    ASSERT_EQ(gcry_fips_mode_active() ? 1000 + SIGABRT : 44,
+              run_child(child_xstrdup_null));
 }
 
 int
