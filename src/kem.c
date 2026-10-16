@@ -1,11 +1,18 @@
 /*
  * kem.c - Key encapsulation mechanisms.
  *
- * ML-KEM (FIPS 203) and the DHKEM constructions of RFC 9180 are provided
- * by OpenSSL's EVP_PKEY encapsulation API.  The "raw" ECC KEMs are plain
+ * ML-KEM (FIPS 203) and the X25519/X448 DHKEMs of RFC 9180 are provided
+ * by OpenSSL's EVP_PKEY encapsulation API.  The DHKEMs over the NIST
+ * curves are composed here from EC_POINT Diffie-Hellman and HKDF, because
+ * OpenSSL's EC KEM lives in the default provider only while ECDH and HKDF
+ * are also in the FIPS provider.  The "raw" ECC KEMs are plain
  * Diffie-Hellman on X25519/X448 (via EVP_PKEY) or on the Weierstrass
  * curves of the curve table (via EC_POINT arithmetic), with an ephemeral
  * public key as the ciphertext.
+ *
+ * In FIPS mode only the curves the table approves for it are served:
+ * the FIPS provider has no X25519/X448 at all, and brainpool and secp256k1
+ * are not approved.
  *
  * Byte formats follow the reference implementation:
  *   ML-KEM:       ek/dk/ct as in FIPS 203 (dk is the expanded form).
@@ -21,7 +28,7 @@
 
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
-#include <openssl/param_build.h>
+#include <openssl/kdf.h>
 #include <openssl/rand.h>
 
 #define MLKEM_RANDOM_LEN GCRY_KEM_MLKEM_RANDOM_LEN
@@ -158,19 +165,24 @@ find_info(int algo)
     return NULL;
 }
 
-/* OpenSSL group name for the EC based DHKEMs. */
-static const char *
-ossl_group_name(const struct kem_info *info)
+/* Whether the curve of an ECC KEM may be used right now: in FIPS mode
+ * only the curves the table approves for it. */
+static gcry_err_code_t
+check_curve_allowed(const struct kem_info *info)
 {
-    if (!strcmp(info->curve, "NIST P-256")) {
-        return "P-256";
+    const struct gcry_ecc_curve *curve;
+
+    if (!info->curve || !_gcry_fips_mode()) {
+        return 0;
     }
 
-    if (!strcmp(info->curve, "NIST P-384")) {
-        return "P-384";
+    curve = _gcry_ecc_curve_find(info->curve);
+
+    if (!curve) {
+        return GPG_ERR_UNKNOWN_CURVE;
     }
 
-    return "P-521";
+    return curve->fips ? 0 : GPG_ERR_NOT_SUPPORTED;
 }
 
 static gcry_err_code_t
@@ -392,7 +404,11 @@ mont_keypair(const struct kem_info *info, unsigned char *pubkey,
 {
     EVP_PKEY *pkey;
     size_t outlen = info->pubkey_len;
-    gcry_err_code_t rc = 0;
+    gcry_err_code_t rc = check_curve_allowed(info);
+
+    if (rc) {
+        return rc;
+    }
 
     if (RAND_priv_bytes_ex(_gcry_libctx(), seckey, info->seckey_len, 0) <= 0) {
         return ossl_error(GPG_ERR_INTERNAL);
@@ -423,7 +439,11 @@ mont_mul(const struct kem_info *info, unsigned char *shared,
     EVP_PKEY *peer = NULL;
     EVP_PKEY_CTX *ctx = NULL;
     size_t outlen = info->shared_len;
-    gcry_err_code_t rc = 0;
+    gcry_err_code_t rc = check_curve_allowed(info);
+
+    if (rc) {
+        return rc;
+    }
 
     priv = EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(), info->ossl_name,
                                            _gcry_propq(), scalar,
@@ -475,8 +495,13 @@ static gcry_err_code_t
 weier_open(const struct kem_info *info, struct weier *w)
 {
     const struct gcry_ecc_curve *curve = _gcry_ecc_curve_find(info->curve);
+    gcry_err_code_t rc = check_curve_allowed(info);
 
     memset(w, 0, sizeof * w);
+
+    if (rc) {
+        return rc;
+    }
 
     if (!curve) {
         return GPG_ERR_UNKNOWN_CURVE;
@@ -587,7 +612,9 @@ leave:
     return rc;
 }
 
-/* result = scalar * point, all in the byte formats described above. */
+/* result = scalar * point, or scalar * G when POINT is NULL, all in the
+ * byte formats described above; RESULT is an uncompressed point of
+ * info->pubkey_len bytes. */
 static gcry_err_code_t
 weier_mul(const struct kem_info *info, unsigned char *result,
           const unsigned char *scalar, const unsigned char *point)
@@ -614,19 +641,24 @@ weier_mul(const struct kem_info *info, unsigned char *result,
         goto leave;
     }
 
-    if (!EC_POINT_oct2point(w.group, pt, point, info->pubkey_len, w.ctx)
-        || EC_POINT_is_on_curve(w.group, pt, w.ctx) != 1) {
-        ERR_clear_error();
-        rc = GPG_ERR_INV_DATA;
-        goto leave;
-    }
+    if (point) {
+        if (!EC_POINT_oct2point(w.group, pt, point, info->pubkey_len, w.ctx)
+            || EC_POINT_is_on_curve(w.group, pt, w.ctx) != 1) {
+            ERR_clear_error();
+            rc = GPG_ERR_INV_DATA;
+            goto leave;
+        }
 
-    if (!EC_POINT_mul(w.group, r, NULL, pt, k, w.ctx)) {
+        if (!EC_POINT_mul(w.group, r, NULL, pt, k, w.ctx)) {
+            rc = ossl_error(GPG_ERR_INTERNAL);
+            goto leave;
+        }
+    } else if (!EC_POINT_mul(w.group, r, k, NULL, NULL, w.ctx)) {
         rc = ossl_error(GPG_ERR_INTERNAL);
         goto leave;
     }
 
-    rc = weier_point_out(&w, r, result, info->shared_len);
+    rc = weier_point_out(&w, r, result, info->pubkey_len);
 
 leave:
     BN_clear_free(k);
@@ -651,71 +683,33 @@ dhkem_params(OSSL_PARAM params[2])
     return params;
 }
 
-/* Build the recipient's public or private EVP_PKEY from the raw bytes. */
+/* Build the recipient's public or private X25519/X448 EVP_PKEY from the
+ * raw bytes. */
 static gcry_err_code_t
 dhkem_pkey(const struct kem_info *info, const unsigned char *data, int priv,
            EVP_PKEY **r_pkey)
 {
+    gcry_err_code_t rc = check_curve_allowed(info);
+
     *r_pkey = NULL;
 
-    if (info->kind == KIND_DHKEM_MONT) {
-        *r_pkey = priv
-                  ? EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(),
-                                                    info->ossl_name, _gcry_propq(), data,
-                                                    info->seckey_len)
-                  : EVP_PKEY_new_raw_public_key_ex(_gcry_libctx(),
-                                                   info->ossl_name, _gcry_propq(), data,
-                                                   info->pubkey_len);
-
-        if (!*r_pkey) {
-            return ossl_error(GPG_ERR_INV_DATA);
-        }
-
-        return 0;
-    }
-
-    {
-        OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
-        OSSL_PARAM *params = NULL;
-        EVP_PKEY_CTX *ctx = NULL;
-        BIGNUM *k = NULL;
-        gcry_err_code_t rc = 0;
-        int ok;
-
-        if (!bld) {
-            return GPG_ERR_ENOMEM;
-        }
-
-        ok = OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
-                                             ossl_group_name(info), 0);
-
-        if (priv) {
-            k = BN_secure_new();
-            ok = ok && k && BN_bin2bn(data, (int)info->seckey_len, k)
-                 && OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, k);
-        } else {
-            ok = ok && OSSL_PARAM_BLD_push_octet_string(bld,
-                                                        OSSL_PKEY_PARAM_PUB_KEY, data, info->pubkey_len);
-        }
-
-        params = ok ? OSSL_PARAM_BLD_to_param(bld) : NULL;
-        ctx = EVP_PKEY_CTX_new_from_name(_gcry_libctx(), "EC",
-                                         _gcry_propq());
-
-        if (!params || !ctx || EVP_PKEY_fromdata_init(ctx) <= 0
-            || EVP_PKEY_fromdata(ctx, r_pkey,
-                                 priv ? EVP_PKEY_KEYPAIR
-                                 : EVP_PKEY_PUBLIC_KEY, params) <= 0
-            || !*r_pkey) {
-            rc = ossl_error(GPG_ERR_INV_DATA);
-        }
-
-        EVP_PKEY_CTX_free(ctx);
-        OSSL_PARAM_free(params);
-        OSSL_PARAM_BLD_free(bld);
-        BN_clear_free(k);
+    if (rc) {
         return rc;
     }
+
+    *r_pkey = priv
+              ? EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(),
+                                                info->ossl_name, _gcry_propq(), data,
+                                                info->seckey_len)
+              : EVP_PKEY_new_raw_public_key_ex(_gcry_libctx(),
+                                               info->ossl_name, _gcry_propq(), data,
+                                               info->pubkey_len);
+
+    if (!*r_pkey) {
+        return ossl_error(GPG_ERR_INV_DATA);
+    }
+
+    return 0;
 }
 
 static gcry_err_code_t
@@ -760,6 +754,185 @@ dhkem_decap(const struct kem_info *info, const unsigned char *seckey,
     return rc;
 }
 
+/* ---- DHKEM over the NIST curves: ECDH + HKDF, RFC 9180 section 4.1 ---- */
+
+/* Hash name and suite_id ("KEM" || I2OSP(kem_id, 2)) of a NIST curve
+ * DHKEM, RFC 9180 section 7.1. */
+static void
+dhkem_suite(const struct kem_info *info, const char **r_digest,
+            unsigned char suite_id[5])
+{
+    unsigned int kem_id;
+
+    if (info->algo == GCRY_KEM_DHKEMP256R1) {
+        kem_id = 0x0010;
+        *r_digest = "SHA256";
+    } else if (info->algo == GCRY_KEM_DHKEMP384R1) {
+        kem_id = 0x0011;
+        *r_digest = "SHA384";
+    } else {
+        kem_id = 0x0012;
+        *r_digest = "SHA512";
+    }
+
+    memcpy(suite_id, "KEM", 3);
+    suite_id[3] = (unsigned char)(kem_id >> 8);
+    suite_id[4] = (unsigned char)kem_id;
+}
+
+/* One HKDF stage with OpenSSL's KDF: MODE is EVP_KDF_HKDF_MODE_EXTRACT_ONLY
+ * (KEY is the IKM, the salt is empty, OUT receives the PRK) or
+ * EVP_KDF_HKDF_MODE_EXPAND_ONLY (KEY is the PRK, INFO the context). */
+static gcry_err_code_t
+hkdf_stage(const char *digest, int mode, const unsigned char *key,
+           size_t keylen, const unsigned char *info, size_t infolen,
+           unsigned char *out, size_t outlen)
+{
+    EVP_KDF *kdf = EVP_KDF_fetch(_gcry_libctx(), "HKDF", _gcry_propq());
+    EVP_KDF_CTX *kctx = kdf ? EVP_KDF_CTX_new(kdf) : NULL;
+    OSSL_PARAM params[5];
+    size_t n = 0;
+    gcry_err_code_t rc = 0;
+
+    EVP_KDF_free(kdf);
+
+    if (!kctx) {
+        return ossl_error(GPG_ERR_NOT_SUPPORTED);
+    }
+
+    params[n++] = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+                                                   unconst(digest), 0);
+    params[n++] = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode);
+    params[n++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
+                                                    unconst(key), keylen);
+
+    if (mode == EVP_KDF_HKDF_MODE_EXPAND_ONLY) {
+        params[n++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO,
+                                                        unconst(info), infolen);
+    }
+
+    params[n] = OSSL_PARAM_construct_end();
+
+    if (EVP_KDF_derive(kctx, out, outlen, params) <= 0) {
+        rc = ossl_error(GPG_ERR_INTERNAL);
+    }
+
+    EVP_KDF_CTX_free(kctx);
+    return rc;
+}
+
+/* RFC 9180 ExtractAndExpand(dh, kem_context):
+ *   eae_prk = LabeledExtract("", "eae_prk", dh)
+ *   shared  = LabeledExpand(eae_prk, "shared_secret", kem_context, Nsecret)
+ * where the labeled forms prefix "HPKE-v1" || suite_id || label (and, for
+ * the expansion, I2OSP(Nsecret, 2)) to the input. */
+static gcry_err_code_t
+dhkem_extract_expand(const struct kem_info *info, const unsigned char *dh,
+                     size_t dhlen, const unsigned char *kem_context,
+                     size_t ctxlen, unsigned char *shared, size_t shared_len)
+{
+    const char *digest;
+    unsigned char suite_id[5];
+    unsigned char ikm[7 + 5 + 7 + 66];
+    unsigned char label[2 + 7 + 5 + 13 + 2 * (1 + 2 * 66)];
+    unsigned char prk[64];
+    size_t prklen = info->shared_len; /* Nh == Nsecret for these suites. */
+    size_t n = 0;
+    gcry_err_code_t rc;
+
+    dhkem_suite(info, &digest, suite_id);
+
+    memcpy(ikm + n, "HPKE-v1", 7);
+    n += 7;
+    memcpy(ikm + n, suite_id, 5);
+    n += 5;
+    memcpy(ikm + n, "eae_prk", 7);
+    n += 7;
+    memcpy(ikm + n, dh, dhlen);
+    n += dhlen;
+    rc = hkdf_stage(digest, EVP_KDF_HKDF_MODE_EXTRACT_ONLY, ikm, n, NULL, 0,
+                    prk, prklen);
+
+    if (rc) {
+        goto leave;
+    }
+
+    n = 0;
+    label[n++] = (unsigned char)(shared_len >> 8);
+    label[n++] = (unsigned char)shared_len;
+    memcpy(label + n, "HPKE-v1", 7);
+    n += 7;
+    memcpy(label + n, suite_id, 5);
+    n += 5;
+    memcpy(label + n, "shared_secret", 13);
+    n += 13;
+    memcpy(label + n, kem_context, ctxlen);
+    n += ctxlen;
+    rc = hkdf_stage(digest, EVP_KDF_HKDF_MODE_EXPAND_ONLY, prk, prklen, label,
+                    n, shared, shared_len);
+
+leave:
+    _gcry_wipememory(ikm, sizeof ikm);
+    _gcry_wipememory(prk, sizeof prk);
+    return rc;
+}
+
+/* Encap(pkR): an ephemeral key pair, dh = skE * pkR (its x coordinate),
+ * enc = pkE, kem_context = enc || pkR. */
+static gcry_err_code_t
+weier_dhkem_encap(const struct kem_info *info, const unsigned char *pubkey,
+                  unsigned char *enc, unsigned char *shared,
+                  size_t shared_len)
+{
+    unsigned char sk_e[66];
+    unsigned char dh[1 + 2 * 66];
+    unsigned char kem_context[2 * (1 + 2 * 66)];
+    gcry_err_code_t rc;
+
+    rc = weier_keypair(info, enc, sk_e);
+
+    if (!rc) {
+        rc = weier_mul(info, dh, sk_e, pubkey);
+    }
+
+    if (!rc) {
+        memcpy(kem_context, enc, info->pubkey_len);
+        memcpy(kem_context + info->pubkey_len, pubkey, info->pubkey_len);
+        rc = dhkem_extract_expand(info, dh + 1, info->seckey_len, kem_context,
+                                  2 * info->pubkey_len, shared, shared_len);
+    }
+
+    _gcry_wipememory(sk_e, sizeof sk_e);
+    _gcry_wipememory(dh, sizeof dh);
+    return rc;
+}
+
+/* Decap(enc, skR): dh = skR * enc, kem_context = enc || pk(skR). */
+static gcry_err_code_t
+weier_dhkem_decap(const struct kem_info *info, const unsigned char *seckey,
+                  const unsigned char *enc, unsigned char *shared,
+                  size_t shared_len)
+{
+    unsigned char dh[1 + 2 * 66];
+    unsigned char kem_context[2 * (1 + 2 * 66)];
+    gcry_err_code_t rc;
+
+    rc = weier_mul(info, dh, seckey, enc);
+
+    if (!rc) {
+        rc = weier_mul(info, kem_context + info->pubkey_len, seckey, NULL);
+    }
+
+    if (!rc) {
+        memcpy(kem_context, enc, info->pubkey_len);
+        rc = dhkem_extract_expand(info, dh + 1, info->seckey_len, kem_context,
+                                  2 * info->pubkey_len, shared, shared_len);
+    }
+
+    _gcry_wipememory(dh, sizeof dh);
+    return rc;
+}
+
 /* The X448 DHKEM secret is 64 bytes (RFC 9180), yet the public header's
  * GCRY_KEM_DHKEM448_SHARED_LEN says 56.  Accept both: a 56 byte buffer
  * receives the first 56 bytes of the RFC secret, which is what the
@@ -798,7 +971,10 @@ dhkem_run(const struct kem_info *info, int encap, const unsigned char *key,
         return rc;
     }
 
-    if (encap) {
+    if (info->kind == KIND_DHKEM_WEIER) {
+        rc = encap ? weier_dhkem_encap(info, key, ciphertext, tmp, real_len)
+             : weier_dhkem_decap(info, key, in_ciphertext, tmp, real_len);
+    } else if (encap) {
         rc = dhkem_encap(info, key, ciphertext, tmp, real_len);
     } else {
         rc = dhkem_decap(info, key, in_ciphertext, tmp, real_len);
