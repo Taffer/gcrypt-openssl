@@ -1236,8 +1236,10 @@ make_list(const struct item *items, size_t nitems, int secure)
     *d++ = ST_OPEN;
 
     for (i = 0; i < nitems; i++) {
-        memcpy(d, items[i].p, items[i].n);
-        d += items[i].n;
+        if (items[i].n) {
+            memcpy(d, items[i].p, items[i].n);
+            d += items[i].n;
+        }
     }
 
     *d++ = ST_CLOSE;

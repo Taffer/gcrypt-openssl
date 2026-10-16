@@ -3483,7 +3483,8 @@ TEST(null_arguments)
     gcry_sexp_t key = genkey("(genkey (ecc (curve \"Ed25519\")))");
     gcry_sexp_t data = sexp("(data (flags eddsa) (hash-algo sha512)"
                             " (value #616263#))");
-    gcry_sexp_t result = sexp("(foo)");
+    gcry_sexp_t probe = sexp("(foo)");
+    gcry_sexp_t result = probe;
     gcry_ctx_t ctx = NULL;
     unsigned char grip[20];
     unsigned char byte = 1;
@@ -3502,7 +3503,7 @@ TEST(null_arguments)
                gcry_pk_hash_sign(NULL, "(data (value %b))", key, NULL, NULL));
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_hash_sign(&result, NULL, key, NULL,
                                                   NULL));
-    gcry_sexp_release(result); /* Untouched: the template is checked first. */
+    ASSERT_TRUE(result == probe); /* Untouched: the template is checked first. */
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_pk_hash_verify(NULL, NULL, key, NULL,
                                                     NULL));
     ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pubkey_get_sexp(NULL, 0, NULL));
@@ -3521,13 +3522,15 @@ TEST(null_arguments)
 
     /* A NULL S-expression is not a key or data object: the reference
      * library reports GPG_ERR_INV_OBJ, not GPG_ERR_INV_ARG. */
-    result = sexp("(foo)");
+    /* RESULT starts out as a stale pointer to prove the calls clear it. */
+    ASSERT_NOT_NULL(probe);
+    result = probe;
     ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_encrypt(&result, data, NULL));
     ASSERT_NULL(result);
-    result = sexp("(foo)");
+    result = probe;
     ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_decrypt(&result, data, NULL));
     ASSERT_NULL(result);
-    result = sexp("(foo)");
+    result = probe;
     ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_sign(&result, data, NULL));
     ASSERT_NULL(result);
     ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_sign(&result, NULL, key));
@@ -3551,6 +3554,7 @@ TEST(null_arguments)
     ASSERT_NULL(gcry_pk_get_param(GCRY_PK_ECDSA, NULL));
     ASSERT_EQ(0, gcry_pk_map_name(NULL));
 
+    gcry_sexp_release(probe);
     gcry_sexp_release(data);
     gcry_sexp_release(key);
 }
