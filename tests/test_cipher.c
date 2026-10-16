@@ -1,4 +1,7 @@
 #include <gcrypt.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/provider.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -2409,6 +2412,479 @@ TEST(upstream_keywrap_and_ccm)
     gcry_cipher_close(hd);
 }
 
+/* Multiply a 128-bit XTS tweak by alpha in GF(2^128), IEEE 1619 style:
+ * little-endian shift left by one with the reduction polynomial 0x87. */
+static void
+xts_ref_mul_alpha(unsigned char t[16])
+{
+    unsigned char carry = 0;
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        unsigned char next = (unsigned char)(t[i] >> 7);
+
+        t[i] = (unsigned char)((t[i] << 1) | carry);
+        carry = next;
+    }
+
+    if (carry) {
+        t[0] ^= 0x87;
+    }
+}
+
+/* One XTS block: OUT = E(IN xor T) xor T through the ECB context. */
+static int
+xts_ref_block(EVP_CIPHER_CTX *ctx, const unsigned char t[16],
+              const unsigned char *in, unsigned char *out)
+{
+    unsigned char blk[16];
+    int outl = 0;
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        blk[i] = (unsigned char)(in[i] ^ t[i]);
+    }
+
+    if (!EVP_CipherUpdate(ctx, blk, &outl, blk, 16) || outl != 16) {
+        return 0;
+    }
+
+    for (i = 0; i < 16; i++) {
+        out[i] = (unsigned char)(blk[i] ^ t[i]);
+    }
+
+    return 1;
+}
+
+/* IEEE 1619 XTS with ciphertext stealing, built in the test from
+ * OpenSSL's ECB cipher ECB_NAME and two half keys.  It is the reference
+ * for ciphers whose XTS mode the library composes itself.  Returns 0 if
+ * the ECB cipher is not available or fails. */
+static int
+xts_reference(const char *ecb_name, const unsigned char *key, size_t keylen,
+              const unsigned char tweak[16], int enc, unsigned char *out,
+              const unsigned char *in, size_t len)
+{
+    EVP_CIPHER *ecb = EVP_CIPHER_fetch(NULL, ecb_name, NULL);
+    EVP_CIPHER_CTX *data = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX *tw = EVP_CIPHER_CTX_new();
+    unsigned char t[16];
+    unsigned char t2[16];
+    size_t m = len / 16;
+    size_t tail = len % 16;
+    size_t plain = tail ? m - 1 : m;
+    size_t i;
+    int outl = 0;
+    int ok = 0;
+
+    if (!ecb) {
+        /* SEED lives in the legacy provider; load it as the library does,
+         * keeping the default provider as the fallback. */
+        ERR_clear_error();
+
+        if (OSSL_PROVIDER_try_load(NULL, "legacy", 1)) {
+            ecb = EVP_CIPHER_fetch(NULL, ecb_name, NULL);
+        }
+    }
+
+    if (!ecb || !data || !tw || len < 16) {
+        goto done;
+    }
+
+    if (!EVP_CipherInit_ex2(data, ecb, key, NULL, enc, NULL)
+        || !EVP_CIPHER_CTX_set_padding(data, 0)
+        || !EVP_EncryptInit_ex2(tw, ecb, key + keylen / 2, NULL, NULL)
+        || !EVP_CIPHER_CTX_set_padding(tw, 0)
+        || !EVP_EncryptUpdate(tw, t, &outl, tweak, 16)) {
+        goto done;
+    }
+
+    for (i = 0; i < plain; i++) {
+        if (!xts_ref_block(data, t, in + i * 16, out + i * 16)) {
+            goto done;
+        }
+
+        xts_ref_mul_alpha(t);
+    }
+
+    if (tail) {
+        /* The last full block uses the earlier tweak when encrypting and
+         * the later one when decrypting; the completed block the other. */
+        const unsigned char *first = enc ? t : t2;
+        const unsigned char *second = enc ? t2 : t;
+        unsigned char cc[16];
+        unsigned char pp[16];
+
+        memcpy(t2, t, 16);
+        xts_ref_mul_alpha(t2);
+
+        if (!xts_ref_block(data, first, in + plain * 16, cc)) {
+            goto done;
+        }
+
+        memcpy(pp, in + m * 16, tail);
+        memcpy(pp + tail, cc + tail, 16 - tail);
+        memcpy(out + m * 16, cc, tail);
+
+        if (!xts_ref_block(data, second, pp, out + plain * 16)) {
+            goto done;
+        }
+    }
+
+    ok = 1;
+done:
+    EVP_CIPHER_CTX_free(data);
+    EVP_CIPHER_CTX_free(tw);
+    EVP_CIPHER_free(ecb);
+    return ok;
+}
+
+#define XTS_MAX_LEN 1100
+
+/* Encrypt and decrypt LEN bytes (not a multiple of the block size) with
+ * ALGO in XTS mode, in place and out of place, and compare against the
+ * reference built on ECB_NAME. */
+static void
+check_xts_stealing(int algo, const char *ecb_name, size_t keylen, size_t len)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char key[64];
+    unsigned char tweak[16];
+    unsigned char pt[XTS_MAX_LEN];
+    unsigned char ct[XTS_MAX_LEN];
+    unsigned char ref[XTS_MAX_LEN];
+    unsigned char buf[XTS_MAX_LEN];
+    size_t m = (len + 15) / 16;   /* Blocks, the last one partial. */
+    size_t tail = len % 16;
+    size_t prefix = (m - 2) * 16; /* Bytes unaffected by the stealing. */
+    size_t i;
+
+    if (getenv("TEST_VERBOSE")) {
+        printf("  XTS stealing %s, %zu bytes\n", gcry_cipher_algo_name(algo),
+               len);
+    }
+
+    for (i = 0; i < sizeof key; i++) {
+        key[i] = (unsigned char)(0x5a ^ (i * 13));
+    }
+
+    for (i = 0; i < sizeof tweak; i++) {
+        tweak[i] = (unsigned char)(0xc3 - i);
+    }
+
+    for (i = 0; i < len; i++) {
+        pt[i] = (unsigned char)(i * 7 + 3);
+    }
+
+    ASSERT_OK(gcry_cipher_open(&hd, algo, GCRY_CIPHER_MODE_XTS, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, 2 * keylen));
+
+    /* Out of place, then in place: the same ciphertext. */
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, len, pt, len));
+    memcpy(buf, pt, len);
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_encrypt(hd, buf, len, NULL, 0));
+    ASSERT_MEM_EQ(ct, buf, len);
+
+    /* The IEEE 1619 construction from the ECB primitive. */
+    ASSERT_TRUE(xts_reference(ecb_name, key, 2 * keylen, tweak, 1, ref, pt,
+                              len));
+    ASSERT_MEM_EQ(ref, ct, len);
+    ASSERT_TRUE(xts_reference(ecb_name, key, 2 * keylen, tweak, 0, ref, ct,
+                              len));
+    ASSERT_MEM_EQ(pt, ref, len);
+
+    /* Stealing only touches the last two blocks: the blocks before them
+     * are the ciphertext of the truncated message. */
+    if (prefix) {
+        ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+        ASSERT_OK(gcry_cipher_encrypt(hd, buf, prefix, pt, prefix));
+        ASSERT_MEM_EQ(ct, buf, prefix);
+    }
+
+    /* Round trips, out of place and in place. */
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_decrypt(hd, buf, len, ct, len));
+    ASSERT_MEM_EQ(pt, buf, len);
+    memcpy(buf, ct, len);
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_decrypt(hd, buf, len, NULL, 0));
+    ASSERT_MEM_EQ(pt, buf, len);
+
+    /* A tampered stolen (last full) block spoils both final blocks and
+     * nothing before them. */
+    memcpy(ref, ct, len);
+    ref[prefix + 5] ^= 0x10;
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_decrypt(hd, buf, len, ref, len));
+    ASSERT_MEM_EQ(pt, buf, prefix);
+    ASSERT_TRUE(memcmp(pt + prefix, buf + prefix, 16) != 0);
+    ASSERT_TRUE(memcmp(pt + prefix + 16, buf + prefix + 16, tail) != 0);
+
+    /* A tampered partial block spoils only the last full block: the
+     * partial plaintext is carved from the full ciphertext block. */
+    memcpy(ref, ct, len);
+    ref[len - 1] ^= 0x80;
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_decrypt(hd, buf, len, ref, len));
+    ASSERT_MEM_EQ(pt, buf, prefix);
+    ASSERT_TRUE(memcmp(pt + prefix, buf + prefix, 16) != 0);
+    ASSERT_MEM_EQ(pt + prefix + 16, buf + prefix + 16, tail);
+
+    gcry_cipher_close(hd);
+}
+
+/* The library's own XTS ciphertext stealing, used for ciphers OpenSSL has
+ * no native XTS for (AES-192 and the other 128 bit block ciphers), checked
+ * against the IEEE 1619 construction built here from the ECB primitive;
+ * the construction itself is pinned to the standard's partial-block
+ * vectors through the native AES-128 path. */
+TEST(xts_ciphertext_stealing)
+{
+    static const struct {
+        int algo;
+        const char *ecb;
+        size_t keylen;
+    } variants[] = {
+        { GCRY_CIPHER_AES192, "AES-192-ECB", 24 },
+        { GCRY_CIPHER_CAMELLIA128, "CAMELLIA-128-ECB", 16 },
+        { GCRY_CIPHER_CAMELLIA256, "CAMELLIA-256-ECB", 32 },
+        { GCRY_CIPHER_SM4, "SM4-ECB", 16 },
+        { GCRY_CIPHER_ARIA128, "ARIA-128-ECB", 16 },
+        { GCRY_CIPHER_SEED, "SEED-ECB", 16 },
+    };
+    /* 17 and 31: two blocks, both involved in the stealing; 33 and 47:
+     * one untouched block before them; 100: several; 1057: a full batch
+     * of 64 blocks and one more before the stolen pair. */
+    static const size_t lengths[] = { 17, 31, 33, 47, 100, 1057 };
+    gcry_cipher_hd_t hd;
+    unsigned char key[64];
+    unsigned char tweak[16] = { 0 };
+    unsigned char pt[32];
+    unsigned char ct[32];
+    unsigned char ref[32];
+    unsigned char expect[32];
+    size_t i;
+    size_t j;
+
+    /* IEEE 1619 vectors 15 and 18 (17 and 20 bytes) through OpenSSL's
+     * native AES-128 XTS and through the reference construction. */
+    unhex("fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0bfbebdbcbbbab9b8b7b6b5b4b3b2b1b0",
+          key, 32);
+    unhex("9a78563412", tweak, 5);
+    unhex("000102030405060708090a0b0c0d0e0f10111213", pt, 20);
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_XTS, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, 32));
+    unhex("6c1625db4671522d3d7599601de7ca09ed", expect, 17);
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 17, pt, 17));
+    ASSERT_MEM_EQ(expect, ct, 17);
+    ASSERT_TRUE(xts_reference("AES-128-ECB", key, 32, tweak, 1, ref, pt, 17));
+    ASSERT_MEM_EQ(expect, ref, 17);
+    ASSERT_TRUE(xts_reference("AES-128-ECB", key, 32, tweak, 0, ref, expect,
+                              17));
+    ASSERT_MEM_EQ(pt, ref, 17);
+    unhex("9d84c813f719aa2c7be3f66171c7c5c2edbf9dac", expect, 20);
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 20, pt, 20));
+    ASSERT_MEM_EQ(expect, ct, 20);
+    ASSERT_TRUE(xts_reference("AES-128-ECB", key, 32, tweak, 1, ref, pt, 20));
+    ASSERT_MEM_EQ(expect, ref, 20);
+    gcry_cipher_close(hd);
+
+    /* The native AES-256 path agrees with the construction as well. */
+    for (i = 0; i < sizeof key; i++) {
+        key[i] = (unsigned char)(0x80 | i);
+    }
+
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_XTS,
+                               0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, 64));
+    ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, 31, pt, 31));
+    ASSERT_TRUE(xts_reference("AES-256-ECB", key, 64, tweak, 1, ref, pt, 31));
+    ASSERT_MEM_EQ(ref, ct, 31);
+    gcry_cipher_close(hd);
+
+    /* The generic path: AES-192 everywhere, the other ciphers only
+     * outside FIPS mode, where they are not available at all. */
+    for (i = 0; i < sizeof variants / sizeof variants[0]; i++) {
+        int algo = variants[i].algo;
+
+        if (algo != GCRY_CIPHER_AES192 && gcry_fips_mode_active()) {
+            ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
+                       gcry_cipher_open(&hd, algo, GCRY_CIPHER_MODE_XTS, 0));
+            continue;
+        }
+
+        if (!algo_available(algo)) {
+            continue;
+        }
+
+        for (j = 0; j < sizeof lengths / sizeof lengths[0]; j++) {
+            check_xts_stealing(algo, variants[i].ecb, variants[i].keylen,
+                               lengths[j]);
+        }
+
+        /* Less than one block cannot be stolen from. */
+        ASSERT_OK(gcry_cipher_open(&hd, algo, GCRY_CIPHER_MODE_XTS, 0));
+        ASSERT_OK(gcry_cipher_setkey(hd, key, 2 * variants[i].keylen));
+        ASSERT_OK(gcry_cipher_setiv(hd, tweak, sizeof tweak));
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT,
+                   gcry_cipher_encrypt(hd, ct, sizeof ct, pt, 15));
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT,
+                   gcry_cipher_encrypt(hd, ct, sizeof ct, pt, 1));
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT,
+                   gcry_cipher_decrypt(hd, ct, sizeof ct, pt, 15));
+        ASSERT_ERR(GPG_ERR_BUFFER_TOO_SHORT,
+                   gcry_cipher_decrypt(hd, ct, 8, NULL, 0));
+        gcry_cipher_close(hd);
+    }
+}
+
+/* AES-128-CCM through OpenSSL's native EVP cipher: the reference for the
+ * library's composed CCM.  Returns 0 if the cipher is not available. */
+static int
+ccm_reference(const unsigned char *key, const unsigned char *nonce,
+              size_t noncelen, const unsigned char *aad, size_t aadlen,
+              const unsigned char *pt, size_t ptlen, unsigned char *ct,
+              unsigned char *tag, size_t taglen)
+{
+    EVP_CIPHER *ccm = EVP_CIPHER_fetch(NULL, "AES-128-CCM", NULL);
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    unsigned char scratch[16];
+    int outl = 0;
+    int ok = 0;
+
+    if (!ccm || !ctx) {
+        goto done;
+    }
+
+    if (!EVP_EncryptInit_ex2(ctx, ccm, NULL, NULL, NULL)
+        || !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)noncelen,
+                                NULL)
+        || !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, (int)taglen, NULL)
+        || !EVP_EncryptInit_ex2(ctx, NULL, key, nonce, NULL)
+        || !EVP_EncryptUpdate(ctx, NULL, &outl, NULL, (int)ptlen)
+        || !EVP_EncryptUpdate(ctx, NULL, &outl, aad, (int)aadlen)) {
+        goto done;
+    }
+
+    if (ptlen && !EVP_EncryptUpdate(ctx, ct, &outl, pt, (int)ptlen)) {
+        goto done;
+    }
+
+    if (!EVP_EncryptFinal_ex(ctx, scratch, &outl)
+        || !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, (int)taglen, tag)) {
+        goto done;
+    }
+
+    ok = 1;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_free(ccm);
+    return ok;
+}
+
+/* AES-CCM with AADLEN bytes of associated data, delivered in two pieces,
+ * and PTLEN bytes of data: ciphertext and tag against the EVP reference,
+ * then the decryption side. */
+static void
+check_ccm_long_aad(const unsigned char *aad, size_t aadlen, size_t ptlen)
+{
+    gcry_cipher_hd_t hd;
+    unsigned char key[16];
+    unsigned char nonce[13];
+    unsigned char pt[40];
+    unsigned char ct[40];
+    unsigned char ref_ct[40];
+    unsigned char out[40];
+    unsigned char tag[16];
+    unsigned char ref_tag[16];
+    unsigned long long lengths[3];
+    size_t split = aadlen / 3;
+    size_t i;
+
+    if (getenv("TEST_VERBOSE")) {
+        printf("  CCM with %zu bytes of AAD, %zu of data\n", aadlen, ptlen);
+    }
+
+    for (i = 0; i < sizeof key; i++) {
+        key[i] = (unsigned char)(0x40 + i);
+    }
+
+    for (i = 0; i < sizeof nonce; i++) {
+        nonce[i] = (unsigned char)(0x10 + i);
+    }
+
+    for (i = 0; i < sizeof pt; i++) {
+        pt[i] = (unsigned char)(0x20 + i);
+    }
+
+    ASSERT_TRUE(ptlen <= sizeof pt);
+    ASSERT_TRUE(ccm_reference(key, nonce, sizeof nonce, aad, aadlen, pt, ptlen,
+                              ref_ct, ref_tag, sizeof ref_tag));
+
+    lengths[0] = ptlen;
+    lengths[1] = aadlen;
+    lengths[2] = sizeof tag;
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CCM, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad, split));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad + split, aadlen - split));
+    ASSERT_OK(gcry_cipher_encrypt(hd, ct, ptlen, pt, ptlen));
+    ASSERT_OK(gcry_cipher_gettag(hd, tag, sizeof tag));
+    ASSERT_MEM_EQ(ref_ct, ct, ptlen);
+    ASSERT_MEM_EQ(ref_tag, tag, sizeof tag);
+
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad, aadlen));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, ptlen, ct, ptlen));
+    ASSERT_MEM_EQ(pt, out, ptlen);
+    ASSERT_OK(gcry_cipher_checktag(hd, ref_tag, sizeof ref_tag));
+
+    /* One AAD byte changed: the tag no longer verifies. */
+    ASSERT_OK(gcry_cipher_setiv(hd, nonce, sizeof nonce));
+    ASSERT_OK(gcry_cipher_ctl(hd, GCRYCTL_SET_CCM_LENGTHS, lengths,
+                              sizeof lengths));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad + 1, aadlen - 1));
+    ASSERT_OK(gcry_cipher_authenticate(hd, aad, 1));
+    ASSERT_OK(gcry_cipher_decrypt(hd, out, ptlen, ct, ptlen));
+    ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, ref_tag,
+                                                      sizeof ref_tag));
+    gcry_cipher_close(hd);
+}
+
+/* CCM associated data of 0xff00 bytes and more is length-prefixed with
+ * the six byte 0xfffe encoding (RFC 3610 section 2.2) instead of the two
+ * byte one; the AES-only test runs in FIPS mode as well. */
+TEST(ccm_long_aad)
+{
+    size_t aadlen = 70000;
+    unsigned char *aad = malloc(aadlen);
+    size_t i;
+
+    ASSERT_NOT_NULL(aad);
+
+    for (i = 0; i < aadlen; i++) {
+        aad[i] = (unsigned char)(i * 31 + (i >> 8));
+    }
+
+    check_ccm_long_aad(aad, 0xfeff, 40); /* Last two byte length. */
+    check_ccm_long_aad(aad, 0xff00, 40); /* First six byte length. */
+    check_ccm_long_aad(aad, 0xff01, 23);
+    check_ccm_long_aad(aad, 70000, 40);
+    check_ccm_long_aad(aad, 0xff00, 0);  /* Authentication only. */
+    check_ccm_long_aad(aad, 70000, 0);
+    free(aad);
+}
+
 TEST(disable_algo)
 {
     gcry_cipher_hd_t hd = NULL;
@@ -2502,6 +2978,8 @@ main(void)
     RUN_TEST(upstream_key_lengths);
     RUN_TEST(upstream_iv_conventions);
     RUN_TEST(upstream_keywrap_and_ccm);
+    RUN_TEST(xts_ciphertext_stealing);
+    RUN_TEST(ccm_long_aad);
     RUN_TEST(disable_algo);
     RUN_TEST(null_buffer_arguments);
     return TEST_RESULT();
