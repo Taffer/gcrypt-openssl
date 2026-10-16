@@ -497,6 +497,7 @@ struct md_entry {
     EVP_MAC *mac;
     EVP_MAC_CTX *macctx;      /* HMAC or keyed BLAKE2. */
     int keyed;                /* MAC context is in use. */
+    int unkeyed_hmac;         /* HMAC entry still waiting for its key. */
     unsigned char *cust_n;    /* cSHAKE function name. */
     size_t cust_nlen;
     unsigned char *cust_s;    /* cSHAKE customisation string. */
@@ -513,7 +514,7 @@ struct gcry_md_context {
     unsigned int finalized : 1;
     unsigned int bugemu1 : 1;
     struct md_entry *list;
-    unsigned char *key;       /* HMAC key. */
+    unsigned char *key;       /* HMAC key; NULL until gcry_md_setkey. */
     size_t keylen;
     FILE *debug;
 };
@@ -594,11 +595,16 @@ entry_init_digest(struct md_entry *e)
     return 0;
 }
 
-/* (Re)initialise the HMAC context of E with KEY. */
+/* (Re)initialise the HMAC context of E with KEY.  A NULL KEY means that no
+ * key has been set yet: the reference library then computes with an empty
+ * key, which OpenSSL's FIPS provider refuses (it insists on at least 112
+ * bits).  In that case the entry is left waiting for gcry_md_setkey, whose
+ * reset discards anything written before it anyway. */
 static gcry_err_code_t
 entry_init_hmac(struct md_entry *e, const unsigned char *key, size_t keylen)
 {
     OSSL_PARAM params[2];
+    int unkeyed = !key;
 
     if (!e->mac) {
         e->mac = EVP_MAC_fetch(_gcry_libctx(), "HMAC", _gcry_propq());
@@ -620,12 +626,31 @@ entry_init_hmac(struct md_entry *e, const unsigned char *key, size_t keylen)
                                                  (char *)(uintptr_t)e->spec->ossl, 0);
     params[1] = OSSL_PARAM_construct_end();
 
-    if (!EVP_MAC_init(e->macctx, key ? key : (const unsigned char *)"",
-                      keylen, params)) {
-        return _gcry_err_from_openssl(GPG_ERR_DIGEST_ALGO);
+    if (unkeyed) {
+        key = (const unsigned char *)"";
+        keylen = 0;
+    }
+
+    if (!EVP_MAC_init(e->macctx, key, keylen, params)) {
+        /* A refused key leaves the previous one in the context; start
+         * from a fresh one next time. */
+        EVP_MAC_CTX_free(e->macctx);
+        e->macctx = NULL;
+        e->keyed = 0;
+
+        if (unkeyed) {
+            ERR_clear_error();
+            e->unkeyed_hmac = 1;
+            return 0;
+        }
+
+        /* The digest itself was fetched when the algorithm was enabled,
+         * so what the provider objects to is the key. */
+        return _gcry_err_from_openssl(GPG_ERR_INV_KEYLEN);
     }
 
     e->keyed = 1;
+    e->unkeyed_hmac = 0;
     return 0;
 }
 
@@ -724,6 +749,11 @@ entry_write(struct md_entry *e, const unsigned char *buf, size_t len)
         return;
     }
 
+    if (e->unkeyed_hmac) {
+        /* Discarded: setting the key resets the handle. */
+        return;
+    }
+
     if (e->keyed) {
         if (!EVP_MAC_update(e->macctx, buf, len)) {
             ERR_clear_error();
@@ -762,6 +792,16 @@ entry_final(struct md_entry *e)
             e->digest[3] = (unsigned char)v;
         }
 
+        e->have_digest = 1;
+        return;
+    }
+
+    if (e->unkeyed_hmac) {
+        /* No key was ever set and the provider will not compute the
+         * empty-key HMAC the reference library would: there is no
+         * digest to hand out. */
+        log_error("HMAC-%s handle was never keyed\n", e->spec->name);
+        memset(e->digest, 0, sizeof e->digest);
         e->have_digest = 1;
         return;
     }
@@ -821,6 +861,7 @@ entry_dup(struct gcry_md_context *ctx, const struct md_entry *src)
     e->crc = src->crc;
     e->have_digest = src->have_digest;
     e->keyed = src->keyed;
+    e->unkeyed_hmac = src->unkeyed_hmac;
     memcpy(e->digest, src->digest, sizeof e->digest);
 
     if (src->md) {
@@ -1237,6 +1278,8 @@ md_setkey(gcry_md_hd_t hd, const void *key, size_t keylen)
 
     if (ctx->hmac) {
         unsigned char *copy;
+        unsigned char *oldkey = ctx->key;
+        size_t oldkeylen = ctx->keylen;
 
         if (keylen && !key) {
             return GPG_ERR_INV_ARG;
@@ -1252,14 +1295,35 @@ md_setkey(gcry_md_hd_t hd, const void *key, size_t keylen)
             memcpy(copy, key, keylen);
         }
 
-        if (ctx->key) {
-            _gcry_wipememory(ctx->key, ctx->keylen);
-            _gcry_free(ctx->key);
-        }
-
+        /* Like a reset, this discards anything written so far. */
         ctx->key = copy;
         ctx->keylen = keylen;
-        md_reset(hd);
+        hd->bufpos = 0;
+        ctx->finalized = 0;
+
+        for (e = ctx->list; e; e = e->next) {
+            rc = entry_reset(ctx, e);
+
+            if (rc) {
+                break;
+            }
+        }
+
+        if (rc) {
+            /* The provider refused the key: back to the previous one. */
+            ctx->key = oldkey;
+            ctx->keylen = oldkeylen;
+            _gcry_wipememory(copy, keylen);
+            _gcry_free(copy);
+            md_reset(hd);
+            return rc;
+        }
+
+        if (oldkey) {
+            _gcry_wipememory(oldkey, oldkeylen);
+            _gcry_free(oldkey);
+        }
+
         return 0;
     }
 

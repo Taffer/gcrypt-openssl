@@ -80,6 +80,88 @@ check_digest(int algo, const void *data, size_t len, const char *hex)
 #define CHECK(algo, data, hex) \
     ASSERT_TRUE(check_digest(algo, data, strlen(data), hex))
 
+/* In FIPS mode OpenSSL's provider offers only the approved digests.  Every
+ * entry point must then report ALGO as an unknown algorithm, never as an
+ * internal error, and the one-shot function must zero the digest. */
+static int
+check_unavailable(int algo)
+{
+    const char *name = gcry_md_algo_name(algo);
+    gcry_md_hd_t hd = NULL;
+    gcry_error_t err;
+    unsigned char buf[65];
+    unsigned char zero[64];
+    gcry_buffer_t iov;
+    char abc[] = "abc";
+    size_t n = sizeof buf;
+    unsigned int dlen = gcry_md_get_algo_dlen(algo);
+
+#define EXPECT_DIGEST_ALGO(expr)                                           \
+    do {                                                                   \
+        if (gcry_err_code(expr) != GPG_ERR_DIGEST_ALGO) {                  \
+            fprintf(stderr, "%s: %s did not report an unknown algorithm\n", \
+                    name, #expr);                                          \
+            return 0;                                                      \
+        }                                                                  \
+    } while (0)
+
+    EXPECT_DIGEST_ALGO(gcry_md_test_algo(algo));
+    EXPECT_DIGEST_ALGO(gcry_md_algo_info(algo, GCRYCTL_SELFTEST, NULL, NULL));
+    EXPECT_DIGEST_ALGO(gcry_md_get_asnoid(algo, NULL, &n));
+    EXPECT_DIGEST_ALGO(gcry_md_open(&hd, algo, 0));
+
+    if (hd) {
+        fprintf(stderr, "%s: open handed out a handle\n", name);
+        return 0;
+    }
+
+    EXPECT_DIGEST_ALGO(gcry_md_open(&hd, algo, GCRY_MD_FLAG_HMAC));
+
+    if (hd) {
+        fprintf(stderr, "%s: HMAC open handed out a handle\n", name);
+        return 0;
+    }
+
+    if (gcry_md_open(&hd, 0, 0)) {
+        return 0;
+    }
+
+    err = gcry_md_enable(hd, algo);
+    gcry_md_close(hd);
+    EXPECT_DIGEST_ALGO(err);
+
+    memset(buf, 0xaa, sizeof buf);
+    memset(zero, 0, sizeof zero);
+    gcry_md_hash_buffer(algo, buf, abc, 3);
+
+    if (dlen == 0 || dlen > sizeof zero || memcmp(buf, zero, dlen)
+        || buf[dlen] != 0xaa) {
+        fprintf(stderr, "%s: hash_buffer did not zero the digest\n", name);
+        return 0;
+    }
+
+    iov.data = abc;
+    iov.off = 0;
+    iov.len = 3;
+    iov.size = 0;
+    EXPECT_DIGEST_ALGO(gcry_md_hash_buffers(algo, 0, buf, &iov, 1));
+    EXPECT_DIGEST_ALGO(gcry_md_hash_buffers(algo, GCRY_MD_FLAG_HMAC, buf, &iov,
+                                            1));
+#undef EXPECT_DIGEST_ALGO
+    return 1;
+}
+
+/* CHECK, except that in FIPS mode the algorithm is not offered and must be
+ * reported as unknown everywhere instead. */
+#define CHECK_OR_UNAVAILABLE(algo, data, hex)     \
+    do {                                          \
+        if (gcry_fips_mode_active()) {            \
+            ASSERT_TRUE(check_unavailable(algo)); \
+        } else {                                  \
+            CHECK(algo, data, hex);               \
+        }                                         \
+    } while (0)
+
 /* One million 'a' bytes, fed in chunks. */
 static int
 check_million_a(int algo, const char *hex)
@@ -110,9 +192,10 @@ static const char msg56[] =
 
 TEST(md5_sha1_sha2)
 {
-    CHECK(GCRY_MD_MD5, "", "d41d8cd98f00b204e9800998ecf8427e");
-    CHECK(GCRY_MD_MD5, "abc", "900150983cd24fb0d6963f7d28e17f72");
-    CHECK(GCRY_MD_MD5, "message digest", "f96b697d7cb7938d525a2f31aaf161d0");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_MD5, "", "d41d8cd98f00b204e9800998ecf8427e");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_MD5, "abc", "900150983cd24fb0d6963f7d28e17f72");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_MD5, "message digest",
+                         "f96b697d7cb7938d525a2f31aaf161d0");
     CHECK(GCRY_MD_SHA1, "", "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     CHECK(GCRY_MD_SHA1, "abc", "a9993e364706816aba3e25717850c26c9cd0d89d");
     CHECK(GCRY_MD_SHA224, "abc",
@@ -250,55 +333,39 @@ TEST(cshake)
 
 TEST(legacy_and_other_hashes)
 {
-    /* RIPEMD-160 is not a FIPS-approved digest: in FIPS mode it is reported
-     * as unavailable and a handle cannot be opened for it. */
-    if (gcry_fips_mode_active()) {
-        gcry_md_hd_t hd = NULL;
-
-        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_RMD160));
-        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_open(&hd, GCRY_MD_RMD160, 0));
-        ASSERT_NULL(hd);
-    } else {
-        CHECK(GCRY_MD_RMD160, "abc", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
-    }
-
-    CHECK(GCRY_MD_MD4, "abc", "a448017aaf21d8525fc10ae87aa6729d");
-
-    /* Whirlpool is not FIPS-approved either. */
-    if (gcry_fips_mode_active()) {
-        gcry_md_hd_t hd = NULL;
-
-        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_WHIRLPOOL));
-        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
-                   gcry_md_open(&hd, GCRY_MD_WHIRLPOOL, 0));
-        ASSERT_NULL(hd);
-    } else {
-        CHECK(GCRY_MD_WHIRLPOOL, "abc",
-              "4e2448a4c6f486bb16b6562c73b4020bf3043e3a731bce721ae1b303d97e6d4c"
-              "7181eebdb6c57e277d0e34957114cbd6c797fc9d95d8b582d225292076d4eef5");
-    }
-
-    CHECK(GCRY_MD_SM3, "abc",
-          "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
+    /* None of these is a FIPS-approved digest: in FIPS mode they are
+     * reported as unavailable and no handle can be opened for them. */
+    CHECK_OR_UNAVAILABLE(GCRY_MD_RMD160, "abc",
+                         "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_MD4, "abc", "a448017aaf21d8525fc10ae87aa6729d");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_WHIRLPOOL, "abc",
+                         "4e2448a4c6f486bb16b6562c73b4020bf3043e3a731bce721ae1b303d97e6d4c"
+                         "7181eebdb6c57e277d0e34957114cbd6c797fc9d95d8b582d225292076d4eef5");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_SM3, "abc",
+                         "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
 }
 
 TEST(blake2)
 {
-    CHECK(GCRY_MD_BLAKE2B_512, "abc",
-          "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
-          "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923");
-    CHECK(GCRY_MD_BLAKE2S_256, "abc",
-          "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982");
-    CHECK(GCRY_MD_BLAKE2B_384, "abc",
-          "6f56a82c8e7ef526dfe182eb5212f7db9df1317e57815dbda46083fc30f54ee6"
-          "c66ba83be64b302d7cba6ce15bb556f4");
-    CHECK(GCRY_MD_BLAKE2B_256, "abc",
-          "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319");
-    CHECK(GCRY_MD_BLAKE2B_160, "abc", "384264f676f39536840523f284921cdc68b6846b");
-    CHECK(GCRY_MD_BLAKE2S_224, "abc",
-          "0b033fc226df7abde29f67a05d3dc62cf271ef3dfea4d387407fbd55");
-    CHECK(GCRY_MD_BLAKE2S_160, "abc", "5ae3b99be29b01834c3b508521ede60438f8de17");
-    CHECK(GCRY_MD_BLAKE2S_128, "abc", "aa4938119b1dc7b87cbad0ffd200d0ae");
+    /* BLAKE2 is not FIPS-approved: unavailable in FIPS mode. */
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2B_512, "abc",
+                         "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
+                         "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2S_256, "abc",
+                         "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2B_384, "abc",
+                         "6f56a82c8e7ef526dfe182eb5212f7db9df1317e57815dbda46083fc30f54ee6"
+                         "c66ba83be64b302d7cba6ce15bb556f4");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2B_256, "abc",
+                         "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2B_160, "abc",
+                         "384264f676f39536840523f284921cdc68b6846b");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2S_224, "abc",
+                         "0b033fc226df7abde29f67a05d3dc62cf271ef3dfea4d387407fbd55");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2S_160, "abc",
+                         "5ae3b99be29b01834c3b508521ede60438f8de17");
+    CHECK_OR_UNAVAILABLE(GCRY_MD_BLAKE2S_128, "abc",
+                         "aa4938119b1dc7b87cbad0ffd200d0ae");
 
     /* Keyed BLAKE2 through gcry_md_setkey (RFC 7693 style: BLAKE2b with a
      * 64 byte key over a 3 byte message, from the official test vectors).
@@ -316,12 +383,15 @@ TEST(blake2)
         unhex("33d0825dddf7ada99b0e7e307104ad07ca9cfd9692214f1561356315e784f3e5"
               "a17e364ae9dbb14cb2036df932b77f4b292761365fb328de7afdc6d8998f5fc1",
               expect, sizeof expect);
-        ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
-        ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
-        gcry_md_write(hd, "\x00\x01\x02", 3);
-        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 64);
-        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 65));
-        gcry_md_close(hd);
+
+        if (!gcry_fips_mode_active()) {
+            ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
+            ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
+            gcry_md_write(hd, "\x00\x01\x02", 3);
+            ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 64);
+            ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 65));
+            gcry_md_close(hd);
+        }
 
         ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, 0));
         ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_setkey(hd, key, 16));
@@ -408,13 +478,49 @@ check_hmac(int algo, void *key, size_t keylen, void *data, size_t datalen,
     unsigned char got[64];
     size_t n = unhex(hex, expect, sizeof expect);
     gcry_md_hd_t hd;
+    gcry_error_t err;
     gcry_buffer_t iov[2];
+    /* The FIPS provider insists on HMAC keys of at least 112 bits. */
+    int short_key = gcry_fips_mode_active() && keylen < 14;
+
+    iov[0].data = key;
+    iov[0].off = 0;
+    iov[0].len = keylen;
+    iov[0].size = 0;
+    iov[1].data = data;
+    iov[1].off = 0;
+    iov[1].len = datalen;
+    iov[1].size = 0;
 
     if (gcry_md_open(&hd, algo, GCRY_MD_FLAG_HMAC)) {
+        fprintf(stderr, "HMAC algo %d: open failed\n", algo);
         return 0;
     }
 
-    if (gcry_md_setkey(hd, key, keylen)) {
+    err = gcry_md_setkey(hd, key, keylen);
+
+    if (short_key) {
+        gcry_md_close(hd);
+
+        if (gcry_err_code(err) != GPG_ERR_INV_KEYLEN) {
+            fprintf(stderr, "HMAC algo %d: short key: %s\n", algo,
+                    gcry_strerror(err));
+            return 0;
+        }
+
+        err = gcry_md_hash_buffers(algo, GCRY_MD_FLAG_HMAC, got, iov, 2);
+
+        if (gcry_err_code(err) != GPG_ERR_INV_KEYLEN) {
+            fprintf(stderr, "HMAC algo %d: short key (hash_buffers): %s\n",
+                    algo, gcry_strerror(err));
+            return 0;
+        }
+
+        return 1;
+    }
+
+    if (err) {
+        fprintf(stderr, "HMAC algo %d: setkey: %s\n", algo, gcry_strerror(err));
         gcry_md_close(hd);
         return 0;
     }
@@ -428,17 +534,12 @@ check_hmac(int algo, void *key, size_t keylen, void *data, size_t datalen,
         return 0;
     }
 
-    iov[0].data = key;
-    iov[0].off = 0;
-    iov[0].len = keylen;
-    iov[0].size = 0;
-    iov[1].data = data;
-    iov[1].off = 0;
-    iov[1].len = datalen;
-    iov[1].size = 0;
     memset(got, 0, sizeof got);
+    err = gcry_md_hash_buffers(algo, GCRY_MD_FLAG_HMAC, got, iov, 2);
 
-    if (gcry_md_hash_buffers(algo, GCRY_MD_FLAG_HMAC, got, iov, 2)) {
+    if (err) {
+        fprintf(stderr, "HMAC algo %d: hash_buffers: %s\n", algo,
+                gcry_strerror(err));
         return 0;
     }
 
@@ -450,9 +551,33 @@ TEST(hmac)
     char key[] = "Jefe";
     char data[] = "what do ya want for nothing?";
     char bigmsg[] = "Test Using Larger Than Block-Size Key - Hash Key First";
+    char hi[] = "Hi There";
     unsigned char bigkey[131];
+    unsigned char key0b[20];
     gcry_md_hd_t hd;
 
+    /* RFC 4231 test case 1 and RFC 2202 test case 1: a 20 (16 for MD5)
+     * byte key, long enough for FIPS mode. */
+    memset(key0b, 0x0b, sizeof key0b);
+    ASSERT_TRUE(check_hmac(GCRY_MD_SHA224, key0b, 20, hi, 8,
+                           "896fb1128abbdf196832107cd49df33f47b4b1169912ba4f53"
+                           "684b22"));
+    ASSERT_TRUE(check_hmac(GCRY_MD_SHA256, key0b, 20, hi, 8,
+                           "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726"
+                           "e9376c2e32cff7"));
+    ASSERT_TRUE(check_hmac(GCRY_MD_SHA384, key0b, 20, hi, 8,
+                           "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682"
+                           "aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"));
+    ASSERT_TRUE(check_hmac(GCRY_MD_SHA512, key0b, 20, hi, 8,
+                           "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787a"
+                           "d0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d"
+                           "914eeb61f1702e696c203a126854"));
+    ASSERT_TRUE(check_hmac(GCRY_MD_SHA1, key0b, 20, hi, 8,
+                           "b617318655057264e28bc0b6fb378c8ef146be00"));
+
+    /* RFC 4231 test case 2: the 4 byte key "Jefe" is below the 112 bits
+     * the FIPS provider requires, so in FIPS mode these must be refused
+     * with an invalid key length (check_hmac verifies that). */
     ASSERT_TRUE(check_hmac(GCRY_MD_SHA256, key, 4, data, 28,
                            "5bdcc146bf60754e6a042426089575c75a003f089d2739839d"
                            "ec58b964ec3843"));
@@ -466,10 +591,34 @@ TEST(hmac)
                            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610"
                            "270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaea"
                            "b1a34d4a6b4b636e070a38bce737"));
-    ASSERT_TRUE(check_hmac(GCRY_MD_MD5, key, 4, data, 28,
-                           "750c783e6ab0b503eaa86e310a5db738"));
     ASSERT_TRUE(check_hmac(GCRY_MD_SHA1, key, 4, data, 28,
                            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"));
+
+    /* HMAC over a digest the FIPS provider lacks is an unknown algorithm
+     * however long the key is. */
+    if (gcry_fips_mode_active()) {
+        unsigned char out[16];
+        gcry_buffer_t iov[2];
+
+        iov[0].data = key0b;
+        iov[0].off = 0;
+        iov[0].len = 16;
+        iov[0].size = 0;
+        iov[1].data = hi;
+        iov[1].off = 0;
+        iov[1].len = 8;
+        iov[1].size = 0;
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_open(&hd, GCRY_MD_MD5,
+                                                     GCRY_MD_FLAG_HMAC));
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                   gcry_md_hash_buffers(GCRY_MD_MD5, GCRY_MD_FLAG_HMAC, out,
+                                        iov, 2));
+    } else {
+        ASSERT_TRUE(check_hmac(GCRY_MD_MD5, key, 4, data, 28,
+                               "750c783e6ab0b503eaa86e310a5db738"));
+        ASSERT_TRUE(check_hmac(GCRY_MD_MD5, key0b, 16, hi, 8,
+                               "9294727a3638bb1c13f48ef8158bfc9d"));
+    }
 
     /* RFC 4231 test case 6: key longer than the block size. */
     memset(bigkey, 0xaa, sizeof bigkey);
@@ -521,11 +670,13 @@ TEST(multi_algo_handle)
     ASSERT_OK(gcry_md_enable(hd, GCRY_MD_SHA1));
     ASSERT_OK(gcry_md_enable(hd, GCRY_MD_SHA256));
     ASSERT_OK(gcry_md_enable(hd, GCRY_MD_SHA256)); /* twice is fine */
-    ASSERT_OK(gcry_md_enable(hd, GCRY_MD_MD5));
+    /* MD5 is not offered in FIPS mode; the handle keeps its other
+     * algorithms when enabling it fails. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_MD5));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_TIGER));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, 12345));
     ASSERT_TRUE(gcry_md_is_enabled(hd, GCRY_MD_SHA1));
-    ASSERT_TRUE(gcry_md_is_enabled(hd, GCRY_MD_MD5));
+    ASSERT_EQ(!gcry_fips_mode_active(), gcry_md_is_enabled(hd, GCRY_MD_MD5));
     ASSERT_FALSE(gcry_md_is_enabled(hd, GCRY_MD_SHA512));
     ASSERT_FALSE(gcry_md_is_secure(hd));
 
@@ -533,12 +684,21 @@ TEST(multi_algo_handle)
     gcry_md_write(hd, "bc", 2);
     ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
     ASSERT_MEM_EQ(sha256, gcry_md_read(hd, GCRY_MD_SHA256), 32);
-    ASSERT_MEM_EQ(md5, gcry_md_read(hd, GCRY_MD_MD5), 16);
-    /* Reading again returns the same digest. */
-    ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
-    /* The most recently enabled algorithm is the "first" one. */
-    ASSERT_EQ(GCRY_MD_MD5, gcry_md_get_algo(hd));
-    ASSERT_MEM_EQ(md5, gcry_md_read(hd, 0), 16);
+
+    if (gcry_fips_mode_active()) {
+        /* Reading again returns the same digest. */
+        ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
+        /* The most recently enabled algorithm is the "first" one. */
+        ASSERT_EQ(GCRY_MD_SHA256, gcry_md_get_algo(hd));
+        ASSERT_MEM_EQ(sha256, gcry_md_read(hd, 0), 32);
+    } else {
+        ASSERT_MEM_EQ(md5, gcry_md_read(hd, GCRY_MD_MD5), 16);
+        /* Reading again returns the same digest. */
+        ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
+        /* The most recently enabled algorithm is the "first" one. */
+        ASSERT_EQ(GCRY_MD_MD5, gcry_md_get_algo(hd));
+        ASSERT_MEM_EQ(md5, gcry_md_read(hd, 0), 16);
+    }
 
     /* Reset and hash something else. */
     gcry_md_reset(hd);
@@ -595,15 +755,16 @@ TEST(putc_buffering_and_copy)
     gcry_md_close(copy);
     gcry_md_close(hd);
 
-    /* Copy of an HMAC handle keeps the key. */
+    /* Copy of an HMAC handle keeps the key (16 bytes: long enough for
+     * FIPS mode). */
     {
         unsigned char ref[32];
         gcry_buffer_t iov[2];
-        char jefe[] = "Jefe";
+        char hmackey[] = "0123456789abcdef";
 
-        iov[0].data = jefe;
+        iov[0].data = hmackey;
         iov[0].off = 0;
-        iov[0].len = 4;
+        iov[0].len = 16;
         iov[0].size = 0;
         iov[1].data = data;
         iov[1].off = 0;
@@ -611,13 +772,29 @@ TEST(putc_buffering_and_copy)
         iov[1].size = 0;
         ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, ref, iov, 2));
         ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
-        ASSERT_OK(gcry_md_setkey(hd, "Jefe", 4));
+        ASSERT_OK(gcry_md_setkey(hd, hmackey, 16));
         gcry_md_write(hd, data, 50);
         ASSERT_OK(gcry_md_copy(&copy, hd));
         gcry_md_write(copy, data + 50, 50);
         ASSERT_MEM_EQ(ref, gcry_md_read(copy, 0), 32);
         gcry_md_reset(copy);
         gcry_md_write(copy, data, 100);
+        ASSERT_MEM_EQ(ref, gcry_md_read(copy, 0), 32);
+        gcry_md_close(copy);
+        gcry_md_close(hd);
+
+        /* A copy taken before the key is set is keyed on its own. */
+        ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+        ASSERT_OK(gcry_md_copy(&copy, hd));
+        ASSERT_OK(gcry_md_setkey(copy, hmackey, 16));
+        gcry_md_write(copy, data, 100);
+        ASSERT_MEM_EQ(ref, gcry_md_read(copy, 0), 32);
+        gcry_md_close(copy);
+        ASSERT_OK(gcry_md_setkey(hd, hmackey, 16));
+        gcry_md_write(hd, data, 100);
+        ASSERT_MEM_EQ(ref, gcry_md_read(hd, 0), 32);
+        /* Copying a finalised HMAC handle keeps its MAC too. */
+        ASSERT_OK(gcry_md_copy(&copy, hd));
         ASSERT_MEM_EQ(ref, gcry_md_read(copy, 0), 32);
         gcry_md_close(copy);
         gcry_md_close(hd);
@@ -648,7 +825,8 @@ TEST(algorithm_info)
 
     ASSERT_OK(gcry_md_test_algo(GCRY_MD_SHA256));
     ASSERT_OK(gcry_md_test_algo(GCRY_MD_CRC32));
-    ASSERT_OK(gcry_md_test_algo(GCRY_MD_BLAKE2S_128));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          gcry_md_test_algo(GCRY_MD_BLAKE2S_128));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_test_algo(GCRY_MD_TIGER));
     /* An unavailable algorithm must not abort gcry_md_hash_buffer(); the
      * digest is zeroed instead. */
@@ -769,6 +947,14 @@ TEST(keyed_blake2_limits)
     unsigned char expect[32];
 
     memset(key, 7, sizeof key);
+
+    if (gcry_fips_mode_active()) {
+        /* No BLAKE2 at all in FIPS mode, keyed or not. */
+        ASSERT_TRUE(check_unavailable(GCRY_MD_BLAKE2B_512));
+        ASSERT_TRUE(check_unavailable(GCRY_MD_BLAKE2S_256));
+        return;
+    }
+
     ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
     ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 65));
     ASSERT_OK(gcry_md_setkey(hd, key, 64));
@@ -791,25 +977,152 @@ TEST(hmac_reset_and_rekey)
     gcry_md_hd_t hd;
     unsigned char expect[32];
     unsigned char first[32];
+    unsigned char key0b[20];
+    unsigned char keyaa[20];
+    unsigned char dd50[50];
+
+    memset(key0b, 0x0b, sizeof key0b);
+    memset(keyaa, 0xaa, sizeof keyaa);
+    memset(dd50, 0xdd, sizeof dd50);
 
     ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
-    ASSERT_OK(gcry_md_setkey(hd, "key", 3));
-    gcry_md_write(hd, "abc", 3);
-    unhex("9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+
+    if (gcry_fips_mode_active()) {
+        /* Keys shorter than 112 bits are refused by the FIPS provider;
+         * the handle stays usable. */
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, "key", 3));
+    } else {
+        ASSERT_OK(gcry_md_setkey(hd, "key", 3));
+        gcry_md_write(hd, "abc", 3);
+        unhex("9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+              expect, sizeof expect);
+        memcpy(first, gcry_md_read(hd, 0), 32);
+        ASSERT_MEM_EQ(expect, first, 32);
+        /* A reset keeps the key. */
+        gcry_md_reset(hd);
+        gcry_md_write(hd, "abc", 3);
+        ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 32);
+        /* A second setkey replaces it. */
+        ASSERT_OK(gcry_md_setkey(hd, "key2", 4));
+        gcry_md_write(hd, "abc", 3);
+        unhex("69ba1f142a63bb0e8f3f74bf55018364bf680b75d35e290918a34d6576861736",
+              expect, sizeof expect);
+        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    }
+
+    /* The same with FIPS-sized keys: RFC 4231 test case 1 ... */
+    ASSERT_OK(gcry_md_setkey(hd, key0b, sizeof key0b));
+    gcry_md_write(hd, "Hi There", 8);
+    unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
           expect, sizeof expect);
     memcpy(first, gcry_md_read(hd, 0), 32);
     ASSERT_MEM_EQ(expect, first, 32);
     /* A reset keeps the key. */
     gcry_md_reset(hd);
-    gcry_md_write(hd, "abc", 3);
+    gcry_md_write(hd, "Hi There", 8);
     ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 32);
-    /* A second setkey replaces it. */
-    ASSERT_OK(gcry_md_setkey(hd, "key2", 4));
-    gcry_md_write(hd, "abc", 3);
-    unhex("69ba1f142a63bb0e8f3f74bf55018364bf680b75d35e290918a34d6576861736",
+    /* ... and test case 3 after a second setkey. */
+    ASSERT_OK(gcry_md_setkey(hd, keyaa, sizeof keyaa));
+    gcry_md_write(hd, dd50, sizeof dd50);
+    unhex("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
           expect, sizeof expect);
     ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+
+    if (gcry_fips_mode_active()) {
+        /* A refused key leaves the previous one in place. */
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, "key", 3));
+        gcry_md_write(hd, dd50, sizeof dd50);
+        ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    }
+
     gcry_md_close(hd);
+}
+
+TEST(hmac_unkeyed_and_key_lengths)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+    unsigned char key[20];
+    unsigned char expect[32];
+    unsigned char tc1[32];
+    gcry_buffer_t iov[2];
+    char hi[] = "Hi There";
+
+    memset(key, 0x0b, sizeof key);
+    unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+          tc1, sizeof tc1);
+
+    /* Setting the key resets the handle: data written before it does not
+     * count, in either mode. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    gcry_md_write(hd, "garbage", 7);
+    ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
+    gcry_md_write(hd, hi, 8);
+    ASSERT_MEM_EQ(tc1, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+
+    /* A copy taken before the key is set can be keyed independently. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    gcry_md_write(hd, "garbage", 7);
+    ASSERT_OK(gcry_md_copy(&copy, hd));
+    ASSERT_OK(gcry_md_setkey(copy, key, sizeof key));
+    gcry_md_write(copy, hi, 8);
+    ASSERT_MEM_EQ(tc1, gcry_md_read(copy, 0), 32);
+    gcry_md_close(copy);
+    ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
+    gcry_md_write(hd, hi, 8);
+    ASSERT_MEM_EQ(tc1, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+
+    /* Without setkey the reference library computes with an empty key.
+     * The FIPS provider refuses an empty key, so there such a handle has
+     * nothing to return and hands out zeros. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    gcry_md_write(hd, "abc", 3);
+
+    if (gcry_fips_mode_active()) {
+        memset(expect, 0, sizeof expect);
+    } else {
+        unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
+              expect, sizeof expect);
+    }
+
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    /* Keying afterwards makes it a proper HMAC handle. */
+    ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
+    gcry_md_write(hd, hi, 8);
+    ASSERT_MEM_EQ(tc1, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+
+    /* The FIPS boundary is 112 bits: 13 byte keys are refused, 14 byte
+     * keys accepted.  Outside FIPS mode any length goes. */
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 13));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 0));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, NULL, 0));
+    ASSERT_OK(gcry_md_setkey(hd, key, 14));
+    gcry_md_close(hd);
+
+    /* gcry_md_hash_buffers takes the key from the first entry and must
+     * agree. */
+    iov[0].data = key;
+    iov[0].off = 0;
+    iov[0].len = 13;
+    iov[0].size = 0;
+    iov[1].data = hi;
+    iov[1].off = 0;
+    iov[1].len = 8;
+    iov[1].size = 0;
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN,
+                          gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC,
+                                               expect, iov, 2));
+    iov[0].len = 14;
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, expect,
+                                   iov, 2));
+    iov[0].len = 20;
+    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, expect,
+                                   iov, 2));
+    ASSERT_MEM_EQ(tc1, expect, 32);
 }
 
 TEST(cshake_copy)
@@ -909,12 +1222,18 @@ TEST(hash_buffers_edges)
                gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, out, 32, NULL, 1));
     ASSERT_ERR(GPG_ERR_INV_ARG,
                gcry_md_hash_buffers_ext(GCRY_MD_SHA256, 0, out, 32, iov + 1, -1));
-    /* HMAC over a BLAKE2 digest and an XOF at its default length. */
-    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_BLAKE2S_256, GCRY_MD_FLAG_HMAC, out,
-                                   iov, 2));
-    unhex("0018bfddc0c878b3e270c6e59b35af01e164a42d89499c9447a90b58a4d60eb3",
-          expect, sizeof expect);
-    ASSERT_MEM_EQ(expect, out, 32);
+    /* HMAC over a BLAKE2 digest (not offered in FIPS mode) and an XOF at
+     * its default length. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          gcry_md_hash_buffers(GCRY_MD_BLAKE2S_256,
+                                               GCRY_MD_FLAG_HMAC, out, iov, 2));
+
+    if (!gcry_fips_mode_active()) {
+        unhex("0018bfddc0c878b3e270c6e59b35af01e164a42d89499c9447a90b58a4d60eb3",
+              expect, sizeof expect);
+        ASSERT_MEM_EQ(expect, out, 32);
+    }
+
     ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHAKE128, 0, out, iov + 1, 1));
     unhex("5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8",
           expect, sizeof expect);
@@ -963,16 +1282,21 @@ TEST(buffer_argument_checks)
     unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           expect, sizeof expect);
     ASSERT_MEM_EQ(expect, out, 32);
-    /* The NULL key of an HMAC is likewise an empty key. */
+    /* The NULL key of an HMAC is likewise an empty key, which the FIPS
+     * provider refuses as too short. */
     iov[0].data = NULL;
     iov[0].len = 0;
     iov[1].data = msg;
     iov[1].len = 3;
-    ASSERT_OK(gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC, out, iov,
-                                   2));
-    unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
-          expect, sizeof expect);
-    ASSERT_MEM_EQ(expect, out, 32);
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN,
+                          gcry_md_hash_buffers(GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC,
+                                               out, iov, 2));
+
+    if (!gcry_fips_mode_active()) {
+        unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
+              expect, sizeof expect);
+        ASSERT_MEM_EQ(expect, out, 32);
+    }
     /* No XOF output bytes may be requested into no buffer. */
     ASSERT_OK(gcry_md_hash_buffers_ext(GCRY_MD_SHAKE128, 0, NULL, 0, iov + 1,
                                        1));
@@ -999,6 +1323,7 @@ main(void)
     RUN_TEST(handle_api_edges);
     RUN_TEST(keyed_blake2_limits);
     RUN_TEST(hmac_reset_and_rekey);
+    RUN_TEST(hmac_unkeyed_and_key_lengths);
     RUN_TEST(cshake_copy);
     RUN_TEST(debug_dump);
     RUN_TEST(hash_buffers_edges);
