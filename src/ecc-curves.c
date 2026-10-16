@@ -749,13 +749,23 @@ leave:
     return group;
 }
 
-/* Identify the curve of an existing EC_GROUP by comparing with each known
- * Weierstrass curve.  Returns NULL if none matches. */
+/* Identify the curve of an existing EC_GROUP by its domain parameters.
+ * Returns NULL if no known Weierstrass curve has them.  The parameters are
+ * compared as numbers: EC_GROUP_cmp cannot compare the generators of
+ * groups with different internal representations, which OpenSSL's
+ * optimised implementations of the NIST curves have. */
 const struct gcry_ecc_curve *
 _gcry_ecc_curve_from_group(const EC_GROUP *group)
 {
-    size_t i;
+    static const char *const names[] = {
+        "p", "a", "b", "g.x", "g.y", "n", "h"
+    };
+    const struct gcry_ecc_curve *found = NULL;
+    const EC_POINT *g;
+    BIGNUM *values[DIM(names)];
     BN_CTX *ctx;
+    size_t i;
+    size_t j;
     int nid;
 
     if (!group) {
@@ -778,30 +788,41 @@ _gcry_ecc_curve_from_group(const EC_GROUP *group)
         return NULL;
     }
 
-    for (i = 0; i < DIM(curves); i++) {
-        EC_GROUP *other;
-        int same;
+    BN_CTX_start(ctx);
 
-        if (curves[i].model != GCRY_ECC_MODEL_WEIERSTRASS) {
-            continue;
+    for (i = 0; i < DIM(values); i++) {
+        values[i] = BN_CTX_get(ctx);
+    }
+
+    g = EC_GROUP_get0_generator(group);
+
+    if (!values[DIM(values) - 1] || !g
+        || !EC_GROUP_get_curve(group, values[0], values[1], values[2], ctx)
+        || !EC_POINT_get_affine_coordinates(group, g, values[3], values[4],
+                                            ctx)
+        || !BN_copy(values[5], EC_GROUP_get0_order(group))
+        || !BN_copy(values[6], EC_GROUP_get0_cofactor(group))) {
+        goto leave;
+    }
+
+    for (i = 0; i < DIM(curves) && !found; i++) {
+        int same = curves[i].model == GCRY_ECC_MODEL_WEIERSTRASS;
+
+        for (j = 0; same && j < DIM(names); j++) {
+            gcry_mpi_t t = _gcry_ecc_curve_param(&curves[i], names[j]);
+
+            same = t && !BN_cmp(_gcry_mpi_bn(t), values[j]);
+            gcry_mpi_release(t);
         }
-
-        other = _gcry_ecc_curve_group(&curves[i]);
-
-        if (!other) {
-            continue;
-        }
-
-        same = EC_GROUP_cmp(group, other, ctx) == 0;
-        EC_GROUP_free(other);
 
         if (same) {
-            BN_CTX_free(ctx);
-            return &curves[i];
+            found = &curves[i];
         }
     }
 
-    BN_CTX_free(ctx);
+leave:
     ERR_clear_error();
-    return NULL;
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    return found;
 }

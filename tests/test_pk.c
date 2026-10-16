@@ -4630,6 +4630,451 @@ TEST(elgamal_crafted_ciphertexts)
     gcry_sexp_release(key);
 }
 
+/* ------------------------------------------------------------------ */
+/* Hostile keys and crafted inputs (security review regressions)      */
+/* ------------------------------------------------------------------ */
+
+/* secp256k1 as explicit domain parameters: a curve FIPS mode does not
+ * approve. */
+#define K1_P "00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"
+#define K1_A "00"
+#define K1_B "07"
+#define K1_N "00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
+#define K1_GX "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+#define K1_GY "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8"
+#define K1_PARAMS                                                        \
+    "(p #" K1_P "#) (a #" K1_A "#) (b #" K1_B "#) (g #04" K1_GX K1_GY "#)" \
+    " (n #" K1_N "#)"
+
+/* NIST P-256 as explicit domain parameters. */
+#define P256_P "00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF"
+#define P256_A "00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC"
+#define P256_B "5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B"
+#define P256_N "00FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"
+#define P256_GX "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"
+#define P256_GY "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5"
+#define P256_PARAMS                                                  \
+    "(p #" P256_P "#) (a #" P256_A "#) (b #" P256_B "#)"              \
+    " (g #04" P256_GX P256_GY "#) (n #" P256_N "#)"
+
+/* FIPS mode only knows the approved curves: explicit parameters have to
+ * be those of one, whatever name goes with them.  A zero cofactor is
+ * rejected when the key is read instead of being searched for a set bit
+ * forever. */
+TEST(ecc_explicit_curve_rules)
+{
+    gcry_sexp_t k1_pub = sexp("(public-key (ecc " K1_PARAMS " (h #01#)"
+                              " (q #04" K1_GX K1_GY "#)))");
+    gcry_sexp_t k1_sec = sexp("(private-key (ecc " K1_PARAMS " (h #01#)"
+                              " (q #04" K1_GX K1_GY "#) (d #01#)))");
+    gcry_sexp_t k1_gen = sexp("(genkey (ecc " K1_PARAMS " (h #01#)))");
+    gcry_sexp_t p256_pub = sexp("(public-key (ecc " P256_PARAMS " (h #01#)"
+                                " (q #04" P256_QX P256_QY "#)))");
+    gcry_sexp_t p256_sec = sexp("(private-key (ecc " P256_PARAMS " (h #01#)"
+                                " (q #04" P256_QX P256_QY "#) (d #" P256_D
+                                "#)))");
+    gcry_sexp_t p256_gen = sexp("(genkey (ecc " P256_PARAMS " (h #01#)))");
+    gcry_sexp_t mixed = sexp("(public-key (ecc (curve \"NIST P-256\")"
+                             " (flags param) " K1_PARAMS " (h #01#)"
+                             " (q #04" K1_GX K1_GY "#)))");
+    gcry_sexp_t h0_mont = sexp("(public-key (ecc (curve Curve25519)"
+                               " (flags djb-tweak param) (h #00#)"
+                               " (q #40" X25519_BOB_PK "#)))");
+    gcry_sexp_t h0_weier = sexp("(public-key (ecc " P256_PARAMS " (h #00#)"
+                                " (q #04" P256_QX P256_QY "#)))");
+    gcry_sexp_t data = sexp("(data (flags raw) (value #" P256_D "#))");
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_sexp_t key = NULL;
+    int fips = gcry_fips_mode_active();
+
+    ASSERT_NOT_NULL(k1_pub);
+    ASSERT_NOT_NULL(k1_sec);
+    ASSERT_NOT_NULL(k1_gen);
+    ASSERT_NOT_NULL(p256_pub);
+    ASSERT_NOT_NULL(p256_sec);
+    ASSERT_NOT_NULL(p256_gen);
+    ASSERT_NOT_NULL(mixed);
+    ASSERT_NOT_NULL(h0_mont);
+    ASSERT_NOT_NULL(h0_weier);
+    ASSERT_NOT_NULL(data);
+
+    /* An explicit copy of P-256's parameters is the approved curve. */
+    ASSERT_STR_EQ("NIST P-256", gcry_pk_get_curve(p256_pub, 0, NULL));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, p256_pub));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, p256_sec));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(ciph);
+    plain = ciph = NULL;
+    ASSERT_OK(gcry_pk_testkey(p256_sec));
+    ASSERT_OK(gcry_pk_genkey(&key, p256_gen));
+    ASSERT_NOT_NULL(key);
+    gcry_sexp_release(key);
+    key = NULL;
+
+    /* secp256k1 given explicitly is not approved: ECDH, key generation
+     * and key checks refuse it in FIPS mode, even under P-256's name. */
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED,
+                     gcry_pk_encrypt(&ciph, data, k1_pub));
+
+    if (!fips) {
+        ASSERT_OK(gcry_pk_decrypt(&plain, ciph, k1_sec));
+        gcry_sexp_release(plain);
+        plain = NULL;
+    }
+
+    gcry_sexp_release(ciph);
+    ciph = NULL;
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED, gcry_pk_testkey(k1_sec));
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED, gcry_pk_genkey(&key, k1_gen));
+    gcry_sexp_release(key);
+    key = NULL;
+
+    if (fips) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_pk_encrypt(&ciph, data, mixed));
+        ASSERT_NULL(ciph);
+    }
+
+    /* A zero cofactor is an invalid key, as in the reference library. */
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_encrypt(&ciph, data, h0_mont));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_pk_encrypt(&ciph, data, h0_weier));
+    ASSERT_NULL(ciph);
+
+    gcry_sexp_release(data);
+    gcry_sexp_release(h0_weier);
+    gcry_sexp_release(h0_mont);
+    gcry_sexp_release(mixed);
+    gcry_sexp_release(p256_gen);
+    gcry_sexp_release(p256_sec);
+    gcry_sexp_release(p256_pub);
+    gcry_sexp_release(k1_gen);
+    gcry_sexp_release(k1_sec);
+    gcry_sexp_release(k1_pub);
+}
+
+/* ElGamal keys that are missing p or have a tiny p: the encoders have no
+ * key size to work with (the PSS one used to address a frame of 2^32 - 1
+ * bits), and for p = 2 there is no random k at all (the reference library
+ * never returns there). */
+TEST(elgamal_hostile_keys)
+{
+    gcry_sexp_t nop = sexp("(private-key (elg (g #02#) (y #02#) (x #01#)))");
+    gcry_sexp_t p2 = sexp("(private-key (elg (p #02#) (g #01#) (y #01#)"
+                          " (x #01#)))");
+    gcry_sexp_t p3 = sexp("(private-key (elg (p #03#) (g #02#) (y #02#)"
+                          " (x #01#)))");
+    gcry_sexp_t pss = sexp("(data (flags pss) (hash sha256 #" SAMPLE_SHA256
+                           "#))");
+    gcry_sexp_t pkcs1 = sexp("(data (flags pkcs1) (hash sha256 #"
+                             SAMPLE_SHA256 "#))");
+    gcry_sexp_t pkcs1v = sexp("(data (flags pkcs1) (value #0102#))");
+    gcry_sexp_t oaep = sexp("(data (flags oaep) (value #0102#))");
+    gcry_sexp_t raw = sexp("(data (flags raw) (value #01#))");
+    gcry_sexp_t out = NULL;
+
+    ASSERT_NOT_NULL(nop);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_NOT_NULL(p3);
+    ASSERT_NOT_NULL(pss);
+    ASSERT_NOT_NULL(pkcs1);
+    ASSERT_NOT_NULL(pkcs1v);
+    ASSERT_NOT_NULL(oaep);
+    ASSERT_NOT_NULL(raw);
+
+    if (gcry_fips_mode_active()) {
+        /* ElGamal is refused before the key is looked at. */
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_sign(&out, pss, nop));
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_sign(&out, raw, p2));
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_encrypt(&out, raw, p2));
+        ASSERT_NULL(out);
+    } else {
+        /* The reference library's codes: the encoders see a frame of no
+         * bytes, raw data misses p when the key is read. */
+        ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_sign(&out, pss, nop));
+        ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_sign(&out, pkcs1, nop));
+        ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_encrypt(&out, pkcs1v, nop));
+        ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_pk_encrypt(&out, oaep, nop));
+        ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_sign(&out, raw, nop));
+        ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_encrypt(&out, raw, nop));
+        ASSERT_NULL(out);
+
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_sign(&out, raw, p2));
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_pk_encrypt(&out, raw, p2));
+        ASSERT_NULL(out);
+        /* p = 3 is the smallest modulus with a k; it works as in the
+         * reference library. */
+        ASSERT_OK(gcry_pk_sign(&out, raw, p3));
+        gcry_sexp_release(out);
+        out = NULL;
+        ASSERT_OK(gcry_pk_encrypt(&out, raw, p3));
+        gcry_sexp_release(out);
+        out = NULL;
+    }
+
+    gcry_sexp_release(raw);
+    gcry_sexp_release(oaep);
+    gcry_sexp_release(pkcs1v);
+    gcry_sexp_release(pkcs1);
+    gcry_sexp_release(pss);
+    gcry_sexp_release(p3);
+    gcry_sexp_release(p2);
+    gcry_sexp_release(nop);
+}
+
+/* Both halves of an ElGamal signature are range checked: s is an exponent
+ * modulo p - 1, so s + (p - 1), which the reference library accepts, is
+ * not a canonical signature here; negative or zero values never were. */
+TEST(elgamal_signature_ranges)
+{
+    gcry_sexp_t key;
+    gcry_sexp_t pub;
+    gcry_sexp_t sec;
+    gcry_sexp_t data = sexp("(data (flags raw) (value #0102030405#))");
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t forged = NULL;
+    gcry_mpi_t r;
+    gcry_mpi_t s;
+    gcry_mpi_t p;
+    gcry_mpi_t t = gcry_mpi_new(0);
+
+    ASSERT_NOT_NULL(data);
+
+    if (gcry_fips_mode_active()) {
+        gcry_sexp_release(data);
+        gcry_mpi_release(t);
+        return; /* No ElGamal at all; see test_elgamal. */
+    }
+
+    key = genkey("(genkey (elg (nbits 3:512)))");
+    ASSERT_NOT_NULL(key);
+    pub = gcry_sexp_find_token(key, "public-key", 0);
+    sec = gcry_sexp_find_token(key, "private-key", 0);
+    ASSERT_OK(gcry_pk_sign(&sig, data, sec));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    r = param_mpi(sig, "r");
+    s = param_mpi(sig, "s");
+    p = param_mpi(pub, "p");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(s);
+    ASSERT_NOT_NULL(p);
+
+    /* s + (p - 1) */
+    gcry_mpi_sub_ui(t, p, 1);
+    gcry_mpi_add(t, t, s);
+    ASSERT_OK(gcry_sexp_build(&forged, NULL, "(sig-val (elg (r %m) (s %m)))",
+                              r, t));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(forged, data, pub));
+    gcry_sexp_release(forged);
+    /* s - (p - 1), a negative number */
+    gcry_mpi_sub_ui(t, p, 1);
+    gcry_mpi_sub(t, s, t);
+    ASSERT_TRUE(gcry_mpi_is_neg(t));
+    ASSERT_OK(gcry_sexp_build(&forged, NULL, "(sig-val (elg (r %m) (s %m)))",
+                              r, t));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(forged, data, pub));
+    gcry_sexp_release(forged);
+    /* s = 0 and s = p - 1 */
+    ASSERT_OK(gcry_sexp_build(&forged, NULL, "(sig-val (elg (r %m) (s %d)))",
+                              r, 0));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(forged, data, pub));
+    gcry_sexp_release(forged);
+    gcry_mpi_sub_ui(t, p, 1);
+    ASSERT_OK(gcry_sexp_build(&forged, NULL, "(sig-val (elg (r %m) (s %m)))",
+                              r, t));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(forged, data, pub));
+    gcry_sexp_release(forged);
+    /* r = p, for completeness of the a range check. */
+    ASSERT_OK(gcry_sexp_build(&forged, NULL, "(sig-val (elg (r %m) (s %m)))",
+                              p, s));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(forged, data, pub));
+    gcry_sexp_release(forged);
+    /* The genuine signature still verifies. */
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+
+    gcry_mpi_release(t);
+    gcry_mpi_release(p);
+    gcry_mpi_release(s);
+    gcry_mpi_release(r);
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    gcry_sexp_release(sec);
+    gcry_sexp_release(pub);
+    gcry_sexp_release(key);
+}
+
+/* X25519 decryption rejects the low order peer points of RFC 7748
+ * section 6.1 (as the reference library does), whichever way the secret
+ * scalar is clamped: with an unclamped scalar their multiples would leak
+ * it modulo 8. */
+TEST(x25519_low_order_points)
+{
+    static const char *const low[] = {
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    };
+    gcry_sexp_t clamped = NULL;
+    gcry_sexp_t unclamped = sexp("(private-key (ecc (curve Curve25519)"
+                                 " (flags djb-tweak) (q #40" X25519_BOB_PK "#)"
+                                 " (d #03#)))");
+    gcry_sexp_t plain = NULL;
+    unsigned char scalar[32];
+    unsigned char be[32];
+    gcry_mpi_t k = NULL;
+    void *v;
+    size_t vlen;
+    size_t i;
+
+    /* Bob's clamped scalar as the big endian number Libgcrypt wants. */
+    hex_to_bytes(X25519_BOB_SK_CLAMPED, scalar);
+
+    for (i = 0; i < 32; i++) {
+        be[i] = scalar[31 - i];
+    }
+
+    ASSERT_OK(gcry_mpi_scan(&k, GCRYMPI_FMT_USG, be, 32, NULL));
+    ASSERT_OK(gcry_sexp_build(&clamped, NULL,
+                              "(private-key (ecc (curve Curve25519) (flags djb-tweak)"
+                              " (q #40" X25519_BOB_PK "#) (d %m)))", k));
+    gcry_mpi_release(k);
+    ASSERT_NOT_NULL(clamped);
+    ASSERT_NOT_NULL(unclamped);
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   decrypt_text(&plain, "(enc-val (ecdh (s #01#) (e #40"
+                                X25519_ALICE_PK "#)))", clamped));
+        ASSERT_NULL(plain);
+        gcry_sexp_release(unclamped);
+        gcry_sexp_release(clamped);
+        return;
+    }
+
+    for (i = 0; i < sizeof low / sizeof low[0]; i++) {
+        char text[160];
+
+        snprintf(text, sizeof text, "(enc-val (ecdh (s #01#) (e #40%s#)))",
+                 low[i]);
+        ASSERT_ERR(GPG_ERR_INV_DATA, decrypt_text(&plain, text, clamped));
+        ASSERT_ERR(GPG_ERR_INV_DATA, decrypt_text(&plain, text, unclamped));
+        ASSERT_NULL(plain);
+    }
+
+    /* A proper peer point works with either scalar. */
+    ASSERT_OK(decrypt_text(&plain, "(enc-val (ecdh (s #01#) (e #40"
+                           X25519_ALICE_PK "#)))", clamped));
+    v = param_bytes(plain, "value", &vlen);
+    ASSERT_TRUE(bytes_eq_hex(v, vlen, "40" X25519_SHARED));
+    gcry_free(v);
+    gcry_sexp_release(plain);
+    ASSERT_OK(decrypt_text(&plain, "(enc-val (ecdh (s #01#) (e #40"
+                           X25519_ALICE_PK "#)))", unclamped));
+    gcry_sexp_release(plain);
+
+    gcry_sexp_release(unclamped);
+    gcry_sexp_release(clamped);
+}
+
+/* Private key material lives in secure memory: generated keys and the
+ * results of decryption are secure S-expressions, as in the reference
+ * library. */
+TEST(private_material_is_secure)
+{
+    gcry_sexp_t rsa = genkey(gcry_fips_mode_active()
+                             ? "(genkey (rsa (nbits 4:2048)))"
+                             : "(genkey (rsa (nbits 4:1024)))");
+    gcry_sexp_t skey = rsa_vector_key(1);
+    gcry_sexp_t pkey = rsa_vector_key(0);
+    gcry_sexp_t data = NULL;
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t plain = NULL;
+
+    ASSERT_NOT_NULL(rsa);
+    ASSERT_TRUE(gcry_is_secure(rsa));
+    gcry_sexp_release(rsa);
+
+    if (dsa_available()) {
+        gcry_sexp_t dsa = genkey("(genkey (dsa (nbits 4:1024)))");
+
+        ASSERT_NOT_NULL(dsa);
+        ASSERT_TRUE(gcry_is_secure(dsa));
+        gcry_sexp_release(dsa);
+    }
+
+    /* RSA-OAEP and raw RSA decryption results. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags oaep) (hash-algo sha256) (value %s))",
+                              "oaep message"));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    {
+        gcry_sexp_t l = gcry_sexp_find_token(ciph, "rsa", 0);
+        gcry_sexp_t flagged = NULL;
+        gcry_mpi_t a = param_mpi(l, "a");
+
+        ASSERT_OK(gcry_sexp_build(&flagged, NULL,
+                                  "(enc-val (flags oaep) (hash-algo sha256) (rsa (a %m)))",
+                                  a));
+        ASSERT_OK(gcry_pk_decrypt(&plain, flagged, skey));
+        ASSERT_TRUE(gcry_is_secure(plain));
+        gcry_sexp_release(plain);
+        plain = NULL;
+        gcry_sexp_release(flagged);
+        gcry_sexp_release(l);
+        gcry_mpi_release(a);
+    }
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    ciph = data = NULL;
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags raw) (value #0102030405060708#))"));
+    ASSERT_OK(gcry_pk_encrypt(&ciph, data, pkey));
+    ASSERT_OK(gcry_pk_decrypt(&plain, ciph, skey));
+    ASSERT_TRUE(gcry_is_secure(plain));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    plain = ciph = data = NULL;
+
+    /* ElGamal PKCS#1 and OAEP decryption results. */
+    if (!gcry_fips_mode_active()) {
+        gcry_sexp_t elg = genkey("(genkey (elg (nbits 3:512)))");
+        gcry_sexp_t pub;
+        gcry_sexp_t sec;
+
+        ASSERT_NOT_NULL(elg);
+        pub = gcry_sexp_find_token(elg, "public-key", 0);
+        sec = gcry_sexp_find_token(elg, "private-key", 0);
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags pkcs1) (value %s))", "elg msg"));
+        ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
+        ASSERT_OK(gcry_pk_decrypt(&plain, ciph, sec));
+        ASSERT_TRUE(gcry_is_secure(plain));
+        gcry_sexp_release(plain);
+        gcry_sexp_release(ciph);
+        gcry_sexp_release(data);
+        plain = ciph = data = NULL;
+        /* OAEP with its default SHA-1, the only hash a 512 bit frame fits. */
+        ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                  "(data (flags oaep) (value %s))", "elg msg"));
+        ASSERT_OK(gcry_pk_encrypt(&ciph, data, pub));
+        ASSERT_OK(gcry_pk_decrypt(&plain, ciph, sec));
+        ASSERT_TRUE(gcry_is_secure(plain));
+        gcry_sexp_release(plain);
+        gcry_sexp_release(ciph);
+        gcry_sexp_release(data);
+        gcry_sexp_release(sec);
+        gcry_sexp_release(pub);
+        gcry_sexp_release(elg);
+    }
+
+    gcry_sexp_release(pkey);
+    gcry_sexp_release(skey);
+}
+
 int
 main(void)
 {
@@ -4673,6 +5118,12 @@ main(void)
     RUN_TEST(rsa_pss_verify_corruptions);
     RUN_TEST(rsa_key_without_crt_values);
     RUN_TEST(elgamal_crafted_ciphertexts);
+    RUN_TEST(ecc_explicit_curve_rules);
+    RUN_TEST(elgamal_hostile_keys);
+    RUN_TEST(elgamal_signature_ranges);
+    RUN_TEST(x25519_low_order_points);
+    RUN_TEST(private_material_is_secure);
+    /* disable_algorithm switches ElGamal off: keep it last but one. */
     RUN_TEST(disable_algorithm);
     RUN_TEST(null_arguments);
     return TEST_RESULT();

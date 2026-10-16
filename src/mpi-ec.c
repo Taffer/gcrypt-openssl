@@ -972,6 +972,53 @@ fill_in_curve(mpi_ec_t ec, const struct gcry_ecc_curve *curve)
     }
 }
 
+/* Whether the domain parameters of EC are exactly those of the table
+ * entry CURVE: p, a, b, n, the affine generator and the cofactor. */
+static int
+params_match_curve(mpi_ec_t ec, const struct gcry_ecc_curve *curve)
+{
+    static const char *const names[] = { "p", "a", "b", "n", "g.x", "g.y" };
+    gcry_mpi_t values[6];
+    size_t i;
+    int same = ec->h == curve->h && ec->G
+               && !gcry_mpi_cmp_ui(ec->G->z, 1);
+
+    values[0] = ec->p;
+    values[1] = ec->a;
+    values[2] = ec->b;
+    values[3] = ec->n;
+    values[4] = ec->G ? ec->G->x : NULL;
+    values[5] = ec->G ? ec->G->y : NULL;
+
+    for (i = 0; same && i < DIM(names); i++) {
+        gcry_mpi_t t = _gcry_ecc_curve_param(curve, names[i]);
+
+        same = t && values[i] && !mpi_is_opaque(values[i])
+               && !gcry_mpi_cmp(t, values[i]);
+        gcry_mpi_release(t);
+    }
+
+    return same;
+}
+
+/* FIPS mode only knows the approved curves of the table.  A context built
+ * from explicit parameters is accepted when they are exactly those of an
+ * approved curve, whatever name (if any) accompanies them; EC->curve is
+ * the table entry the parameters were identified as, or the named one. */
+static gcry_err_code_t
+fips_check_explicit_curve(mpi_ec_t ec)
+{
+    if (!_gcry_fips_mode()) {
+        return 0;
+    }
+
+    if (!ec->curve || !ec->curve->fips || !params_match_curve(ec, ec->curve)) {
+        return GPG_ERR_NOT_SUPPORTED;
+    }
+
+    return 0;
+}
+
 /* Build the EC_GROUP for a Weierstrass context. */
 static gcry_err_code_t
 setup_group(mpi_ec_t ec)
@@ -1051,6 +1098,7 @@ _gcry_mpi_ec_internal_new(mpi_ec_t *r_ec, int *r_flags, gcry_sexp_t keyparam,
     gcry_sexp_t l1 = NULL;
     char *name = NULL;
     int flags = r_flags ? *r_flags : 0;
+    int have_params = 0;
 
     *r_ec = NULL;
     rc = _gcry_pk_util_get_nbits(keyparam, &nbits);
@@ -1105,9 +1153,21 @@ _gcry_mpi_ec_internal_new(mpi_ec_t *r_ec, int *r_flags, gcry_sexp_t keyparam,
                 goto leave;
             }
 
+            have_params = ec->p || ec->a || ec->b || ec->G || ec->n
+                          || cofactor;
+
             if (cofactor) {
-                gcry_mpi_get_ui(&ec->h, cofactor);
+                /* A zero (or oversized) cofactor is not one: the
+                 * djb-tweak clamping searches for its lowest set bit. */
+                if (gcry_mpi_get_ui(&ec->h, cofactor) || !ec->h) {
+                    rc = GPG_ERR_INV_OBJ;
+                }
+
                 gcry_mpi_release(cofactor);
+
+                if (rc) {
+                    goto leave;
+                }
             }
         }
     }
@@ -1155,6 +1215,16 @@ _gcry_mpi_ec_internal_new(mpi_ec_t *r_ec, int *r_flags, gcry_sexp_t keyparam,
 
     if (rc) {
         goto leave;
+    }
+
+    /* Explicit parameters, with or without a curve name, bypass the
+     * table's FIPS flag above; they must describe an approved curve. */
+    if (have_params) {
+        rc = fips_check_explicit_curve(ec);
+
+        if (rc) {
+            goto leave;
+        }
     }
 
     if (keyparam) {
@@ -2006,6 +2076,7 @@ _gcry_ecc_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
         OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
         EVP_PKEY_CTX *pctx = NULL;
         EC_POINT *P = NULL;
+        BIGNUM *sd = NULL;
         unsigned char *pub = NULL;
         size_t publen = 0;
         int selection = want_private ? EVP_PKEY_KEYPAIR : EVP_PKEY_PUBLIC_KEY;
@@ -2066,11 +2137,16 @@ _gcry_ecc_evp_key(mpi_ec_t ec, int want_private, gcry_err_code_t *r_rc)
             }
         }
 
-        if (want_private
-            && !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY,
-                                       _gcry_mpi_bn(ec->d))) {
-            rc = GPG_ERR_INTERNAL;
-            goto wleave;
+        /* The secret scalar goes in as a copy flagged secure: that puts
+         * it into the parameter blob OSSL_PARAM_free wipes. */
+        if (want_private) {
+            sd = BN_secure_new();
+
+            if (!sd || !BN_copy(sd, _gcry_mpi_bn(ec->d))
+                || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, sd)) {
+                rc = GPG_ERR_INTERNAL;
+                goto wleave;
+            }
         }
 
         keyp = OSSL_PARAM_BLD_to_param(bld);
@@ -2090,6 +2166,7 @@ wleave:
         OSSL_PARAM_free(keyp);
         OSSL_PARAM_free(grp);
         OSSL_PARAM_BLD_free(bld);
+        BN_clear_free(sd);
         EC_POINT_free(P);
         _gcry_free(pub);
         BN_CTX_free(bctx);
@@ -2446,6 +2523,12 @@ gcry_mpi_ec_set_mpi(const char *name, gcry_mpi_t newvalue, gcry_ctx_t ctx)
             return GCRY_ERR(GPG_ERR_INV_ARG);
         }
 
+        /* In FIPS mode the context stays on the approved curve it was
+         * created for. */
+        if (_gcry_fips_mode() && *slot && gcry_mpi_cmp(*slot, newvalue)) {
+            return GCRY_ERR(GPG_ERR_NOT_SUPPORTED);
+        }
+
         gcry_mpi_release(*slot);
         *slot = gcry_mpi_copy(newvalue);
 
@@ -2458,7 +2541,18 @@ gcry_mpi_ec_set_mpi(const char *name, gcry_mpi_t newvalue, gcry_ctx_t ctx)
         rc = setup_group(ec);
     } else if (!strcmp(name, "h")) {
         if (newvalue) {
-            gcry_mpi_get_ui(&ec->h, newvalue);
+            unsigned int h;
+
+            if (mpi_is_opaque(newvalue) || gcry_mpi_get_ui(&h, newvalue)
+                || !h) {
+                return GCRY_ERR(GPG_ERR_INV_ARG);
+            }
+
+            if (_gcry_fips_mode() && h != ec->h) {
+                return GCRY_ERR(GPG_ERR_NOT_SUPPORTED);
+            }
+
+            ec->h = h;
         }
     } else if (*name == 'q' && (!name[1] || name[1] == '@')) {
         if (newvalue) {
@@ -2503,6 +2597,15 @@ gcry_mpi_ec_set_point(const char *name, gcry_mpi_point_t newvalue,
     }
 
     if (!strcmp(name, "g")) {
+        /* In FIPS mode the context stays on the approved curve it was
+         * created for: the generator is part of the domain parameters. */
+        if (_gcry_fips_mode()
+            && (!newvalue || !ec->G || gcry_mpi_cmp(ec->G->x, newvalue->x)
+                || gcry_mpi_cmp(ec->G->y, newvalue->y)
+                || gcry_mpi_cmp(ec->G->z, newvalue->z))) {
+            return GCRY_ERR(GPG_ERR_NOT_SUPPORTED);
+        }
+
         gcry_mpi_point_release(ec->G);
         ec->G = gcry_mpi_point_copy(newvalue);
     } else if (!strcmp(name, "q")) {

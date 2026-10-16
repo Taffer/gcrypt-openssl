@@ -747,13 +747,15 @@ TEST(context_from_odd_keys)
     ASSERT_NULL(ctx);
     gcry_sexp_release(key);
 
-    /* "param" together with a curve name: the name wins. */
+    /* "param" together with a curve name: the name wins, except that FIPS
+     * mode refuses parameters that are not those of an approved curve. */
     key = NULL;
     key = sexp_of(
               "(public-key (ecc (curve \"NIST P-256\") (flags param) (p #0b#)))"
           );
     ASSERT_NOT_NULL(key);
-    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_mpi_ec_new(&ctx, key, NULL));
     gcry_ctx_release(ctx);
     ctx = NULL;
     gcry_sexp_release(key);
@@ -1607,6 +1609,120 @@ TEST(argument_checks)
     gcry_ctx_release(ctx);
 }
 
+/* FIPS mode admits explicit domain parameters only when they are those of
+ * an approved curve, whatever name goes with them, and then keeps the
+ * context on that curve. */
+TEST(explicit_curve_fips_gate)
+{
+#define K1_PARAMS                                                            \
+    " (p #00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F#)" \
+    " (a #00#) (b #07#)"                                                     \
+    " (g #0479BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798" \
+    "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8#)"      \
+    " (n #00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141#)" \
+    " (h #01#)"
+    static const char p256[] =
+        "(public-key (ecc"
+        " (p #00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF#)"
+        " (a #00FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC#)"
+        " (b #5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B#)"
+        " (g #046B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"
+        "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5#)"
+        " (n #00FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551#)"
+        " (h #01#)))";
+    static const char k1[] = "(public-key (ecc" K1_PARAMS "))";
+    static const char k1_as_p256[] =
+        "(public-key (ecc (curve \"NIST P-256\") (flags param)" K1_PARAMS "))";
+    gcry_ctx_t ctx = NULL;
+    gcry_ctx_t named = NULL;
+    gcry_sexp_t key;
+    gcry_mpi_point_t G;
+    gcry_mpi_point_t R = gcry_mpi_point_new(0);
+    gcry_mpi_point_t Rn = gcry_mpi_point_new(0);
+    gcry_mpi_t x = gcry_mpi_new(0);
+    gcry_mpi_t y = gcry_mpi_new(0);
+    gcry_mpi_t v;
+    int fips = gcry_fips_mode_active();
+
+    /* P-256 as explicit parameters is the approved curve itself. */
+    key = sexp_of(p256);
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_sexp_release(key);
+    ASSERT_OK(gcry_mpi_ec_new(&named, NULL, "NIST P-256"));
+    G = gcry_mpi_ec_get_point("g", ctx, 1);
+    ASSERT_NOT_NULL(G);
+    gcry_mpi_ec_mul(R, GCRYMPI_CONST_TWO, G, ctx);
+    gcry_mpi_ec_mul(Rn, GCRYMPI_CONST_TWO, G, named);
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+    ASSERT_EQ(0, gcry_mpi_ec_get_affine(y, NULL, Rn, named));
+    ASSERT_EQ(0, gcry_mpi_cmp(x, y));
+    gcry_ctx_release(named);
+
+    /* Setting a domain parameter to its own value is fine everywhere;
+     * changing one (which makes a different curve) is not in FIPS mode.
+     * A zero cofactor is never accepted. */
+    v = gcry_mpi_ec_get_mpi("n", ctx, 1);
+    ASSERT_NOT_NULL(v);
+    ASSERT_OK(gcry_mpi_ec_set_mpi("n", v, ctx));
+    gcry_mpi_add_ui(v, v, 1);
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED,
+                     gcry_mpi_ec_set_mpi("n", v, ctx));
+    gcry_mpi_set_ui(v, 1);
+    ASSERT_OK(gcry_mpi_ec_set_mpi("h", v, ctx));
+    gcry_mpi_set_ui(v, 2);
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED,
+                     gcry_mpi_ec_set_mpi("h", v, ctx));
+    gcry_mpi_set_ui(v, 0);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_ec_set_mpi("h", v, ctx));
+    gcry_mpi_release(v);
+    ASSERT_OK(gcry_mpi_ec_set_point("g", G, ctx));
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED,
+                     gcry_mpi_ec_set_point("g", R, ctx));
+    gcry_mpi_point_release(G);
+    gcry_ctx_release(ctx);
+    ctx = NULL;
+
+    /* secp256k1 as explicit parameters is not an approved curve, not
+     * even under P-256's name. */
+    key = sexp_of(k1);
+    ASSERT_NOT_NULL(key);
+    ASSERT_OK_UNLESS(fips, GPG_ERR_NOT_SUPPORTED,
+                     gcry_mpi_ec_new(&ctx, key, NULL));
+    gcry_sexp_release(key);
+
+    if (fips) {
+        ASSERT_NULL(ctx);
+    } else {
+        ASSERT_NOT_NULL(ctx);
+        G = gcry_mpi_ec_get_point("g", ctx, 1);
+        gcry_mpi_ec_mul(R, GCRYMPI_CONST_TWO, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        ASSERT_TRUE(mpi_eq_hex(x, "C6047F9441ED7D6D3045406E95C07CD85C778E4B"
+                               "8CEF3CA7ABAC09B95C709EE5"));
+        gcry_mpi_point_release(G);
+        gcry_ctx_release(ctx);
+        ctx = NULL;
+    }
+
+    key = sexp_of(k1_as_p256);
+    ASSERT_NOT_NULL(key);
+
+    if (fips) {
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_mpi_ec_new(&ctx, key, NULL));
+        ASSERT_NULL(ctx);
+    } else if (!gcry_mpi_ec_new(&ctx, key, NULL)) {
+        gcry_ctx_release(ctx);
+    }
+
+    gcry_sexp_release(key);
+    gcry_mpi_point_release(R);
+    gcry_mpi_point_release(Rn);
+    gcry_mpi_release(x);
+    gcry_mpi_release(y);
+#undef K1_PARAMS
+}
+
 int
 main(void)
 {
@@ -1628,5 +1744,6 @@ main(void)
     RUN_TEST(montgomery_generic_ladder);
     RUN_TEST(edwards_projective_point);
     RUN_TEST(argument_checks);
+    RUN_TEST(explicit_curve_fips_gate);
     return TEST_RESULT();
 }

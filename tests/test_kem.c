@@ -440,6 +440,16 @@ TEST(dhkem_x25519)
                              sizeof ss1, pkR, 32));
     ASSERT_HEX_EQ("fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
                   ss1, 32);
+
+    /* A low order recipient key or ciphertext (here u = 0, of order 2)
+     * is invalid data, as the reference library reports it. */
+    memset(pk, 0, sizeof pk);
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_encap(GCRY_KEM_DHKEM25519, pk, sizeof pk, ct, sizeof ct,
+                              ss1, sizeof ss1, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_decap(GCRY_KEM_DHKEM25519, skR, 32, pk, 32, ss1,
+                              sizeof ss1, NULL, 0));
     free(skR);
     free(pkR);
     free(enc);
@@ -476,6 +486,15 @@ TEST(dhkem_x448)
     ASSERT_ERR(GPG_ERR_INV_ARG,
                gcry_kem_encap(GCRY_KEM_DHKEM448, pk, sizeof pk, ct, sizeof ct,
                               ss1, 48, NULL, 0));
+
+    /* A low order recipient key or ciphertext (u = 0) is invalid data. */
+    memset(pk, 0, sizeof pk);
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_decap(GCRY_KEM_DHKEM448, sk, sizeof sk, pk, sizeof pk,
+                              ss2, sizeof ss2, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               gcry_kem_encap(GCRY_KEM_DHKEM448, pk, sizeof pk, ct, sizeof ct,
+                              ss1, sizeof ss1, NULL, 0));
 }
 
 TEST(dhkem_p256)

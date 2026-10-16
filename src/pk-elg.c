@@ -39,15 +39,34 @@ elg_get_nbits(gcry_sexp_t parms)
 static gcry_err_code_t
 gen_k(gcry_mpi_t p, int coprime, gcry_mpi_t *r_k)
 {
-    gcry_mpi_t k = gcry_mpi_snew(0);
-    gcry_mpi_t p_1 = gcry_mpi_new(0);
-    gcry_mpi_t g = gcry_mpi_new(0);
-    BN_CTX *bctx = BN_CTX_new_ex(_gcry_libctx());
+    gcry_mpi_t k;
+    gcry_mpi_t p_1;
+    gcry_mpi_t g;
+    BN_CTX *bctx;
     gcry_err_code_t rc = 0;
+    unsigned int tries;
 
+    *r_k = NULL;
+
+    /* For p < 3 there is no such k at all (the reference library loops
+     * forever on p = 2); for any larger p, k = 1 is one, so the search
+     * below terminates quickly and its bound is only a safeguard. */
+    if (mpi_is_opaque(p) || gcry_mpi_cmp_ui(p, 3) < 0) {
+        return GPG_ERR_INV_VALUE;
+    }
+
+    k = gcry_mpi_snew(0);
+    p_1 = gcry_mpi_new(0);
+    g = gcry_mpi_new(0);
+    bctx = BN_CTX_new_ex(_gcry_libctx());
     gcry_mpi_sub_ui(p_1, p, 1);
 
-    for (;;) {
+    for (tries = 0;; tries++) {
+        if (tries >= 10000) {
+            rc = GPG_ERR_INV_VALUE;
+            break;
+        }
+
         if (!bctx || !BN_priv_rand_range_ex(_gcry_mpi_bn(k), _gcry_mpi_bn(p_1),
                                             0, bctx)) {
             rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
@@ -103,6 +122,7 @@ data_to_mpi(struct pk_data *pd, gcry_mpi_t *r_m)
     }
 
     rc = _gcry_mpi_scan(r_m, GCRYMPI_FMT_USG, frame, framelen, NULL);
+    _gcry_wipememory(frame, framelen); /* The padded plaintext. */
     _gcry_free(frame);
     return rc;
 }
@@ -404,14 +424,20 @@ elg_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    if (gcry_mpi_cmp_ui(sig_a, 0) <= 0 || gcry_mpi_cmp(sig_a, p) >= 0) {
+    /* 0 < a < p and 0 < b < p - 1: b is an exponent modulo p - 1, so a
+     * value outside that range is a non-canonical signature (the reference
+     * library only checks a). */
+    t1 = gcry_mpi_new(0);
+    t2 = gcry_mpi_new(0);
+    gcry_mpi_sub_ui(t1, p, 1);
+
+    if (gcry_mpi_cmp_ui(sig_a, 0) <= 0 || gcry_mpi_cmp(sig_a, p) >= 0
+        || gcry_mpi_cmp_ui(sig_b, 0) <= 0 || gcry_mpi_cmp(sig_b, t1) >= 0) {
         rc = GPG_ERR_BAD_SIGNATURE;
         goto leave;
     }
 
     /* y^a * a^b == g^m (mod p) */
-    t1 = gcry_mpi_new(0);
-    t2 = gcry_mpi_new(0);
     gcry_mpi_powm(t1, y, sig_a, p);
     gcry_mpi_powm(t2, sig_a, sig_b, p);
     gcry_mpi_mulm(t1, t1, t2, p);

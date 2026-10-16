@@ -36,6 +36,35 @@ rsa_get_nbits(gcry_sexp_t parms)
     return nbits;
 }
 
+/* A copy of BN carrying BN_FLG_SECURE.  OSSL_PARAM_BLD_push_BN puts such a
+ * number into the blob that OSSL_PARAM_free wipes, the others into one it
+ * merely frees. */
+static BIGNUM *
+secure_bn_copy(const BIGNUM *bn)
+{
+    BIGNUM *copy = BN_secure_new();
+
+    if (copy && !BN_copy(copy, bn)) {
+        BN_clear_free(copy);
+        copy = NULL;
+    }
+
+    return copy;
+}
+
+/* A secure MPI with the value of BN, for private key material. */
+static gcry_mpi_t
+secure_mpi_from_bn(const BIGNUM *bn)
+{
+    BIGNUM *copy = secure_bn_copy(bn);
+
+    if (!copy) {
+        _gcry_fatal_error(GPG_ERR_ENOMEM, NULL);
+    }
+
+    return _gcry_mpi_new_from_bn(copy, 1);
+}
+
 /* Build an EVP_PKEY from the key parameters. */
 static gcry_err_code_t
 rsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
@@ -52,6 +81,9 @@ rsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
     OSSL_PARAM *params = NULL;
     EVP_PKEY_CTX *ctx = NULL;
     BN_CTX *bctx = NULL;
+    BIGNUM *sd = NULL;
+    BIGNUM *sp = NULL;
+    BIGNUM *sq = NULL;
     BIGNUM *dp = NULL;
     BIGNUM *dq = NULL;
     BIGNUM *coeff = NULL;
@@ -86,24 +118,28 @@ rsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
     }
 
     if (want_private) {
-        if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D,
-                                    _gcry_mpi_bn(d))) {
+        /* The private values go in as secure copies, see secure_bn_copy. */
+        sd = secure_bn_copy(_gcry_mpi_bn(d));
+
+        if (!sd || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D, sd)) {
             rc = GPG_ERR_ENOMEM;
             goto leave;
         }
 
         if (p && q) {
             /* OpenSSL factor1 := q, factor2 := p. */
-            dp = BN_new();
-            dq = BN_new();
-            coeff = BN_new();
-            tmp = BN_new();
+            sp = secure_bn_copy(_gcry_mpi_bn(p));
+            sq = secure_bn_copy(_gcry_mpi_bn(q));
+            dp = BN_secure_new();
+            dq = BN_secure_new();
+            coeff = BN_secure_new();
+            tmp = BN_secure_new();
 
-            if (!dp || !dq || !coeff || !tmp
-                || !BN_sub(tmp, _gcry_mpi_bn(q), BN_value_one())
-                || !BN_mod(dp, _gcry_mpi_bn(d), tmp, bctx)
-                || !BN_sub(tmp, _gcry_mpi_bn(p), BN_value_one())
-                || !BN_mod(dq, _gcry_mpi_bn(d), tmp, bctx)) {
+            if (!sp || !sq || !dp || !dq || !coeff || !tmp
+                || !BN_sub(tmp, sq, BN_value_one())
+                || !BN_mod(dp, sd, tmp, bctx)
+                || !BN_sub(tmp, sp, BN_value_one())
+                || !BN_mod(dq, sd, tmp, bctx)) {
                 rc = GPG_ERR_INTERNAL;
                 goto leave;
             }
@@ -113,16 +149,14 @@ rsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
                     rc = GPG_ERR_ENOMEM;
                     goto leave;
                 }
-            } else if (!BN_mod_inverse(coeff, _gcry_mpi_bn(p),
-                                       _gcry_mpi_bn(q), bctx)) {
+            } else if (!BN_mod_inverse(coeff, sp, sq, bctx)) {
                 rc = GPG_ERR_BAD_SECKEY;
                 goto leave;
             }
 
-            if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR1,
-                                        _gcry_mpi_bn(q))
+            if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR1, sq)
                 || !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR2,
-                                           _gcry_mpi_bn(p))
+                                           sp)
                 || !OSSL_PARAM_BLD_push_BN(bld,
                                            OSSL_PKEY_PARAM_RSA_EXPONENT1, dp)
                 || !OSSL_PARAM_BLD_push_BN(bld,
@@ -157,10 +191,13 @@ rsa_evp_key(gcry_sexp_t parms, int want_private, EVP_PKEY **r_key,
 
 leave:
     ERR_clear_error();
-    BN_free(dp);
-    BN_free(dq);
-    BN_free(coeff);
-    BN_free(tmp);
+    BN_clear_free(sd);
+    BN_clear_free(sp);
+    BN_clear_free(sq);
+    BN_clear_free(dp);
+    BN_clear_free(dq);
+    BN_clear_free(coeff);
+    BN_clear_free(tmp);
     BN_CTX_free(bctx);
     EVP_PKEY_CTX_free(ctx);
     OSSL_PARAM_free(params);
@@ -377,6 +414,12 @@ rsa_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 leave:
     EVP_PKEY_free(key);
     gcry_mpi_release(n);
+
+    /* The frame is the padded plaintext. */
+    if (frame) {
+        _gcry_wipememory(frame, framelen ? framelen : k);
+    }
+
     _gcry_free(frame);
     _gcry_free(out);
     _gcry_pk_data_free(&pd);
@@ -518,16 +561,14 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         break;
 
     default: {
-        gcry_mpi_t plain = NULL;
+        /* A secure number, so that the result S-expression is secure
+         * like the reference library's. */
+        gcry_mpi_t plain = gcry_mpi_snew(0);
 
-        rc = _gcry_mpi_scan(&plain, GCRYMPI_FMT_USG, out, k, NULL);
-
-        if (!rc) {
-            rc = _gcry_sexp_build(r_plain, NULL,
-                                  (pd.flags & PUBKEY_FLAG_LEGACYRESULT) ? "%m"
-                                  : "(value %m)", plain);
-        }
-
+        _gcry_mpi_set_buffer(plain, out, (unsigned int)k, 0);
+        rc = _gcry_sexp_build(r_plain, NULL,
+                              (pd.flags & PUBKEY_FLAG_LEGACYRESULT) ? "%m"
+                              : "(value %m)", plain);
         gcry_mpi_release(plain);
         break;
     }
@@ -922,12 +963,14 @@ rsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         goto leave;
     }
 
+    /* The private values are secure MPIs, which makes the key S-expression
+     * secure. */
     m_n = _gcry_pk_mpi_from_bn(bn_n);
     m_e = _gcry_pk_mpi_from_bn(bn_e);
-    m_d = _gcry_pk_mpi_from_bn(bn_d);
-    m_p = _gcry_pk_mpi_from_bn(bn_p);
-    m_q = _gcry_pk_mpi_from_bn(bn_q);
-    m_u = _gcry_pk_mpi_from_bn(bn_u);
+    m_d = secure_mpi_from_bn(bn_d);
+    m_p = secure_mpi_from_bn(bn_p);
+    m_q = secure_mpi_from_bn(bn_q);
+    m_u = secure_mpi_from_bn(bn_u);
     rc = _gcry_sexp_build(r_skey, NULL,
                           "(key-data"
                           " (public-key"
