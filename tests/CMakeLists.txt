@@ -78,6 +78,26 @@ if(GCRYPT_OPENSSL_BUILD_SHARED AND GCRYPT_OPENSSL_BUILD_STATIC)
     )
 endif()
 
+# `cmake --build <dir> --target memcheck` runs every test program under
+# Valgrind's memcheck through CTest (`ctest -T memcheck`), with the options
+# and suppressions configured at the top level. check_exports runs a shell
+# script and is skipped. A defect reported by Valgrind fails the test.
+if(GCRYPT_OPENSSL_VALGRIND)
+    add_custom_target(
+        memcheck
+        COMMAND
+            ${CMAKE_CTEST_COMMAND} -T memcheck --output-on-failure
+            --exclude-regex check_exports --parallel 4 --test-dir
+            "${PROJECT_BINARY_DIR}"
+        WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+        USES_TERMINAL
+        COMMENT "Running the tests under Valgrind"
+        VERBATIM
+    )
+else()
+    message(STATUS "Valgrind not found; memcheck target not available")
+endif()
+
 # The shared library must export exactly the reference library's symbols.
 if(GCRYPT_OPENSSL_BUILD_SHARED
    AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"

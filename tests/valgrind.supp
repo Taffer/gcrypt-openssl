@@ -1,0 +1,17 @@
+# Valgrind suppressions for the test suite, used by `ctest -T memcheck`
+# and the memcheck target. Add an entry only for a report that has been
+# traced to code outside this project.
+
+# glibc's dynamic loader keeps per-object lookup tables that it never
+# frees; they show up as "possibly lost" when OpenSSL dlopen()s a provider
+# module (the legacy provider at library initialisation).
+{
+   glibc-dlopen-dl_find_object
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:_dl_find_object_update
+   ...
+   fun:dlopen*
+}

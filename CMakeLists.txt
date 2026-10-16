@@ -185,6 +185,27 @@ endif()
 add_subdirectory(src)
 
 if(GCRYPT_OPENSSL_BUILD_TESTS)
+    # Valgrind integration for `ctest -T memcheck` and the memcheck target
+    # defined in tests/. These must be set before CTest is included so that
+    # they land in DartConfiguration.tcl.
+    find_program(
+        GCRYPT_OPENSSL_VALGRIND
+        NAMES valgrind
+        DOC "Valgrind"
+    )
+    if(GCRYPT_OPENSSL_VALGRIND)
+        set(MEMORYCHECK_COMMAND "${GCRYPT_OPENSSL_VALGRIND}")
+        set(MEMORYCHECK_COMMAND_OPTIONS
+            "--tool=memcheck --error-exitcode=1 --leak-check=full \
+--errors-for-leak-kinds=definite,possible --track-origins=yes \
+--num-callers=30 \
+--read-var-info=yes"
+        )
+        set(MEMORYCHECK_SUPPRESSIONS_FILE
+            "${PROJECT_SOURCE_DIR}/tests/valgrind.supp"
+        )
+    endif()
+
     include(CTest)
     add_subdirectory(tests)
 endif()

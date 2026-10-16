@@ -82,6 +82,13 @@
     {
       "name": "fips",
       "configurePreset": "fips"
+    },
+    {
+      "name": "memcheck",
+      "configurePreset": "debug",
+      "targets": [
+        "memcheck"
+      ]
     }
   ],
   "testPresets": [

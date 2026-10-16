@@ -125,8 +125,9 @@ name; every one uses Ninja and writes `compile_commands.json`.
 | `coverage` | `build-coverage/`| Debug, `GCRYPT_OPENSSL_COVERAGE=ON`, benchmarks off |
 | `fips`     | `build-fips/`    | RelWithDebInfo, `GCRYPT_OPENSSL_FIPS=ON`        |
 
-The extra build preset `coverage-report` runs the `coverage` target in the
-`coverage` tree. To point every preset at a non-system OpenSSL, add local
+The extra build presets `coverage-report` and `memcheck` run the
+`coverage` target in the `coverage` tree and the `memcheck` target in the
+`debug` tree. To point every preset at a non-system OpenSSL, add local
 presets that inherit these in an untracked `CMakeUserPresets.json` (see
 [OpenSSL 4](#openssl-4)).
 
@@ -147,6 +148,7 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | `bench_gcrypt_stock` | | The same sources linked against the stock `libgcrypt.so.20`, when one is found |
 | `bench-compare` | | Runs both benchmarks through `benchmarks/compare.sh` |
 | `coverage` | | Runs the tests and writes the coverage report; only with `GCRYPT_OPENSSL_COVERAGE=ON` |
+| `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
 | `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
 
 All libraries, tests and benchmarks are part of the default (`all`) target.
@@ -164,6 +166,18 @@ export check:
 ctest --preset debug                    # all 20 entries
 ctest --preset debug -R 'cipher|md'     # by name
 build-debug/tests/test_pk               # one program directly
+```
+
+When Valgrind is installed, the `memcheck` target runs every test program
+(except the export check) under memcheck with full leak checking and
+origin tracking; any error Valgrind reports, including a definite or
+possible leak, fails that test. The
+suppressions in `tests/valgrind.supp` apply, and CTest keeps the logs in
+`Testing/Temporary/MemoryChecker.*.log` under the build directory. A
+Debug tree gives the most useful reports:
+
+```sh
+cmake --build --preset memcheck      # or: ctest --preset debug -T memcheck
 ```
 
 The shared library is linked with `--no-undefined`, which clashes with the
