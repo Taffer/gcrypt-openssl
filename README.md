@@ -34,11 +34,16 @@ This project was extruded by Claude. Use at your own risk.
 - **Clean room.** Upstream was read for behaviour only; the public header,
   constants and S-expression formats are reproduced because they are the
   API, the code is new. See [LICENSE](LICENSE).
-- **Secure memory** is OpenSSL's secure heap, a process-wide pool of 32 KiB
-  unless `GCRYCTL_INIT_SECMEM` asks for more. Secure allocations are wiped
-  on free and `gcry_is_secure()` is an exact range check. When the pool is
-  exhausted, allocations fall back to the ordinary heap and are reported as
-  not secure.
+- **Secure memory** is a pool of the library's own, like the reference
+  implementation's: an anonymous mapping of 32 KiB (more if
+  `GCRYCTL_INIT_SECMEM` asks for it), locked into RAM and excluded from
+  core dumps where the system allows, carved up by a small first-fit
+  allocator. Secure allocations are wiped on free and `gcry_is_secure()` is
+  an exact range check. When the pool is exhausted, allocations fall back
+  to the ordinary heap and are reported as not secure. OpenSSL's own
+  secure heap is deliberately left alone: it is process-wide with no
+  fallback, and sizing it for the application starved OpenSSL's internal
+  users of it, most visibly the FIPS module's self-tests.
 - **Thread safety** follows the reference library: handles are not shared
   between threads, everything else is. Fetched OpenSSL algorithm objects
   are cached for the life of the process behind mutexes, and each thread
@@ -182,10 +187,7 @@ cmake --build --preset memcheck      # or: ctest --preset debug -T memcheck
 
 The shared library is linked with `--no-undefined`, which clashes with the
 sanitizer runtimes. To run the suite under ASan/UBSan, build the static
-library only. CTest sets `LSAN_OPTIONS` to use `tests/lsan.supp` (OpenSSL
-keeps DRBG state in its secure heap, which LeakSanitizer cannot scan) and
-`ASAN_OPTIONS=fast_unwind_on_malloc=0` so that stacks through libcrypto
-are complete:
+library only:
 
 ```sh
 CC=clang cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
@@ -236,10 +238,34 @@ request off.
 mode unconditionally, as if the marker file were present, and defines
 `GCRYPT_OPENSSL_FIPS=1` for every target in the tree: the libraries, the
 drop-in, the tests, the benchmarks and a coverage build configured with
-both options. The tests do not yet adapt to FIPS mode, and the setting has
-not been validated against a FIPS provider: with an OpenSSL that has no
-`fips` module (such as the one `scripts/build-openssl.sh` produces) the
-library silently runs in non-FIPS mode and the suite passes as usual.
+both options. With an OpenSSL that has no `fips` module (such as the one
+`scripts/build-openssl.sh` produces) the library silently runs in non-FIPS
+mode.
+
+The test suite passes in genuine FIPS mode. Every test program branches on
+`gcry_fips_mode_active()`: algorithms the FIPS provider lacks are asserted
+to fail with the family's unknown-algorithm code, FIPS-only parameter
+rules are asserted (HMAC keys of at least 14 bytes, PBKDF2 with a salt of
+at least 16 bytes, at least 1000 iterations and at least 14 bytes of
+output, RSA keys of at least 2048 bits with `e` at least 65537, XTS keys
+with distinct halves), and everything approved is exercised as usual. To
+run it, build OpenSSL with `enable-fips`, run `fipsinstall`, and point
+`OPENSSL_CONF` at a configuration that activates the `fips` and `base`
+providers with `fips=yes` as the default property; the library picks that
+up through `OSSL_LIB_CTX_load_config()`.
+
+What FIPS mode offers, as seen through OpenSSL 4.0.3's FIPS provider: AES
+in every mode except SIV and GCM-SIV; SHA-1, SHA-2, SHA-3, SHAKE and
+cSHAKE; HMAC over those, CMAC-AES and GMAC-AES; PBKDF2, HKDF, the
+one-step KDF and X9.63; RSA, ECDSA and ECDH on the NIST curves, Ed25519
+and Ed448 (not Ed25519ctx); ML-KEM and, composed from ECDH and HKDF,
+DHKEM over P-256, P-384 and P-521; prime generation. Not available:
+every other cipher and digest, Poly1305, scrypt, Argon2, DSA, ElGamal,
+X25519 and X448 (the provider has no implementation at all), Brainpool,
+secp256k1, SM2 and GOST curves, non-approved digests in public key
+operations (including pre-computed RIPEMD-160 or CRC digests), and custom
+allocation, out-of-core and fatal-error handlers, which the reference
+library also ignores in FIPS mode.
 
 ### OpenSSL 4
 

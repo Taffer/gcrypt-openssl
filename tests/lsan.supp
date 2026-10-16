@@ -1,8 +1,0 @@
-# LeakSanitizer suppressions for the test suite.
-#
-# OpenSSL keeps DRBG state in its secure heap, an mmap'd arena that
-# LeakSanitizer does not scan. Once any secure allocation has initialised
-# that heap, the per-thread DRBGs of the library context look unreachable
-# even though they are owned by it. Nothing in this project allocates
-# them, so hide every object reached through a DRBG instantiation.
-leak:rand_new_drbg

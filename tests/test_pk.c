@@ -3385,12 +3385,19 @@ TEST(rsa_encoding_vectors)
     gcry_sexp_release(sig);
     gcry_sexp_release(data);
 
-    /* Signatures with digests OpenSSL does not offer for PKCS#1. */
+    /* Signatures with digests OpenSSL does not offer for PKCS#1.  CRC-32
+     * is not an approved digest, so FIPS mode refuses it. */
     data = sexp("(data (flags pkcs1) (hash crc32 #01020304#))");
-    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
-    ASSERT_TRUE(param_is_hex(sig, "s", RSA_CRC32_SIG));
-    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
-    gcry_sexp_release(sig);
+
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_pk_sign(&sig, data, skey));
+    } else {
+        ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+        ASSERT_TRUE(param_is_hex(sig, "s", RSA_CRC32_SIG));
+        ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+        gcry_sexp_release(sig);
+    }
+
     gcry_sexp_release(data);
     ASSERT_OK(gcry_sexp_build(&data, NULL,
                               "(data (flags pkcs1) (hash sha3-256 %b))", 32,
