@@ -1367,6 +1367,305 @@ TEST(argument_checks)
     gcry_sexp_release(s);
 }
 
+TEST(oversized_items)
+{
+    gcry_sexp_t s = NULL;
+    gcry_mpi_t big = gcry_mpi_new(0);
+    gcry_mpi_t opaque;
+    char *buf = malloc(140000 + 16);
+    size_t erroff = 99;
+    size_t n;
+    const char *d;
+
+    ASSERT_NOT_NULL(buf);
+    ASSERT_NOT_NULL(big);
+
+    /* Data items are limited to 65535 bytes, however they arrive. */
+    memset(buf, 'a', 70000);
+    buf[70000] = 0;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %b)", 70000,
+                                                buf));
+    ASSERT_NULL(s);
+    ASSERT_EQ(4, erroff);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %s)", buf));
+    ASSERT_EQ(4, erroff);
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %b)", 65535, buf));
+    d = gcry_sexp_nth_data(s, 1, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(65535, n);
+    gcry_sexp_release(s);
+    s = NULL;
+    /* The scanner: a token, a quoted string, hex, base64 and a length
+     * prefix, all over the limit. */
+    memcpy(buf, "(a ", 3);
+    memset(buf + 3, 'a', 70000);
+    buf[70003] = ')';
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, buf, 70004));
+    ASSERT_NULL(s);
+    memcpy(buf, "(a \"", 4);
+    memset(buf + 4, 'a', 70000);
+    memcpy(buf + 70004, "\")", 2);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, buf, 70006));
+    memcpy(buf, "(a #", 4);
+    memset(buf + 4, '0', 140000);
+    memcpy(buf + 140004, "#)", 2);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, buf, 140006));
+    memcpy(buf, "(a |", 4);
+    memset(buf + 4, 'A', 93336); /* 70002 bytes. */
+    memcpy(buf + 93340, "|)", 2);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, buf, 93342));
+    memcpy(buf, "(a 70000:", 9);
+    memset(buf + 9, 'a', 70000);
+    buf[70009] = ')';
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff, buf, 70010));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_new(&s, buf, 70010, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&s, &erroff,
+                                                "(a 99999999999999999999:x)",
+                                                26));
+    ASSERT_NULL(s);
+    /* MPIs are data items too: an opaque one of 70000 bytes, and a
+     * number of 65536 bytes. */
+    memset(buf, 'a', 70000);
+    opaque = gcry_mpi_set_opaque_copy(NULL, buf, 70000 * 8);
+    ASSERT_NOT_NULL(opaque);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %m)",
+                                                opaque));
+    ASSERT_EQ(4, erroff);
+    gcry_mpi_set_bit(big, 65536 * 8 - 1);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %m)", big));
+    ASSERT_EQ(4, erroff);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %M)", big));
+    ASSERT_NULL(s);
+
+    /* Below the limit, long items make the builder grow its buffer, in
+     * one big step or several smaller ones. */
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %b %b)", 60000, buf, 60000, buf));
+    ASSERT_EQ(3, gcry_sexp_length(s));
+    d = gcry_sexp_nth_data(s, 2, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(60000, n);
+    ASSERT_EQ('a', d[59999]);
+    n = gcry_sexp_sprint(s, GCRYSEXP_FMT_CANON, NULL, 0);
+    ASSERT_EQ(1 + 3 + 2 * (6 + 60000) + 1 + 1, n);
+    gcry_sexp_release(s);
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %b %b %b %b)", 1000, buf, 1000,
+                              buf, 1000, buf, 1000, buf));
+    ASSERT_EQ(5, gcry_sexp_length(s));
+    d = gcry_sexp_nth_data(s, 4, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(1000, n);
+    ASSERT_EQ('a', d[999]);
+    gcry_sexp_release(s);
+
+    gcry_mpi_release(opaque);
+    gcry_mpi_release(big);
+    free(buf);
+}
+
+TEST(build_null_and_secure_arguments)
+{
+    gcry_sexp_t s = NULL;
+    gcry_sexp_t inner = NULL;
+    gcry_mpi_t m = gcry_mpi_snew(0);
+    gcry_mpi_t so;
+    gcry_mpi_t x = NULL;
+    unsigned char *secbuf;
+    size_t erroff = 99;
+    const char *d;
+    size_t n;
+    char *c;
+
+    ASSERT_NOT_NULL(m);
+
+    /* NULL arguments are rejected at their directive. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %m)",
+                                                (gcry_mpi_t)NULL));
+    ASSERT_NULL(s);
+    ASSERT_EQ(4, erroff);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %M)",
+                                                (gcry_mpi_t)NULL));
+    ASSERT_EQ(4, erroff);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %s)",
+                                                (char *)NULL));
+    ASSERT_EQ(4, erroff);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, &erroff, "(a %b)", 5,
+                                                (char *)NULL));
+    ASSERT_EQ(4, erroff);
+
+    /* Secure arguments move the result into secure memory, however many
+     * of them there are and whatever their kind: numbers ... */
+    gcry_mpi_set_ui(m, 0x1234);
+    ASSERT_TRUE(gcry_mpi_get_flag(m, GCRYMPI_FLAG_SECURE));
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %m %m %M)", m, m, m));
+    ASSERT_TRUE(gcry_is_secure(s));
+    gcry_sexp_release(s);
+    /* ... raw buffers ... */
+    secbuf = gcry_malloc_secure(4);
+    ASSERT_NOT_NULL(secbuf);
+    memcpy(secbuf, "\x81\x02\x03\x04", 4);
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %b)", 4, secbuf));
+    ASSERT_TRUE(gcry_is_secure(s));
+    d = gcry_sexp_nth_data(s, 1, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(4, n);
+    ASSERT_MEM_EQ(secbuf, d, 4);
+    gcry_sexp_release(s);
+    /* ... opaque MPIs ... */
+    so = gcry_mpi_set_opaque_copy(NULL, secbuf, 32);
+    ASSERT_NOT_NULL(so);
+    ASSERT_TRUE(gcry_mpi_get_flag(so, GCRYMPI_FLAG_SECURE));
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a %m)", so));
+    ASSERT_TRUE(gcry_is_secure(s));
+    d = gcry_sexp_nth_data(s, 1, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(4, n);
+    ASSERT_MEM_EQ(secbuf, d, 4);
+    /* ... and S-expressions spliced in with %S. */
+    ASSERT_OK(gcry_sexp_build(&inner, NULL, "(k %S)", s));
+    ASSERT_TRUE(gcry_is_secure(inner));
+    c = canon(inner);
+    ASSERT_MEM_EQ("(1:k(1:a4:\x81\x02\x03\x04))", c, 17);
+    free(c);
+    gcry_sexp_release(inner);
+    /* An opaque extraction out of a secure S-expression is secure too. */
+    ASSERT_OK(gcry_sexp_extract_param(s, NULL, "/a", &x, NULL));
+    ASSERT_NOT_NULL(x);
+    ASSERT_TRUE(gcry_mpi_get_flag(x, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_TRUE(gcry_mpi_get_flag(x, GCRYMPI_FLAG_SECURE));
+    ASSERT_EQ(32, gcry_mpi_get_nbits(x));
+    ASSERT_MEM_EQ(secbuf, gcry_mpi_get_opaque(x, NULL), 4);
+    gcry_mpi_release(x);
+    gcry_sexp_release(s);
+    s = NULL;
+
+    /* A failure after the switch to secure memory cleans up as well. */
+    ASSERT_ERR(GPG_ERR_SEXP_INV_LEN_SPEC, gcry_sexp_build(&s, &erroff,
+                                                          "(a %m %q)", m));
+    ASSERT_NULL(s);
+    ASSERT_EQ(7, erroff);
+
+    gcry_free(secbuf);
+    gcry_mpi_release(so);
+    gcry_mpi_release(m);
+}
+
+TEST(display_hint_and_canon_len_errors)
+{
+    gcry_sexp_t s = NULL;
+    size_t erroff = 99;
+    gcry_error_t err = 0;
+
+    /* A list may not open inside a display hint; one that has been
+     * closed is fine in front of a list. */
+    ASSERT_ERR(GPG_ERR_SEXP_UNMATCHED_DH,
+               gcry_sexp_build(&s, &erroff, "(a [h(b))"));
+    ASSERT_NULL(s);
+    ASSERT_EQ(5, erroff);
+    ASSERT_ERR(GPG_ERR_SEXP_UNMATCHED_DH,
+               gcry_sexp_sscan(&s, &erroff, "(a [h(b))", 9));
+    ASSERT_EQ(5, erroff);
+    ASSERT_OK(gcry_sexp_build(&s, NULL, "(a [h](b))"));
+    ASSERT_EQ(3, gcry_sexp_length(s));
+    gcry_sexp_release(s);
+    s = NULL;
+    /* The same in canonical form, and a nested hint. */
+    ASSERT_EQ(0, gcry_sexp_canon_len((const unsigned char *)"([1:h(1:a))", 0,
+                                     &erroff, &err));
+    ASSERT_ERR(GPG_ERR_SEXP_UNMATCHED_DH, err);
+    ASSERT_EQ(5, erroff);
+    ASSERT_EQ(0, gcry_sexp_canon_len((const unsigned char *)"([1:h[1:x]1:a)",
+                                     0, &erroff, &err));
+    ASSERT_ERR(GPG_ERR_SEXP_NESTED_DH, err);
+    ASSERT_EQ(5, erroff);
+    /* A closing parenthesis is never seen at level zero: the scan must
+     * start with an opening one and stops as soon as the level is back
+     * to zero, so a stray one is "not canonical" or simply ignored. */
+    ASSERT_EQ(0, gcry_sexp_canon_len((const unsigned char *)")", 0, &erroff,
+                                     &err));
+    ASSERT_ERR(GPG_ERR_SEXP_NOT_CANONICAL, err);
+    ASSERT_EQ(0, erroff);
+    ASSERT_EQ(5, gcry_sexp_canon_len((const unsigned char *)"(1:a))", 0,
+                                     &erroff, &err));
+    ASSERT_OK(err);
+}
+
+TEST(navigation_past_the_end)
+{
+    gcry_sexp_t s = scan("(a b)", 0);
+    gcry_sexp_t lone = NULL;
+    gcry_sexp_t t;
+    gcry_mpi_t m = NULL;
+    const char *d;
+    size_t n = 99;
+    char *c;
+
+    ASSERT_NOT_NULL(s);
+
+    /* Indexing just past the last element is NULL, like any overrun. */
+    ASSERT_NULL(gcry_sexp_nth(s, 2));
+    ASSERT_NULL(gcry_sexp_nth(s, 3));
+    ASSERT_NULL(gcry_sexp_nth_data(s, 2, &n));
+    ASSERT_EQ(0, n);
+    ASSERT_NULL(gcry_sexp_nth_string(s, 2));
+    ASSERT_NULL(gcry_sexp_nth_mpi(s, 2, GCRYMPI_FMT_USG));
+    gcry_sexp_release(s);
+
+    /* A lone data item has an element 0 and nothing else; the list
+     * accessors do not apply to it. */
+    ASSERT_OK(gcry_sexp_build(&lone, NULL, "%s", "x"));
+    d = gcry_sexp_nth_data(lone, 0, &n);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(1, n);
+    ASSERT_EQ('x', d[0]);
+    n = 99;
+    ASSERT_NULL(gcry_sexp_nth_data(lone, 1, &n));
+    ASSERT_EQ(0, n);
+    ASSERT_NULL(gcry_sexp_nth(lone, 0));
+    ASSERT_NULL(gcry_sexp_car(lone));
+    ASSERT_NULL(gcry_sexp_cdr(lone));
+    gcry_sexp_release(lone);
+
+    /* An empty list does not exist as an object of its own: it is
+     * normalised to NULL, so there is no empty list to take the cdr of.
+     * Nested, it is kept and yields nothing. */
+    ASSERT_OK(gcry_sexp_new(&s, "()", 0, 1));
+    ASSERT_NULL(s);
+    ASSERT_NULL(gcry_sexp_cdr(s));
+    s = scan("(a ())", 0);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(2, gcry_sexp_length(s));
+    c = canon(s);
+    ASSERT_STR_EQ("(1:a())", c);
+    free(c);
+    t = gcry_sexp_nth(s, 1);
+    ASSERT_NULL(t);
+    t = gcry_sexp_cdr(s);
+    ASSERT_NOT_NULL(t);
+    c = canon(t);
+    ASSERT_STR_EQ("(())", c);
+    free(c);
+    ASSERT_NULL(gcry_sexp_car(t));
+    ASSERT_NULL(gcry_sexp_cdr(t));
+    gcry_sexp_release(t);
+    gcry_sexp_release(s);
+
+    /* Parameter paths: a trailing '%' is ignored, a quote without its
+     * partner or with nothing between the quotes is a syntax error. */
+    s = scan("(k (n #0102#) (e 3:257))", 0);
+    ASSERT_NOT_NULL(s);
+    ASSERT_OK(gcry_sexp_extract_param(s, NULL, "n%", &m, NULL));
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0x102));
+    gcry_mpi_release(m);
+    m = NULL;
+    ASSERT_ERR(GPG_ERR_SYNTAX, gcry_sexp_extract_param(s, NULL, "'n", &m,
+                                                       NULL));
+    ASSERT_ERR(GPG_ERR_SYNTAX, gcry_sexp_extract_param(s, NULL, "''n", &m,
+                                                       NULL));
+    ASSERT_NULL(m);
+    gcry_sexp_release(s);
+}
+
 int
 main(void)
 {
@@ -1394,5 +1693,9 @@ main(void)
     RUN_TEST(create_and_new_edges);
     RUN_TEST(print_formats);
     RUN_TEST(extract_param_edges);
+    RUN_TEST(oversized_items);
+    RUN_TEST(build_null_and_secure_arguments);
+    RUN_TEST(display_hint_and_canon_len_errors);
+    RUN_TEST(navigation_past_the_end);
     return TEST_RESULT();
 }

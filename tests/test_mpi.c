@@ -3,11 +3,58 @@
 #include <gcrypt.h>
 
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <stdarg.h>
 #include <stdlib.h>
 
 #include "test_common.h"
+
+/* The upstream header marks the log handler setter deprecated; it is
+ * still the only way to observe the logger. */
+#if defined(__GNUC__)
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+/* Run FN in a child and report how it ended: its exit code, or 1000 plus
+ * the signal number.  The fatal paths abort, so they cannot run in the
+ * test process itself. */
+static int
+run_child(void (*fn)(void))
+{
+    pid_t pid;
+    int status = 0;
+
+    fflush(NULL); /* The child's exit() must not replay our buffers. */
+    pid = fork();
+
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) {
+            test_child_exit(99);
+        }
+
+        fn();
+        test_child_exit(0);
+    }
+
+    if (pid < 0) {
+        return -1;
+    }
+
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        return 1000 + WTERMSIG(status);
+    }
+
+    return -1;
+}
 
 static gcry_mpi_t
 from_hex(const char *hex)
@@ -1124,6 +1171,381 @@ TEST(argument_checks)
     gcry_mpi_release(b);
 }
 
+TEST(print_too_short)
+{
+    gcry_mpi_t m = from_hex("1234");
+    gcry_mpi_t top = from_hex("80");
+    gcry_mpi_t neg = from_hex("-1234");
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x81\x02", 16);
+    unsigned char buf[16];
+    unsigned char *abuf = NULL;
+    size_t nw;
+
+    ASSERT_NOT_NULL(m);
+    ASSERT_NOT_NULL(top);
+    ASSERT_NOT_NULL(neg);
+    ASSERT_NOT_NULL(o);
+
+    /* Every format refuses a short buffer with GPG_ERR_TOO_SHORT and a
+     * zero count; the required size comes from a call without buffer. */
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_STD, buf, 1, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, NULL, 0, &nw, m));
+    ASSERT_EQ(2, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, 2, &nw, m));
+    ASSERT_MEM_EQ("\x12\x34", buf, 2);
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_USG, buf, 1, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_PGP, buf, 3, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_PGP, buf, 4, &nw, m));
+    ASSERT_EQ(4, nw);
+    ASSERT_MEM_EQ("\x00\x0d\x12\x34", buf, 4);
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 5, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 6, &nw, m));
+    ASSERT_EQ(6, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x02\x12\x34", buf, 6);
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 4, &nw,
+                                                 m));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, NULL, 0, &nw, m));
+    ASSERT_EQ(5, nw); /* With the terminating NUL. */
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 5, &nw, m));
+    ASSERT_EQ(5, nw);
+    ASSERT_STR_EQ("1234", (char *)buf);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 5, &nw,
+                                                 neg));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 6, &nw, neg));
+    ASSERT_EQ(6, nw);
+    ASSERT_STR_EQ("-1234", (char *)buf);
+
+    /* A set top bit costs a leading zero in the signed formats, which
+     * the buffer must have room for. */
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_STD, buf, 1, &nw,
+                                                 top));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, 2, &nw, top));
+    ASSERT_EQ(2, nw);
+    ASSERT_MEM_EQ("\x00\x80", buf, 2);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_USG, buf, 1, &nw, top));
+    ASSERT_EQ(1, nw);
+    ASSERT_MEM_EQ("\x80", buf, 1);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 5, &nw,
+                                                 top));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 6, &nw, top));
+    ASSERT_EQ(6, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x02\x00\x80", buf, 6);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_PGP, buf, sizeof buf, &nw, top));
+    ASSERT_EQ(3, nw);
+    ASSERT_MEM_EQ("\x00\x08\x80", buf, 3);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 4, &nw,
+                                                 top));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 5, &nw, top));
+    ASSERT_STR_EQ("0080", (char *)buf);
+
+    /* An opaque value whose first byte has the top bit set gets the same
+     * leading zero in STD, SSH and HEX, and none in USG and PGP. */
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_STD, buf, 2, &nw,
+                                                 o));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_STD, buf, 3, &nw, o));
+    ASSERT_EQ(3, nw);
+    ASSERT_MEM_EQ("\x00\x81\x02", buf, 3);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 6, &nw,
+                                                 o));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_SSH, buf, 7, &nw, o));
+    ASSERT_EQ(7, nw);
+    ASSERT_MEM_EQ("\x00\x00\x00\x03\x00\x81\x02", buf, 7);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_USG, buf, 2, &nw, o));
+    ASSERT_EQ(2, nw);
+    ASSERT_MEM_EQ("\x81\x02", buf, 2);
+    nw = 99;
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_PGP, buf, 3, &nw,
+                                                 o));
+    ASSERT_EQ(0, nw);
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_PGP, buf, 4, &nw, o));
+    ASSERT_EQ(4, nw);
+    ASSERT_MEM_EQ("\x00\x10\x81\x02", buf, 4);
+    ASSERT_ERR(GPG_ERR_TOO_SHORT, gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 6, &nw,
+                                                 o));
+    ASSERT_OK(gcry_mpi_print(GCRYMPI_FMT_HEX, buf, 7, &nw, o));
+    ASSERT_EQ(7, nw);
+    ASSERT_STR_EQ("008102", (char *)buf);
+    ASSERT_OK(gcry_mpi_aprint(GCRYMPI_FMT_STD, &abuf, &nw, o));
+    ASSERT_EQ(3, nw);
+    ASSERT_MEM_EQ("\x00\x81\x02", abuf, 3);
+    gcry_free(abuf);
+
+    gcry_mpi_release(m);
+    gcry_mpi_release(top);
+    gcry_mpi_release(neg);
+    gcry_mpi_release(o);
+}
+
+TEST(scan_hex_invalid)
+{
+    gcry_mpi_t m = NULL;
+    size_t ns = 99;
+    char *big;
+
+    /* Only hex digits may follow the optional sign and "0x" prefix. */
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "zz", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "0xzz", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-0xzz", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "12g4", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "0X12", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "0x-12", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "--12", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, " 12", 0,
+                                              &ns));
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "12 ", 0,
+                                              &ns));
+    ASSERT_EQ(99, ns); /* Untouched on error. */
+    /* A hex string carries its own length, so BUFLEN must be zero. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "12", 2,
+                                              &ns));
+
+    /* An odd number of digits is fine, with or without sign and prefix;
+     * the count covers the whole string. */
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "abc", 0, &ns));
+    ASSERT_EQ(3, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0xabc));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "0xABC", 0, &ns));
+    ASSERT_EQ(5, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0xabc));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-0xabc", 0, &ns));
+    ASSERT_EQ(6, ns);
+    ASSERT_TRUE(gcry_mpi_is_neg(m));
+    gcry_mpi_abs(m);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0xabc));
+    gcry_mpi_release(m);
+    ASSERT_OK(gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, "-0x", 0, &ns));
+    ASSERT_EQ(3, ns);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(m, 0));
+    ASSERT_FALSE(gcry_mpi_is_neg(m));
+    gcry_mpi_release(m);
+
+    /* Like the binary formats, hex input beyond 16 MiB is rejected. */
+    big = malloc(16u * 1024 * 1024 + 2);
+    ASSERT_NOT_NULL(big);
+    memset(big, 'a', 16u * 1024 * 1024 + 1);
+    big[16u * 1024 * 1024 + 1] = 0;
+    ASSERT_ERR(GPG_ERR_INV_OBJ, gcry_mpi_scan(&m, GCRYMPI_FMT_HEX, big, 0,
+                                              NULL));
+    free(big);
+}
+
+TEST(set_abs_and_opaque_edges)
+{
+    gcry_mpi_t w = from_hex("0a");
+    gcry_mpi_t u = from_hex("0b");
+    gcry_mpi_t n = from_hex("-0b");
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x81\x02", 16);
+    gcry_mpi_t e1 = gcry_mpi_set_opaque(NULL, NULL, 0);
+    gcry_mpi_t e2 = gcry_mpi_set_opaque(NULL, NULL, 0);
+    gcry_mpi_t so;
+    gcry_mpi_t copy;
+    unsigned char *secbuf;
+    unsigned int nbits = 99;
+
+    ASSERT_NOT_NULL(w);
+    ASSERT_NOT_NULL(u);
+    ASSERT_NOT_NULL(n);
+    ASSERT_NOT_NULL(o);
+    ASSERT_NOT_NULL(e1);
+    ASSERT_NOT_NULL(e2);
+
+    /* Assignments to an immutable MPI are ignored with a warning; the
+     * target is returned untouched.  The same goes for gcry_mpi_abs. */
+    gcry_mpi_set_flag(w, GCRYMPI_FLAG_IMMUTABLE);
+    ASSERT_TRUE(gcry_mpi_set(w, u) == w);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 10));
+    ASSERT_TRUE(gcry_mpi_set(w, o) == w);
+    ASSERT_FALSE(gcry_mpi_get_flag(w, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 10));
+    gcry_mpi_clear_flag(w, GCRYMPI_FLAG_IMMUTABLE);
+    gcry_mpi_set_flag(n, GCRYMPI_FLAG_IMMUTABLE);
+    gcry_mpi_abs(n);
+    ASSERT_TRUE(gcry_mpi_is_neg(n));
+    gcry_mpi_clear_flag(n, GCRYMPI_FLAG_IMMUTABLE);
+    gcry_mpi_abs(n);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(n, 11));
+
+    /* Assigning an opaque value makes the target an opaque copy with a
+     * buffer of its own. */
+    ASSERT_TRUE(gcry_mpi_set(w, o) == w);
+    ASSERT_TRUE(gcry_mpi_get_flag(w, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(16, gcry_mpi_get_nbits(w));
+    ASSERT_EQ(0, gcry_mpi_cmp(w, o));
+    ASSERT_TRUE(gcry_mpi_get_opaque(w, &nbits) != gcry_mpi_get_opaque(o, NULL));
+    ASSERT_EQ(16, nbits);
+    ASSERT_MEM_EQ("\x81\x02", gcry_mpi_get_opaque(w, NULL), 2);
+    copy = gcry_mpi_set(NULL, o);
+    ASSERT_NOT_NULL(copy);
+    ASSERT_EQ(0, gcry_mpi_cmp(copy, o));
+    gcry_mpi_release(copy);
+    /* Back to a number, then to an empty opaque value. */
+    ASSERT_TRUE(gcry_mpi_set(w, u) == w);
+    ASSERT_FALSE(gcry_mpi_get_flag(w, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(w, 11));
+    ASSERT_TRUE(gcry_mpi_set(w, e1) == w);
+    ASSERT_TRUE(gcry_mpi_get_flag(w, GCRYMPI_FLAG_OPAQUE));
+    ASSERT_EQ(0, gcry_mpi_get_nbits(w));
+    ASSERT_NULL(gcry_mpi_get_opaque(w, &nbits));
+    ASSERT_EQ(0, nbits);
+
+    /* Empty opaque values compare equal to each other and sort below
+     * any opaque value with content. */
+    ASSERT_EQ(0, gcry_mpi_cmp(e1, e2));
+    ASSERT_EQ(0, gcry_mpi_cmp(w, e1));
+    ASSERT_TRUE(gcry_mpi_cmp(e1, o) < 0);
+    ASSERT_TRUE(gcry_mpi_cmp(o, e1) > 0);
+
+    /* A buffer from secure memory makes the opaque MPI secure, and the
+     * copy taken by gcry_mpi_set follows suit. */
+    secbuf = gcry_malloc_secure(2);
+    ASSERT_NOT_NULL(secbuf);
+    memcpy(secbuf, "\x81\x02", 2);
+    so = gcry_mpi_set_opaque(NULL, secbuf, 16);
+    ASSERT_NOT_NULL(so);
+    ASSERT_TRUE(gcry_mpi_get_flag(so, GCRYMPI_FLAG_SECURE));
+    ASSERT_TRUE(gcry_mpi_get_flag(so, GCRYMPI_FLAG_OPAQUE));
+    copy = gcry_mpi_set(NULL, so);
+    ASSERT_NOT_NULL(copy);
+    ASSERT_TRUE(gcry_mpi_get_flag(copy, GCRYMPI_FLAG_SECURE));
+    ASSERT_TRUE(gcry_is_secure(gcry_mpi_get_opaque(copy, NULL)));
+    ASSERT_EQ(0, gcry_mpi_cmp(copy, so));
+    gcry_mpi_release(copy);
+    gcry_mpi_release(so);
+
+    /* A number is moved into secure memory by setting the flag. */
+    ASSERT_FALSE(gcry_mpi_get_flag(u, GCRYMPI_FLAG_SECURE));
+    gcry_mpi_set_flag(u, GCRYMPI_FLAG_SECURE);
+    ASSERT_TRUE(gcry_mpi_get_flag(u, GCRYMPI_FLAG_SECURE));
+    gcry_mpi_add_ui(u, u, 1);
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(u, 12));
+    copy = gcry_mpi_copy(u);
+    ASSERT_NOT_NULL(copy);
+    ASSERT_TRUE(gcry_mpi_get_flag(copy, GCRYMPI_FLAG_SECURE));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(copy, 12));
+    gcry_mpi_release(copy);
+
+    gcry_mpi_release(w);
+    gcry_mpi_release(u);
+    gcry_mpi_release(n);
+    gcry_mpi_release(o);
+    gcry_mpi_release(e1);
+    gcry_mpi_release(e2);
+}
+
+/* The MPI misuse paths are reported as bugs through the logger, which
+ * then aborts.  The log handler sees the message first, so a child can
+ * leave with a code of its own from there (and flush its coverage). */
+static void
+bug_exit_handler(void *opaque, int level, const char *fmt, va_list ap)
+{
+    (void)opaque;
+    (void)fmt;
+    (void)ap;
+
+    if (level == GCRY_LOG_BUG) {
+        test_child_exit(42);
+    }
+}
+
+static void
+fatal_mpi_get_opaque_normal(void)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    gcry_mpi_get_opaque(a, NULL);
+}
+
+static void
+fatal_mpi_set_flag_opaque(void)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    gcry_mpi_set_flag(a, GCRYMPI_FLAG_OPAQUE);
+}
+
+static void
+fatal_mpi_clear_flag_const(void)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    gcry_mpi_clear_flag(a, GCRYMPI_FLAG_CONST);
+}
+
+static void
+fatal_mpi_get_flag_unknown(void)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    gcry_mpi_get_flag(a, (enum gcry_mpi_flag)0x1000);
+}
+
+static void
+fatal_mpi_opaque_arithmetic(void)
+{
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x01", 8);
+    gcry_mpi_t r = gcry_mpi_new(0);
+
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    gcry_mpi_add(r, o, o);
+}
+
+static void
+fatal_mpi_unknown_constant(void)
+{
+    gcry_set_log_handler(bug_exit_handler, NULL);
+    _gcry_mpi_get_const(99);
+}
+
+static void
+fatal_mpi_get_opaque_unhandled(void)
+{
+    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+
+    gcry_mpi_get_opaque(a, NULL);
+}
+
+TEST(fatal_misuse)
+{
+    /* Caller bugs the reference library treats as fatal: the process
+     * aborts after logging, so each runs in a child of its own. */
+    ASSERT_EQ(42, run_child(fatal_mpi_get_opaque_normal));
+    ASSERT_EQ(42, run_child(fatal_mpi_set_flag_opaque));
+    ASSERT_EQ(42, run_child(fatal_mpi_clear_flag_const));
+    ASSERT_EQ(42, run_child(fatal_mpi_get_flag_unknown));
+    ASSERT_EQ(42, run_child(fatal_mpi_opaque_arithmetic));
+    ASSERT_EQ(42, run_child(fatal_mpi_unknown_constant));
+    ASSERT_EQ(1000 + SIGABRT, run_child(fatal_mpi_get_opaque_unhandled));
+}
+
 int
 main(void)
 {
@@ -1147,5 +1569,9 @@ main(void)
     RUN_TEST(point_edges);
     RUN_TEST(dump);
     RUN_TEST(argument_checks);
+    RUN_TEST(print_too_short);
+    RUN_TEST(scan_hex_invalid);
+    RUN_TEST(set_abs_and_opaque_edges);
+    RUN_TEST(fatal_misuse);
     return TEST_RESULT();
 }

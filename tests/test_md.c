@@ -1,8 +1,97 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <gcrypt.h>
 
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "test_common.h"
+
+/* The upstream header marks gcry_set_log_handler and gcry_md_info
+ * deprecated; the former is still the only way to observe the logger. */
+#if defined(__GNUC__)
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+/* --- log capture ------------------------------------------------------ */
+
+static char logbuf[4096];
+static size_t loglen;
+static int logcalls;
+static int loglevel;
+
+static void
+capture_log(void *opaque, int level, const char *fmt, va_list ap)
+{
+    int n;
+
+    (void)opaque;
+    logcalls++;
+    loglevel = level;
+
+    if (loglen < sizeof logbuf - 1) {
+        n = vsnprintf(logbuf + loglen, sizeof logbuf - loglen, fmt, ap);
+
+        if (n > 0) {
+            loglen += (size_t)n;
+
+            if (loglen > sizeof logbuf - 1) {
+                loglen = sizeof logbuf - 1;
+            }
+        }
+    }
+}
+
+static void
+log_reset(void)
+{
+    loglen = 0;
+    logbuf[0] = 0;
+    logcalls = 0;
+    loglevel = -1;
+}
+
+/* Run FN in a child and report how it ended: its exit code, or 1000 plus
+ * the signal number.  The fatal paths abort, so they cannot run in the
+ * test process itself. */
+static int
+run_child(void (*fn)(void))
+{
+    pid_t pid;
+    int status = 0;
+
+    fflush(NULL); /* The child's exit() must not replay our buffers. */
+    pid = fork();
+
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) {
+            test_child_exit(99);
+        }
+
+        fn();
+        test_child_exit(0);
+    }
+
+    if (pid < 0) {
+        return -1;
+    }
+
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        return 1000 + WTERMSIG(status);
+    }
+
+    return -1;
+}
 
 /* Decode a hex string into BUF; returns the number of bytes. */
 static size_t
@@ -1305,6 +1394,455 @@ TEST(buffer_argument_checks)
                gcry_md_hash_buffers(GCRY_MD_SHA256, 0, out, NULL, 0));
 }
 
+TEST(hmac_never_keyed)
+{
+    gcry_md_hd_t hd;
+    unsigned char expect[32];
+    unsigned char tc1[32];
+    unsigned char key[20];
+    int fips = gcry_fips_mode_active();
+
+    memset(key, 0x0b, sizeof key);
+    unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+          tc1, sizeof tc1);
+
+    if (fips) {
+        /* The provider refuses the empty key the reference library would
+         * compute with, so a handle that was never keyed has nothing to
+         * hand out: all zeros, with an error on the log. */
+        memset(expect, 0, sizeof expect);
+    } else {
+        /* HMAC-SHA256 with the empty key, as the reference library has
+         * it. */
+        unhex("fd7adb152c05ef80dccf50a1fa4c05d5a3ec6da95575fc312ae7c5d091836351",
+              expect, sizeof expect);
+    }
+
+    log_reset();
+    gcry_set_log_handler(capture_log, NULL);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    ASSERT_EQ(fips ? 1 : 0, logcalls);
+
+    if (fips) {
+        ASSERT_EQ(GCRY_LOG_ERROR, loglevel);
+        ASSERT_NOT_NULL(strstr(logbuf, "HMAC-SHA256 handle was never keyed"));
+    }
+
+    /* An explicit empty key, as NULL or as an empty buffer, is the same
+     * thing: outside FIPS mode it is the key the handle computed with
+     * anyway, inside it is refused and the handle stays unkeyed. */
+    log_reset();
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, NULL, 0));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    ASSERT_EQ(fips ? 1 : 0, logcalls);
+    log_reset();
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, "", 0));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    ASSERT_EQ(fips ? 1 : 0, logcalls);
+
+    /* A NULL key with a length is an argument error in both modes. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_setkey(hd, NULL, 5));
+
+    /* A real key ends the unkeyed state. */
+    log_reset();
+    ASSERT_OK(gcry_md_setkey(hd, key, sizeof key));
+    gcry_md_write(hd, "Hi There", 8);
+    ASSERT_MEM_EQ(tc1, gcry_md_read(hd, 0), 32);
+    ASSERT_EQ(0, logcalls);
+    gcry_set_log_handler(NULL, NULL);
+    gcry_md_close(hd);
+}
+
+TEST(keyed_blake2_reset_and_rekey)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t fresh;
+    unsigned char key[64];
+    unsigned char expect[64];
+    unsigned char first[64];
+    size_t i;
+
+    if (gcry_fips_mode_active()) {
+        return; /* No BLAKE2 at all; see keyed_blake2_limits. */
+    }
+
+    for (i = 0; i < sizeof key; i++) {
+        key[i] = (unsigned char)i;
+    }
+
+    /* The official keyed BLAKE2b-512 KAT (key 00..3f, empty message). */
+    unhex("10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786"
+          "b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568",
+          expect, sizeof expect);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
+    ASSERT_OK(gcry_md_setkey(hd, key, 64));
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 64);
+    /* The key survives a reset ... */
+    gcry_md_reset(hd);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 64);
+    /* ... with data as well (the KAT entry for the message 00).  Note
+     * that the stock library forgets a BLAKE2 key on reset and would
+     * return the unkeyed digest here. */
+    unhex("961f6dd1e4dd30f63901690c512e78e4b45e4742ed197c3c5e45c549fd25f2e4"
+          "187b0bc9fe30492b16b0d0bc4ef9b0f34c7003fac09a5ef1532e69430234cebd",
+          expect, sizeof expect);
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "\x00", 1);
+    memcpy(first, gcry_md_read(hd, 0), 64);
+    ASSERT_MEM_EQ(expect, first, 64);
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "\x00", 1);
+    ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 64);
+    /* An empty key is refused (OpenSSL's BLAKE2 MAC insists on one) and
+     * the current key stays in place. */
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 0));
+    gcry_md_write(hd, "\x00", 1);
+    ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 64);
+    gcry_md_close(hd);
+
+    /* Keying a handle that has already produced a digest starts afresh:
+     * the next digest is the keyed one, the same as from a fresh handle
+     * (plain BLAKE2b-512 of "abc" first). */
+    unhex("ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
+          "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
+          expect, sizeof expect);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_512, 0));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 64);
+    ASSERT_OK(gcry_md_setkey(hd, key, 64));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_OK(gcry_md_open(&fresh, GCRY_MD_BLAKE2B_512, 0));
+    ASSERT_OK(gcry_md_setkey(fresh, key, 64));
+    gcry_md_write(fresh, "abc", 3);
+    memcpy(first, gcry_md_read(fresh, 0), 64);
+    ASSERT_TRUE(memcmp(expect, first, 64) != 0);
+    ASSERT_MEM_EQ(first, gcry_md_read(hd, 0), 64);
+    gcry_md_close(fresh);
+    gcry_md_close(hd);
+
+    /* The same for BLAKE2s-256 (key 00..1f). */
+    unhex("48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49",
+          expect, 32);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2S_256, 0));
+    ASSERT_OK(gcry_md_setkey(hd, key, 32));
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_reset(hd);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    unhex("40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1",
+          expect, 32);
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "\x00", 1);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_md_setkey(hd, key, 0));
+    gcry_md_write(hd, "\x00", 1);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+
+    /* The truncated variants keep their key through a reset as well
+     * (reference values from the stock library, without a reset). */
+    unhex("dff38c978666dff5631db35ca15535520d134f5c8060ea569c6a178ad393719f",
+          expect, 32);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2B_256, 0));
+    ASSERT_OK(gcry_md_setkey(hd, key, 64));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+    unhex("61ba5f165c194692e09d12520cc4c74a", expect, 16);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_BLAKE2S_128, 0));
+    ASSERT_OK(gcry_md_setkey(hd, key, 32));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 16);
+    gcry_md_reset(hd);
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 16);
+    gcry_md_close(hd);
+}
+
+/* Feed HD the KMAC128 framing for the NIST sample key (40..5f, 256 bits):
+ * bytepad(encode_string(K), 168).  The message and right_encode(L) follow
+ * separately. */
+static void
+kmac128_prefix(gcry_md_hd_t hd)
+{
+    unsigned char block[168];
+    size_t i;
+
+    memset(block, 0, sizeof block);
+    block[0] = 0x01; /* left_encode(168) */
+    block[1] = 0xa8;
+    block[2] = 0x02; /* left_encode(256) */
+    block[3] = 0x01;
+    block[4] = 0x00;
+
+    for (i = 0; i < 32; i++) {
+        block[5 + i] = (unsigned char)(0x40 + i);
+    }
+
+    gcry_md_write(hd, block, sizeof block);
+}
+
+TEST(cshake_function_name)
+{
+    gcry_md_hd_t hd;
+    gcry_md_hd_t copy;
+    struct gcry_cshake_customization cust;
+    unsigned char data[200];
+    unsigned char out[32];
+    unsigned char expect[32];
+    size_t i;
+
+    for (i = 0; i < sizeof data; i++) {
+        data[i] = (unsigned char)i;
+    }
+
+    /* The function name N is reserved for NIST-defined constructions and
+     * OpenSSL knows only those, so "KMAC" goes through: a cSHAKE128
+     * handle with N = "KMAC" computes KMAC128 when given the KMAC framing.
+     * NIST KMAC sample 1: N only, a 4 byte message, 256 output bits. */
+    unhex("e5780b0d3ea6f7d3a429c5706aa43a00fadbd7d49628839e3187243f456ee14e",
+          expect, sizeof expect);
+    cust.n = "KMAC";
+    cust.n_len = 4;
+    cust.s = NULL;
+    cust.s_len = 0;
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_CSHAKE128, 0));
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    kmac128_prefix(hd);
+    gcry_md_write(hd, data, 4);
+    gcry_md_write(hd, "\x01\x00\x02", 3); /* right_encode(256) */
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+
+    /* Sample 2 adds S; a copy taken midway carries both strings. */
+    unhex("3b1fba963cd8b0b59e8c1a6d71888b7143651af8ba0a7070c0979e2811324aa5",
+          expect, sizeof expect);
+    cust.s = "My Tagged Application";
+    cust.s_len = 21;
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    kmac128_prefix(hd);
+    gcry_md_write(hd, data, 2);
+    ASSERT_OK(gcry_md_copy(&copy, hd));
+    gcry_md_write(hd, data + 2, 2);
+    gcry_md_write(hd, "\x01\x00\x02", 3);
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_write(copy, data + 2, 2);
+    gcry_md_write(copy, "\x01\x00\x02", 3);
+    memset(out, 0, sizeof out);
+    ASSERT_OK(gcry_md_extract(copy, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    /* The copy can be customised again on its own (sample 3: 200 bytes). */
+    unhex("1f5b4e6cca02209e0dcb5ca635b89a15e271ecc760071dfd805faa38f9729230",
+          expect, sizeof expect);
+    ASSERT_OK(gcry_md_ctl(copy, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    kmac128_prefix(copy);
+    gcry_md_write(copy, data, sizeof data);
+    gcry_md_write(copy, "\x01\x00\x02", 3);
+    ASSERT_OK(gcry_md_extract(copy, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_close(copy);
+
+    /* Any other function name is refused.  The customisation is dropped
+     * altogether, S included, and the handle reset: it now computes plain
+     * cSHAKE128 without strings, which is SHAKE128. */
+    unhex("5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8",
+          expect, sizeof expect);
+    cust.n = "ABC";
+    cust.n_len = 3;
+    ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+               gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_OK(gcry_md_copy(&copy, hd)); /* Nothing left to carry over. */
+    ASSERT_OK(gcry_md_extract(hd, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    memset(out, 0, sizeof out);
+    ASSERT_OK(gcry_md_extract(copy, 0, out, 32));
+    ASSERT_MEM_EQ(expect, out, 32);
+    gcry_md_close(copy);
+    gcry_md_close(hd);
+}
+
+TEST(hmac_blake2_and_misc_edges)
+{
+    gcry_md_hd_t hd;
+    struct gcry_cshake_customization cust;
+    gcry_buffer_t iov;
+    unsigned char out[32];
+    unsigned char expect[32];
+    char abc[] = "abc";
+    size_t n;
+    int algo;
+
+    /* HMAC over a truncated BLAKE2 digest cannot be expressed with
+     * OpenSSL's HMAC (and in FIPS mode BLAKE2 is unavailable anyway). */
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_md_open(&hd, GCRY_MD_BLAKE2B_160, GCRY_MD_FLAG_HMAC));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_md_open(&hd, GCRY_MD_BLAKE2S_128, GCRY_MD_FLAG_HMAC));
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_BLAKE2B_384));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
+                          gcry_md_enable(hd, GCRY_MD_BLAKE2B_512));
+    gcry_md_close(hd);
+
+    /* A customisation needs an algorithm on the handle. */
+    cust.n = NULL;
+    cust.n_len = 0;
+    cust.s = "x";
+    cust.s_len = 1;
+    ASSERT_OK(gcry_md_open(&hd, 0, 0));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               gcry_md_ctl(hd, GCRYCTL_MD_CUSTOMIZE, &cust, sizeof cust));
+    gcry_md_close(hd);
+
+    /* The one-shot helpers with an unknown algorithm: gcry_md_hash_buffer
+     * leaves the digest alone, gcry_md_hash_buffers reports it. */
+    memset(out, 0xaa, sizeof out);
+    memset(expect, 0xaa, sizeof expect);
+    gcry_md_hash_buffer(4711, out, abc, 3);
+    ASSERT_MEM_EQ(expect, out, 32);
+    iov.size = 0;
+    iov.off = 0;
+    iov.len = 3;
+    iov.data = abc;
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_hash_buffers(4711, 0, out, &iov,
+                                                         1));
+
+    /* Zero length writes and a repeated finalisation change nothing. */
+    unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          expect, sizeof expect);
+    ASSERT_OK(gcry_md_open(&hd, GCRY_MD_SHA256, 0));
+    gcry_md_write(hd, "", 0);
+    gcry_md_write(hd, "ab", 2);
+    gcry_md_write(hd, NULL, 0);
+    gcry_md_write(hd, "c", 1);
+    gcry_md_write(hd, "", 0);
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_FINALIZE, NULL, 0));
+    ASSERT_OK(gcry_md_ctl(hd, GCRYCTL_FINALIZE, NULL, 0));
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, GCRY_MD_SHA256), 32);
+
+    /* gcry_md_info, the deprecated query interface. */
+    n = 99;
+    ASSERT_OK(gcry_md_info(hd, GCRYCTL_IS_SECURE, NULL, &n));
+    ASSERT_EQ(0, n);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_info(hd, GCRYCTL_IS_SECURE, NULL,
+                                             NULL));
+    algo = GCRY_MD_SHA256;
+    n = sizeof algo;
+    ASSERT_OK(gcry_md_info(hd, GCRYCTL_IS_ALGO_ENABLED, &algo, &n));
+    ASSERT_EQ(1, n);
+    algo = GCRY_MD_SHA1;
+    n = sizeof algo;
+    ASSERT_OK(gcry_md_info(hd, GCRYCTL_IS_ALGO_ENABLED, &algo, &n));
+    ASSERT_EQ(0, n);
+    n = 1;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_info(hd, GCRYCTL_IS_ALGO_ENABLED,
+                                             &algo, &n));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_info(hd, GCRYCTL_IS_ALGO_ENABLED,
+                                             NULL, &n));
+    ASSERT_ERR(GPG_ERR_INV_OP, gcry_md_info(hd, 9999, NULL, &n));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_md_info(NULL, GCRYCTL_IS_SECURE, NULL,
+                                             &n));
+
+    /* A dump file that cannot be created is noted on the log, and the
+     * handle carries on undisturbed. */
+    log_reset();
+    gcry_set_log_handler(capture_log, NULL);
+    gcry_md_reset(hd);
+    gcry_md_debug(hd, "nodir/x");
+    gcry_set_log_handler(NULL, NULL);
+    ASSERT_EQ(1, logcalls);
+    ASSERT_EQ(GCRY_LOG_DEBUG, loglevel);
+    ASSERT_NOT_NULL(strstr(logbuf, "can't open"));
+    gcry_md_write(hd, "abc", 3);
+    ASSERT_MEM_EQ(expect, gcry_md_read(hd, 0), 32);
+    gcry_md_close(hd);
+}
+
+/* Leave the child with a code that tells which error was raised.  The
+ * fatal error handler is honoured outside FIPS mode only; there the
+ * child exits here instead of aborting. */
+static void
+fatal_exit_handler(void *opaque, int rc, const char *text)
+{
+    (void)opaque;
+    (void)text;
+    test_child_exit(rc == GPG_ERR_INV_ARG ? 42
+                    : rc == GPG_ERR_DIGEST_ALGO ? 43 : 44);
+}
+
+static void
+fatal_md_read_null(void)
+{
+    gcry_set_fatalerror_handler(fatal_exit_handler, NULL);
+    gcry_md_read(NULL, 0);
+}
+
+static void
+fatal_md_read_missing(void)
+{
+    gcry_md_hd_t hd;
+
+    gcry_set_fatalerror_handler(fatal_exit_handler, NULL);
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, 0)) {
+        return;
+    }
+
+    gcry_md_write(hd, "abc", 3);
+    gcry_md_read(hd, GCRY_MD_SHA1);
+}
+
+static void
+fatal_md_write_null(void)
+{
+    gcry_md_hd_t hd;
+
+    gcry_set_fatalerror_handler(fatal_exit_handler, NULL);
+
+    if (gcry_md_open(&hd, GCRY_MD_SHA256, 0)) {
+        return;
+    }
+
+    gcry_md_write(hd, NULL, 3);
+}
+
+static void
+fatal_md_hash_buffer_null(void)
+{
+    gcry_set_fatalerror_handler(fatal_exit_handler, NULL);
+    gcry_md_hash_buffer(GCRY_MD_SHA256, NULL, "abc", 3);
+}
+
+static void
+fatal_md_read_null_unhandled(void)
+{
+    gcry_md_read(NULL, 0);
+}
+
+TEST(fatal_arguments)
+{
+    int fips = gcry_fips_mode_active();
+
+    /* Caller bugs the reference library treats as fatal: the fatal error
+     * handler is called (outside FIPS mode) and the process aborts if it
+     * returns, so each runs in a child of its own. */
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 42, run_child(fatal_md_read_null));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 43, run_child(fatal_md_read_missing));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 42, run_child(fatal_md_write_null));
+    ASSERT_EQ(fips ? 1000 + SIGABRT : 42,
+              run_child(fatal_md_hash_buffer_null));
+    ASSERT_EQ(1000 + SIGABRT, run_child(fatal_md_read_null_unhandled));
+}
+
 int
 main(void)
 {
@@ -1328,5 +1866,10 @@ main(void)
     RUN_TEST(debug_dump);
     RUN_TEST(hash_buffers_edges);
     RUN_TEST(buffer_argument_checks);
+    RUN_TEST(hmac_never_keyed);
+    RUN_TEST(keyed_blake2_reset_and_rekey);
+    RUN_TEST(cshake_function_name);
+    RUN_TEST(hmac_blake2_and_misc_edges);
+    RUN_TEST(fatal_arguments);
     return TEST_RESULT();
 }
