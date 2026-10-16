@@ -2,16 +2,21 @@
  * memory.c - Memory allocation with optional "secure" (wiped, locked)
  * storage, plus the user-installable allocation handlers.
  *
- * Secure memory is a pool of the library's own, like the reference
- * implementation's: an anonymous mapping that is locked into RAM and kept
- * out of core dumps where the system allows it, carved up by a small
- * first-fit allocator.  That gives the two properties Libgcrypt promises,
- * wiping on free and a gcry_is_secure() that can answer for any pointer at
- * all (it is a range check), without touching OpenSSL's secure heap.  The
- * secure heap is process-wide and has no fallback once it exists, so
- * sizing it for the application's GCRYCTL_INIT_SECMEM request starved
- * OpenSSL's own callers of it, most visibly the FIPS module, whose
+ * Secure memory is a set of pools of the library's own, like the
+ * reference implementation's: anonymous mappings that are locked into RAM
+ * and kept out of core dumps where the system allows it, each carved up
+ * by a small first-fit allocator.  That gives the two properties Libgcrypt
+ * promises, wiping on free and a gcry_is_secure() that can answer for any
+ * pointer at all (it is a range check), without touching OpenSSL's secure
+ * heap.  The secure heap is process-wide and has no fallback once it
+ * exists, so sizing it for the application's GCRYCTL_INIT_SECMEM request
+ * starved OpenSSL's own callers of it, most visibly the FIPS module, whose
  * self-tests allocate their DRBG state and post-quantum keys from it.
+ *
+ * When the pools are full another one is mapped (the reference does the
+ * same once GCRYCTL_AUTO_EXPAND_SECMEM was used); secure memory never
+ * silently degrades to the ordinary heap.  Only when the system refuses
+ * the mapping does a secure allocation fail.
  */
 #define _DEFAULT_SOURCE 1 /* MAP_ANONYMOUS and madvise() on glibc. */
 
@@ -19,6 +24,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -28,19 +34,34 @@
     #define MAP_ANONYMOUS MAP_ANON
 #endif
 
-/* Same default pool size as the reference implementation. */
+/* Same default pool size as the reference implementation; also the
+ * default size of the pools added when the existing ones are full. */
 #define DEFAULT_POOL_SIZE 32768
 
-/* Every block carries one of these; the payload follows it directly. */
+/* Payload alignment: two size_t words, the alignment of the widest
+ * fundamental type on the platforms this runs on. */
+#define SECMEM_ALIGN (2 * sizeof(size_t))
+
+/* Every block carries one of these; the payload follows it directly.  The
+ * header is two alignment units long, so the payload stays aligned. */
 struct secblock {
-    size_t size; /* Payload size, a multiple of SECMEM_ALIGN. */
-    size_t in_use; /* A size_t only to keep the header aligned. */
+    size_t magic;  /* SECBLOCK_MAGIC mixed with the header's address. */
+    size_t size;   /* Payload size, a multiple of SECMEM_ALIGN. */
+    size_t in_use;
+    size_t unused;
 };
 
-/* Payload alignment, which is also the header size: two pointer-sized
- * words, the alignment of the widest fundamental type on the platforms
- * this runs on. */
-#define SECMEM_ALIGN sizeof(struct secblock)
+#define SECBLOCK_MAGIC ((size_t)0x5ec0b10cu)
+
+/* A pool is one mapping.  This descriptor sits at its start, the blocks
+ * follow; the pools form a list, newest first. */
+struct secpool {
+    struct secpool *next;
+    size_t size; /* Of the whole mapping, descriptor included. */
+};
+
+#define SECPOOL_HEADER \
+    ((sizeof(struct secpool) + SECMEM_ALIGN - 1) & ~(SECMEM_ALIGN - 1))
 
 static gcry_handler_alloc_t alloc_func;
 static gcry_handler_alloc_t alloc_secure_func;
@@ -52,13 +73,31 @@ static gcry_handler_no_mem_t outofcore_handler;
 static void *outofcore_handler_value;
 
 static pthread_mutex_t secmem_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned char *pool; /* NULL while there is no pool. */
-static size_t pool_size;
+static struct secpool *pools; /* NULL while there is no pool. */
+static size_t auto_expand_size; /* 0: DEFAULT_POOL_SIZE. */
+static unsigned int secmem_flags;
 static int secmem_disabled;
+static int mlock_failed;     /* Some pool could not be locked ... */
+static int insecure_warned;  /* ... and the warning has been given. */
 
 /* ------------------------------------------------------------------ */
-/* The secure pool.  All of these expect the lock to be held.          */
+/* The secure pools.  All of these expect the lock to be held.         */
 /* ------------------------------------------------------------------ */
+
+static size_t
+block_magic(const struct secblock *b)
+{
+    return SECBLOCK_MAGIC ^ (size_t)(uintptr_t)b;
+}
+
+static void
+block_init(struct secblock *b, size_t size, size_t in_use)
+{
+    b->magic = block_magic(b);
+    b->size = size;
+    b->in_use = in_use;
+    b->unused = 0;
+}
 
 static struct secblock *
 block_next(struct secblock *b)
@@ -67,17 +106,52 @@ block_next(struct secblock *b)
 }
 
 static struct secblock *
-pool_end(void)
+pool_blocks(struct secpool *pool)
 {
-    return (struct secblock *)(pool + pool_size);
+    return (struct secblock *)((unsigned char *)pool + SECPOOL_HEADER);
 }
 
-static int
-pool_contains(const void *p)
+static struct secblock *
+pool_end(struct secpool *pool)
 {
-    const unsigned char *a = p;
+    return (struct secblock *)((unsigned char *)pool + pool->size);
+}
 
-    return pool && a >= pool + sizeof(struct secblock) && a < pool + pool_size;
+/* The pool whose payload area contains A, or NULL.  A range check, which
+ * is all gcry_is_secure() needs. */
+static struct secpool *
+pool_find(const void *a)
+{
+    const unsigned char *p = a;
+    struct secpool *pool;
+
+    for (pool = pools; pool; pool = pool->next) {
+        if (p >= (const unsigned char *)(pool_blocks(pool) + 1)
+            && p < (const unsigned char *)pool_end(pool)) {
+            return pool;
+        }
+    }
+
+    return NULL;
+}
+
+/* The live block whose payload starts at P, which pool_find() placed in
+ * POOL, or NULL if P is not that: an interior pointer, a block already
+ * freed, or something else that was never handed out. */
+static struct secblock *
+pool_check_block(struct secpool *pool, void *p)
+{
+    struct secblock *b = (struct secblock *)p - 1;
+
+    if (((uintptr_t)p & (SECMEM_ALIGN - 1))
+        || (unsigned char *)b < (unsigned char *)pool_blocks(pool)
+        || b->magic != block_magic(b) || !b->in_use
+        || b->size > (size_t)((unsigned char *)pool_end(pool)
+                              - (unsigned char *)(b + 1))) {
+        return NULL;
+    }
+
+    return b;
 }
 
 static size_t
@@ -91,92 +165,74 @@ round_up_align(size_t n)
     return n ? n : SECMEM_ALIGN;
 }
 
-/* Create the pool with at least N bytes.  Must be called with the lock
- * held or before any thread is running. */
-static void
-pool_init(size_t n)
+/* Map a new pool with room for a block of N payload bytes (N already
+ * aligned) and at least MIN bytes in all, and put it first in the list.
+ * NULL only if the system refuses the mapping. */
+static struct secpool *
+pool_map(size_t n, size_t min)
 {
+    size_t need;
     long pagesize;
     void *p;
+    struct secpool *pool;
 
-    if (pool || secmem_disabled) {
-        return;
+    if (n > (size_t) - 1 - SECPOOL_HEADER - sizeof(struct secblock)) {
+        return NULL;
     }
 
-    if (n < DEFAULT_POOL_SIZE) {
-        n = DEFAULT_POOL_SIZE;
+    need = SECPOOL_HEADER + sizeof(struct secblock) + n;
+
+    if (need < min) {
+        need = min;
     }
 
     pagesize = sysconf(_SC_PAGESIZE);
 
-    if (pagesize > 0) {
-        n = (n + (size_t)pagesize - 1) & ~((size_t)pagesize - 1);
+    if (pagesize > 0 && need <= (size_t) - 1 - (size_t)pagesize) {
+        need = (need + (size_t)pagesize - 1) & ~((size_t)pagesize - 1);
     }
 
-    p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+    p = mmap(NULL, need, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
              -1, 0);
 
     if (p == MAP_FAILED) {
-        return; /* Allocations fall back to the ordinary heap. */
-    }
-
-    /* Locking the pages is best effort: an unprivileged process may be
-     * over its RLIMIT_MEMLOCK, and the reference carries on as well. */
-    (void)mlock(p, n);
-#ifdef MADV_DONTDUMP
-    (void)madvise(p, n, MADV_DONTDUMP);
-#endif
-
-    pool = p;
-    pool_size = n;
-    ((struct secblock *)pool)->size = n - sizeof(struct secblock);
-    ((struct secblock *)pool)->in_use = 0;
-}
-
-/* Release the pool unless something is still allocated from it. */
-static int
-pool_term(void)
-{
-    struct secblock *b;
-
-    if (!pool) {
-        return 1;
-    }
-
-    for (b = (struct secblock *)pool; b < pool_end(); b = block_next(b)) {
-        if (b->in_use) {
-            return 0;
-        }
-    }
-
-    OPENSSL_cleanse(pool, pool_size);
-    (void)munlock(pool, pool_size);
-    (void)munmap(pool, pool_size);
-    pool = NULL;
-    pool_size = 0;
-    return 1;
-}
-
-/* First fit, merging runs of free blocks on the way. */
-static void *
-pool_alloc(size_t n)
-{
-    struct secblock *b;
-
-    n = round_up_align(n);
-
-    if (!pool || !n) {
         return NULL;
     }
 
-    for (b = (struct secblock *)pool; b < pool_end(); b = block_next(b)) {
+    /* Locking the pages is best effort: an unprivileged process may be
+     * over its RLIMIT_MEMLOCK.  The reference carries on as well, with a
+     * warning, which the caller gives once it has dropped the lock. */
+    if (mlock(p, need)) {
+        mlock_failed = 1;
+    }
+
+#ifdef MADV_DONTDUMP
+    (void)madvise(p, need, MADV_DONTDUMP);
+#endif
+
+    pool = p;
+    pool->next = pools;
+    pool->size = need;
+    block_init(pool_blocks(pool),
+               need - SECPOOL_HEADER - sizeof(struct secblock), 0);
+    pools = pool;
+    return pool;
+}
+
+/* First fit within one pool, merging runs of free blocks on the way. */
+static void *
+pool_alloc_in(struct secpool *pool, size_t n)
+{
+    struct secblock *b;
+
+    for (b = pool_blocks(pool); b < pool_end(pool); b = block_next(b)) {
         struct secblock *next;
 
         if (b->in_use) {
             continue;
         }
 
-        for (next = block_next(b); next < pool_end() && !next->in_use;
+        for (next = block_next(b); next < pool_end(pool) && !next->in_use;
              next = block_next(next)) {
             b->size += sizeof(struct secblock) + next->size;
         }
@@ -189,8 +245,7 @@ pool_alloc(size_t n)
             struct secblock *rest;
 
             rest = (struct secblock *)((unsigned char *)(b + 1) + n);
-            rest->size = b->size - n - sizeof(struct secblock);
-            rest->in_use = 0;
+            block_init(rest, b->size - n - sizeof(struct secblock), 0);
             b->size = n;
         }
 
@@ -201,21 +256,115 @@ pool_alloc(size_t n)
     return NULL;
 }
 
-static size_t
-pool_block_size(const void *p)
+/* A block of N bytes from any pool, mapping another pool if they are all
+ * full (or there is none yet). */
+static void *
+pool_alloc(size_t n)
 {
-    const struct secblock *b = (const struct secblock *)p - 1;
+    struct secpool *pool;
+    void *p;
 
-    return b->size;
+    n = round_up_align(n);
+
+    if (!n) {
+        return NULL;
+    }
+
+    for (pool = pools; pool; pool = pool->next) {
+        p = pool_alloc_in(pool, n);
+
+        if (p) {
+            return p;
+        }
+    }
+
+    pool = pool_map(n, auto_expand_size ? auto_expand_size
+                    : DEFAULT_POOL_SIZE);
+
+    if (!pool) {
+        return NULL;
+    }
+
+    return pool_alloc_in(pool, n);
+}
+
+/* Create the first pool with at least N bytes.  Must be called with the
+ * lock held or before any thread is running. */
+static void
+pool_init(size_t n)
+{
+    if (pools || secmem_disabled) {
+        return;
+    }
+
+    (void)pool_map(0, n < DEFAULT_POOL_SIZE ? DEFAULT_POOL_SIZE : n);
+}
+
+static int
+pool_in_use(struct secpool *pool)
+{
+    struct secblock *b;
+
+    for (b = pool_blocks(pool); b < pool_end(pool); b = block_next(b)) {
+        if (b->in_use) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Release every pool from which nothing is allocated any more; the
+ * others stay, with their blocks intact. */
+static void
+pool_term(void)
+{
+    struct secpool **pp = &pools;
+
+    while (*pp) {
+        struct secpool *pool = *pp;
+        size_t size = pool->size;
+
+        if (pool_in_use(pool)) {
+            pp = &pool->next;
+            continue;
+        }
+
+        *pp = pool->next;
+        OPENSSL_cleanse(pool, size);
+        (void)munlock(pool, size);
+        (void)munmap(pool, size);
+    }
 }
 
 static void
-pool_free(void *p)
+pool_free(struct secblock *b)
 {
-    struct secblock *b = (struct secblock *)p - 1;
-
-    OPENSSL_cleanse(p, b->size);
+    OPENSSL_cleanse(b + 1, b->size);
     b->in_use = 0;
+}
+
+/* Called without the lock: a misused pointer is a caller bug, fatal like
+ * glibc's "free(): invalid pointer". */
+static void
+secmem_misuse(const char *what)
+{
+    _gcry_fatal_error(GPG_ERR_INV_ARG, what);
+}
+
+/* Called without the lock, after an allocation: the reference's warning
+ * when the secure memory could not be locked into RAM. */
+static void
+warn_insecure(void)
+{
+    if (!mlock_failed || insecure_warned
+        || (secmem_flags & (GCRY_SECMEM_FLAG_NO_WARNING
+                            | GCRY_SECMEM_FLAG_SUSPEND_WARNING))) {
+        return;
+    }
+
+    insecure_warned = 1;
+    log_info("Warning: using insecure memory!\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -229,20 +378,21 @@ _gcry_secmem_init(size_t n)
 
     if (n == 0) {
         /* Zero means "I will not use secure memory", but allocations are
-         * still allowed to fall back to the normal heap. */
+         * still allowed to create a pool when they come. */
         pthread_mutex_unlock(&secmem_lock);
         return;
     }
 
     pool_init(n);
     pthread_mutex_unlock(&secmem_lock);
+    warn_insecure();
 }
 
 void
 _gcry_secmem_term(void)
 {
     pthread_mutex_lock(&secmem_lock);
-    (void)pool_term();
+    pool_term();
     pthread_mutex_unlock(&secmem_lock);
 }
 
@@ -258,6 +408,38 @@ int
 _gcry_secmem_is_disabled(void)
 {
     return secmem_disabled;
+}
+
+void
+_gcry_secmem_set_auto_expand(size_t chunksize)
+{
+    pthread_mutex_lock(&secmem_lock);
+
+    if (chunksize && chunksize < DEFAULT_POOL_SIZE) {
+        chunksize = DEFAULT_POOL_SIZE;
+    }
+
+    auto_expand_size = chunksize;
+    pthread_mutex_unlock(&secmem_lock);
+}
+
+void
+_gcry_secmem_set_flags(unsigned int flags)
+{
+    pthread_mutex_lock(&secmem_lock);
+    secmem_flags = flags;
+    pthread_mutex_unlock(&secmem_lock);
+}
+
+unsigned int
+_gcry_secmem_get_flags(void)
+{
+    unsigned int flags;
+
+    pthread_mutex_lock(&secmem_lock);
+    flags = secmem_flags;
+    pthread_mutex_unlock(&secmem_lock);
+    return flags;
 }
 
 void
@@ -296,13 +478,12 @@ _gcry_malloc_secure(size_t n)
     }
 
     pthread_mutex_lock(&secmem_lock);
-    pool_init(DEFAULT_POOL_SIZE);
     p = pool_alloc(n);
     pthread_mutex_unlock(&secmem_lock);
+    warn_insecure();
 
     if (!p) {
-        /* Pool exhausted or unavailable: degrade gracefully. */
-        p = malloc(n ? n : 1);
+        errno = ENOMEM;
     }
 
     return p;
@@ -340,27 +521,11 @@ _gcry_calloc_secure(size_t n, size_t m)
     return calloc_core(n, m, 1);
 }
 
-/* Is A in the pool?  Takes the lock; SIZE, when given, receives the block
- * size if it is. */
-static int
-secure_block(const void *a, size_t *size)
-{
-    int yes;
-
-    pthread_mutex_lock(&secmem_lock);
-    yes = pool_contains(a);
-
-    if (yes && size) {
-        *size = pool_block_size(a);
-    }
-
-    pthread_mutex_unlock(&secmem_lock);
-    return yes;
-}
-
 int
 _gcry_is_secure(const void *a)
 {
+    int yes;
+
     if (secmem_disabled || !a) {
         return 0;
     }
@@ -369,13 +534,18 @@ _gcry_is_secure(const void *a)
         return is_secure_func(a);
     }
 
-    return secure_block(a, NULL);
+    pthread_mutex_lock(&secmem_lock);
+    yes = pool_find(a) != NULL;
+    pthread_mutex_unlock(&secmem_lock);
+    return yes;
 }
 
 void *
 _gcry_realloc(void *a, size_t n)
 {
-    size_t oldsize;
+    struct secpool *pool;
+    size_t oldsize = 0;
+    int valid = 1;
     void *p;
 
     if (realloc_func) {
@@ -386,15 +556,36 @@ _gcry_realloc(void *a, size_t n)
         return _gcry_malloc(n);
     }
 
-    if (!is_secure_func && secure_block(a, &oldsize)) {
-        p = _gcry_malloc_secure(n);
+    if (!is_secure_func) {
+        pthread_mutex_lock(&secmem_lock);
+        pool = pool_find(a);
 
-        if (p) {
-            memcpy(p, a, oldsize < n ? oldsize : n);
-            _gcry_free(a);
+        if (pool) {
+            struct secblock *b = pool_check_block(pool, a);
+
+            if (b) {
+                oldsize = b->size;
+            } else {
+                valid = 0;
+            }
         }
 
-        return p;
+        pthread_mutex_unlock(&secmem_lock);
+
+        if (!valid) {
+            secmem_misuse("gcry_realloc: not a live secure memory block");
+        }
+
+        if (pool) {
+            p = _gcry_malloc_secure(n);
+
+            if (p) {
+                memcpy(p, a, oldsize < n ? oldsize : n);
+                _gcry_free(a);
+            }
+
+            return p;
+        }
     }
 
     return realloc(a, n ? n : 1);
@@ -414,18 +605,30 @@ _gcry_free(void *p)
     if (free_func) {
         free_func(p);
     } else {
-        int secure;
+        struct secpool *pool;
+        int valid = 1;
 
         pthread_mutex_lock(&secmem_lock);
-        secure = pool_contains(p);
+        pool = pool_find(p);
 
-        if (secure) {
-            pool_free(p);
+        if (pool) {
+            struct secblock *b = pool_check_block(pool, p);
+
+            if (b) {
+                pool_free(b);
+            } else {
+                valid = 0;
+            }
         }
 
         pthread_mutex_unlock(&secmem_lock);
 
-        if (!secure) {
+        if (!valid) {
+            secmem_misuse("gcry_free: not a live secure memory block "
+                          "(double free or interior pointer)");
+        }
+
+        if (!pool) {
             free(p);
         }
     }

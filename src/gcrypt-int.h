@@ -55,6 +55,10 @@ void _gcry_global_init(void);
 OSSL_LIB_CTX *_gcry_libctx(void);
 const char *_gcry_propq(void);
 int _gcry_fips_mode(void);
+/* FIPS mode was required but no FIPS provider could be activated: the
+ * library is not operational.  Algorithm entry points should refuse with
+ * GPG_ERR_NOT_OPERATIONAL while this is true. */
+int _gcry_fips_error_state(void);
 unsigned int _gcry_get_debug_flags(void);
 int _gcry_get_rng_type(void);
 unsigned int _gcry_fips_reject_flags(void);
@@ -93,6 +97,14 @@ void _gcry_secmem_init(size_t n);
 void _gcry_secmem_term(void);
 void _gcry_secmem_disable(void);
 int _gcry_secmem_is_disabled(void);
+/* Size of the mappings added when the secure pools are full; 0 restores
+ * the default. */
+void _gcry_secmem_set_auto_expand(size_t chunksize);
+
+#define GCRY_SECMEM_FLAG_NO_WARNING (1u << 0)
+#define GCRY_SECMEM_FLAG_SUSPEND_WARNING (1u << 1)
+void _gcry_secmem_set_flags(unsigned int flags);
+unsigned int _gcry_secmem_get_flags(void);
 
 /* ---- error.c ----------------------------------------------------- */
 

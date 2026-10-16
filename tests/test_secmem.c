@@ -173,6 +173,117 @@ TEST(realloc_paths)
     ASSERT_NULL(gcry_calloc_secure((size_t) - 1, 2));
 }
 
+/* Every byte of P..P+N is zero. */
+static int
+all_zero(const unsigned char *p, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (p[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+TEST(pool_expands)
+{
+    enum { count = 200, size = 1024 };
+    unsigned char *p[count];
+    unsigned char *big;
+    int i;
+
+    /* Far more than the 16 KiB pool main() asked for: the pool grows
+     * instead of quietly handing out ordinary heap memory. */
+    for (i = 0; i < count; i++) {
+        p[i] = gcry_malloc_secure(size);
+        ASSERT_NOT_NULL(p[i]);
+        ASSERT_TRUE(gcry_is_secure(p[i]));
+        memset(p[i], 0xa5 + i, size);
+    }
+
+    /* Every block is still intact and wiped when it is freed.  (Reading
+     * a freed block is fine here: it stays mapped as part of the pool and
+     * nothing else is allocated in between.) */
+    for (i = 0; i < count; i++) {
+        ASSERT_EQ((unsigned char)(0xa5 + i), p[i][0]);
+        ASSERT_EQ((unsigned char)(0xa5 + i), p[i][size - 1]);
+        gcry_free(p[i]);
+        ASSERT_TRUE(all_zero(p[i], size));
+    }
+
+    /* A block larger than any pool so far gets a pool of its own. */
+    big = gcry_malloc_secure(100000);
+    ASSERT_NOT_NULL(big);
+    ASSERT_TRUE(gcry_is_secure(big));
+    memset(big, 0x5a, 100000);
+    ASSERT_TRUE(gcry_is_secure(big + 99999));
+    gcry_free(big);
+    ASSERT_TRUE(all_zero(big, 100000));
+
+    /* The expansion chunk size can be set and reset. */
+    ASSERT_OK(gcry_control(GCRYCTL_AUTO_EXPAND_SECMEM, 1048576u));
+    big = gcry_malloc_secure(200000);
+    ASSERT_NOT_NULL(big);
+    ASSERT_TRUE(gcry_is_secure(big));
+    gcry_free(big);
+    ASSERT_OK(gcry_control(GCRYCTL_AUTO_EXPAND_SECMEM, 0u));
+    ASSERT_OK(gcry_control(GCRYCTL_TERM_SECMEM));
+}
+
+TEST(realloc_stays_secure)
+{
+    unsigned char *p = gcry_malloc_secure(64);
+    unsigned char *q;
+
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x3c, 64);
+
+    /* Growing past what the current pools hold still keeps the block in
+     * secure memory, with its contents. */
+    q = gcry_realloc(p, 70000);
+    ASSERT_NOT_NULL(q);
+    ASSERT_TRUE(gcry_is_secure(q));
+    ASSERT_EQ(0x3c, q[0]);
+    ASSERT_EQ(0x3c, q[63]);
+    memset(q, 0x3d, 70000);
+    p = gcry_realloc(q, 32);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(gcry_is_secure(p));
+    ASSERT_EQ(0x3d, p[31]);
+    gcry_free(p);
+    ASSERT_OK(gcry_control(GCRYCTL_TERM_SECMEM));
+}
+
+TEST(term_keeps_live_blocks)
+{
+    unsigned char *a = gcry_malloc_secure(100);
+    unsigned char *b;
+
+    ASSERT_NOT_NULL(a);
+    memset(a, 0x77, 100);
+
+    /* Tearing the pools down with a block still allocated keeps that
+     * block's pool; a pool nothing is allocated from goes away. */
+    b = gcry_malloc_secure(60000); /* In a pool of its own. */
+    ASSERT_NOT_NULL(b);
+    gcry_free(b);
+    ASSERT_OK(gcry_control(GCRYCTL_TERM_SECMEM));
+    ASSERT_TRUE(gcry_is_secure(a));
+    ASSERT_EQ(0x77, a[0]);
+    ASSERT_EQ(0x77, a[99]);
+    ASSERT_FALSE(gcry_is_secure(b));
+    b = gcry_malloc_secure(16);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(gcry_is_secure(b));
+    gcry_free(b);
+    gcry_free(a);
+    ASSERT_OK(gcry_control(GCRYCTL_TERM_SECMEM));
+    ASSERT_FALSE(gcry_is_secure(a));
+}
+
 TEST(free_keeps_errno)
 {
     void *p = gcry_malloc(8);
@@ -469,6 +580,61 @@ child_xstrdup_null(void)
     test_child_exit(1); /* Unreachable. */
 }
 
+/* Misuse of the secure allocator is a caller bug and fatal, like glibc's
+ * "free(): invalid pointer": a block freed twice ... */
+static void
+child_double_free(void)
+{
+    unsigned char *p = gcry_malloc_secure(32);
+    unsigned char *q = gcry_malloc_secure(32);
+
+    if (!p || !q || !gcry_is_secure(p)) {
+        test_child_exit(2);
+    }
+
+    memset(q, 0x42, 32);
+    gcry_free(p);
+    gcry_free(p); /* Must not wipe Q, which may now occupy that space. */
+    test_child_exit(q[0] == 0x42 ? 3 : 4); /* Unreachable. */
+}
+
+/* ... or a pointer into the middle of one. */
+static void
+child_interior_free(void)
+{
+    unsigned char *p = gcry_malloc_secure(64);
+
+    if (!p || !gcry_is_secure(p)) {
+        test_child_exit(2);
+    }
+
+    memset(p, 0, 64);
+    gcry_free(p + 16);
+    test_child_exit(3); /* Unreachable. */
+}
+
+/* A plain realloc of such a pointer dies the same way. */
+static void
+child_interior_realloc(void)
+{
+    unsigned char *p = gcry_malloc_secure(64);
+
+    if (!p || !gcry_is_secure(p)) {
+        test_child_exit(2);
+    }
+
+    memset(p, 0, 64);
+    p = gcry_realloc(p + 32, 128);
+    test_child_exit(3); /* Unreachable. */
+}
+
+TEST(allocator_misuse_is_fatal)
+{
+    ASSERT_EQ(1000 + SIGABRT, run_child(child_double_free));
+    ASSERT_EQ(1000 + SIGABRT, run_child(child_interior_free));
+    ASSERT_EQ(1000 + SIGABRT, run_child(child_interior_realloc));
+}
+
 TEST(xstrdup_null_is_fatal)
 {
     /* The x-functions never return NULL, so a NULL input is reported
@@ -488,7 +654,11 @@ main(void)
 
     RUN_TEST(secmem_lifecycle);
     RUN_TEST(realloc_paths);
+    RUN_TEST(pool_expands);
+    RUN_TEST(realloc_stays_secure);
+    RUN_TEST(term_keeps_live_blocks);
     RUN_TEST(free_keeps_errno);
+    RUN_TEST(allocator_misuse_is_fatal);
     RUN_TEST(disable_secmem_in_child);
     RUN_TEST(fatal_handler_called);
     RUN_TEST(fatal_without_handler_aborts);
