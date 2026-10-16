@@ -3954,6 +3954,612 @@ TEST(null_arguments)
     gcry_sexp_release(key);
 }
 
+/* ------------------------------------------------------------------ */
+/* Corrupted RSA frames, keys without CRT values, crafted ElGamal data */
+/* ------------------------------------------------------------------ */
+
+/* An RSA key with a 2049 bit modulus (a 1025 bit p and a 1024 bit q made
+ * with "openssl prime -generate", d = e^-1 mod (p-1)(q-1)): the PSS
+ * encoded message is one byte shorter than the modulus, so the verifier
+ * has to strip a leading zero byte.  Test data only. */
+#define RSA2049_N "1D5036B7DE47CA4283A2AAC3220FE5C20D8D3E8099EDE46F419AA44946F7DF47530CA19E1ECB63A927471381882A01D55A8B31768D2160286E4852136700CE13903AD4C07673E95F4F8132FB4D5E7170FAF3F5CC22A72E9FD59E6C34C63B5702411662A4B0512F32194E72D1C0A5D840B594D8297EDE10F6E001623AF459AD8B2BB389480C5589DBE9B6FADEA184D21A82BB6B2A96823CABCCA75485A8473146BCFFBE510D0A81F497323D954028997B7C0702CA9849CDB2041C64B93459D2E463775E9CFBC2842B0B625A2136D6D4D3F4C700EF9559A22CA572414AA332A13F13C763641A3B78650F1E39F4A2E7A6ECF6CA2D7A190FEF94C02E2027225710F6B"
+#define RSA2049_D "836489E0A2FA2822FCE8A78503A93EB6150888A0E958EC17C678E4ED90AE80A5B41D6A52D8B5D482E30C34E2E8F562427518771E6E7CAC088E4C9D995A9AC11DEFE1C4C2EE31A261167E8986E7C5EDB7FF28891BFC3865450CC29143FD4AFF379B883BA0F8B2EE5A2215019631713164DC87D2662DC6374461D1D1FD704A8919FB080C5F8BA8FEDC765CD724C58E5F1566BB49FCDE6AC7E820AF09C704967CF5143A83955B0DA14209FFD831DB4751451A932073E5D9D62FCD9F653C3A21BAE2B2A3558107D7B1E6224FB7A53F1E43867240614FD7C99CB187B2B2A4E5E4950065FDE927DC100070062E66FEA732D0686CD9F5FB562C01E28EE94FE5B02EB541"
+#define RSA2049_P "1EC5ED17355A15D7321C82C61A3DABFEFE7DF9296205D82933F56A447798AF52DAB0B960F033D0110A93CBD2DE842E7BD023604658699665A388D7B73FA3B087A1717B4457C260B4F508ADFFC88C3D1E9375A9EB2DFA6C112AE2CFBEF87BEAD74120B177F3FFE4E063FA4929C9C7F73C7309297422C26682D7293FC8B5D13A175"
+#define RSA2049_Q "F3DB1BD974813A31F83DE7E919B72434727510CA8BD2AFDC3BB5C0A850A884CFEB62DEAE626743EDE5349ABB14AEB27BBFC91E3D6F43DFB960CC2062AD7627F770EEA90AAD6D0DCDC2FFCAD5190A4480472F448BB74BFFBC48A42F446C26DEC74D77BCA1136966B1E577DDC2022D1213C31D0A32D42DC9B1924237381965F15F"
+
+/* An RSA private key (e = 65537) from hex parts.  WITH_PQ adds the
+ * primes (ordered p < q as the reference library wants them), WITH_U the
+ * CRT coefficient u = p^-1 mod q on top of them. */
+static gcry_sexp_t
+rsa_key_from_hex(const char *nhex, const char *dhex, const char *phex,
+                 const char *qhex, int with_pq, int with_u)
+{
+    gcry_sexp_t key = NULL;
+    gcry_mpi_t n = hex_mpi(nhex);
+    gcry_mpi_t e = gcry_mpi_set_ui(NULL, 65537);
+    gcry_mpi_t d = hex_mpi(dhex);
+    gcry_mpi_t p = hex_mpi(phex);
+    gcry_mpi_t q = hex_mpi(qhex);
+    gcry_mpi_t u = gcry_mpi_new(0);
+
+    if (gcry_mpi_cmp(p, q) > 0) {
+        gcry_mpi_swap(p, q);
+    }
+
+    gcry_mpi_invm(u, p, q);
+
+    if (!with_pq) {
+        gcry_sexp_build(&key, NULL, "(private-key (rsa (n %m)(e %m)(d %m)))",
+                        n, e, d);
+    } else if (!with_u) {
+        gcry_sexp_build(&key, NULL,
+                        "(private-key (rsa (n %m)(e %m)(d %m)(p %m)(q %m)))",
+                        n, e, d, p, q);
+    } else {
+        gcry_sexp_build(&key, NULL,
+                        "(private-key (rsa (n %m)(e %m)(d %m)(p %m)(q %m)(u %m)))",
+                        n, e, d, p, q, u);
+    }
+
+    gcry_mpi_release(n);
+    gcry_mpi_release(e);
+    gcry_mpi_release(d);
+    gcry_mpi_release(p);
+    gcry_mpi_release(q);
+    gcry_mpi_release(u);
+    return key;
+}
+
+/* The public key belonging to the RSA private key SKEY. */
+static gcry_sexp_t
+rsa_public_of(gcry_sexp_t skey)
+{
+    gcry_sexp_t key = NULL;
+    gcry_mpi_t n = param_mpi(skey, "n");
+    gcry_mpi_t e = param_mpi(skey, "e");
+
+    if (n && e) {
+        gcry_sexp_build(&key, NULL, "(public-key (rsa (n %m)(e %m)))", n, e);
+    }
+
+    gcry_mpi_release(n);
+    gcry_mpi_release(e);
+    return key;
+}
+
+/* M as a big endian number left padded with zeros to LEN bytes. */
+static int
+mpi_to_bytes(gcry_mpi_t m, unsigned char *buf, size_t len)
+{
+    size_t n = 0;
+
+    if (gcry_mpi_print(GCRYMPI_FMT_USG, NULL, 0, &n, m) || n > len) {
+        return 0;
+    }
+
+    memset(buf, 0, len - n);
+    return !gcry_mpi_print(GCRYMPI_FMT_USG, buf + len - n, n, NULL, m);
+}
+
+/* Textbook RSA on the number M with the private key: s = M^d mod n. */
+static gcry_error_t
+raw_sign_mpi(gcry_sexp_t *r_sig, gcry_mpi_t m, gcry_sexp_t skey)
+{
+    gcry_sexp_t data = NULL;
+    gcry_error_t err;
+
+    *r_sig = NULL;
+    err = gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", m);
+
+    if (!err) {
+        err = gcry_pk_sign(r_sig, data, skey);
+    }
+
+    gcry_sexp_release(data);
+    return err;
+}
+
+/* Verify the PSS data DATATEXT against a signature whose public
+ * operation recovers exactly the EMLEN bytes EM: the raw private
+ * operation on EM gives that signature, so the verifier decodes EM. */
+static gcry_error_t
+verify_pss_em(const unsigned char *em, size_t emlen, const char *datatext,
+              gcry_sexp_t skey, gcry_sexp_t pkey)
+{
+    gcry_mpi_t m = NULL;
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t data = sexp(datatext);
+    gcry_error_t err;
+
+    if (!data) {
+        return gcry_error(GPG_ERR_INTERNAL);
+    }
+
+    err = gcry_mpi_scan(&m, GCRYMPI_FMT_USG, em, emlen, NULL);
+
+    if (!err) {
+        err = raw_sign_mpi(&sig, m, skey);
+    }
+
+    if (!err) {
+        err = gcry_pk_verify(sig, data, pkey);
+    }
+
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    gcry_mpi_release(m);
+    return err;
+}
+
+#define PKCS1_SHA256_DATA "(data (flags pkcs1) (hash sha256 #" RSA_DIGEST "#))"
+#define PSS_SHA256_DATA "(data (flags pss) (hash sha256 #" RSA_DIGEST "#))"
+#define FOX "The quick brown fox jumps over the lazy dog"
+
+TEST(rsa_pkcs1_verify_mismatch)
+{
+    gcry_sexp_t skey = rsa_vector_key(1);
+    gcry_sexp_t pkey = rsa_vector_key(0);
+    gcry_sexp_t good = sexp("(sig-val (rsa (s #" RSA_SIG "#)))");
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t data = NULL;
+    gcry_mpi_t n = hex_mpi(RSA_N);
+    gcry_mpi_t m = gcry_mpi_new(0);
+    gcry_mpi_t s;
+    char flipped[sizeof RSA_SIG];
+
+    ASSERT_NOT_NULL(good);
+
+    /* The frame recovered from the signature is compared with the one
+     * the data describes: another digest, another digest algorithm (so
+     * another DigestInfo) or the bare digest all make a different frame. */
+    ASSERT_OK(gcry_pk_verify(good, data = sexp(PKCS1_SHA256_DATA), pkey));
+    gcry_sexp_release(data);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               gcry_pk_verify(good, data = sexp("(data (flags pkcs1)"
+                                                " (hash sha256 #" D32 "#))"),
+                              pkey));
+    gcry_sexp_release(data);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               gcry_pk_verify(good, data = sexp("(data (flags pkcs1)"
+                                                " (hash sha512 #" D32 D32 "#))"),
+                              pkey));
+    gcry_sexp_release(data);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               gcry_pk_verify(good, data = sexp("(data (flags pkcs1-raw)"
+                                                " (value #" RSA_DIGEST "#))"),
+                              pkey));
+    gcry_sexp_release(data);
+
+    /* The same with the message given for prehashing. */
+    ASSERT_OK(gcry_pk_verify(good, data = sexp("(data (flags pkcs1 prehash)"
+                                               " (hash-algo sha256)"
+                                               " (value \"" FOX "\"))"),
+                             pkey));
+    gcry_sexp_release(data);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               gcry_pk_verify(good, data = sexp("(data (flags pkcs1 prehash)"
+                                                " (hash-algo sha256)"
+                                                " (value \"" FOX ".\"))"),
+                              pkey));
+    gcry_sexp_release(data);
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               gcry_pk_verify(good, data = sexp("(data (flags pkcs1 prehash)"
+                                                " (hash-algo sha512)"
+                                                " (value \"" FOX "\"))"),
+                              pkey));
+    gcry_sexp_release(data);
+
+    /* A flipped low bit keeps the signature below n: the public operation
+     * runs and the recovered frame is garbage. */
+    data = sexp(PKCS1_SHA256_DATA);
+    memcpy(flipped, RSA_SIG, sizeof flipped);
+    flipped[sizeof flipped - 2] = '5'; /* ...34 -> ...35 */
+    s = hex_mpi(flipped);
+    ASSERT_TRUE(gcry_mpi_cmp(s, n) < 0);
+    ASSERT_OK(gcry_sexp_build(&sig, NULL, "(sig-val (rsa (s %m)))", s));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_mpi_release(s);
+
+    /* A flipped top bit takes it above n and it is refused before that. */
+    flipped[sizeof flipped - 2] = '4';
+    flipped[0] = 'C'; /* 48... -> C8..., above n = B7... */
+    s = hex_mpi(flipped);
+    ASSERT_TRUE(gcry_mpi_cmp(s, n) > 0);
+    ASSERT_OK(gcry_sexp_build(&sig, NULL, "(sig-val (rsa (s %m)))", s));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_mpi_release(s);
+    ASSERT_OK(gcry_sexp_build(&sig, NULL, "(sig-val (rsa (s %m)))", n));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    /* Raw data must be below the modulus: 2^2048 does not even fit the
+     * frame, n fits but is not below itself, n - 1 is the largest value
+     * (and, as -1, its own signature). */
+    gcry_mpi_set_ui(m, 1);
+    gcry_mpi_mul_2exp(m, m, 2048);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", m));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_sign(&sig, data, skey));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(good, data, pkey));
+    gcry_sexp_release(data);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", n));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_sign(&sig, data, skey));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(good, data, pkey));
+    gcry_sexp_release(data);
+    gcry_mpi_sub_ui(m, n, 1);
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", m));
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    s = param_mpi(sig, "s");
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(0, gcry_mpi_cmp(s, m));
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_mpi_release(s);
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+
+    gcry_mpi_release(m);
+    gcry_mpi_release(n);
+    gcry_sexp_release(good);
+    gcry_sexp_release(skey);
+    gcry_sexp_release(pkey);
+}
+
+TEST(rsa_pss_verify_corruptions)
+{
+    /* The encoded message of a 2048 bit key with SHA-256 and the default
+     * 20 byte salt: DB = 202 zero bytes, 0x01, the salt (masked), then
+     * H and the 0xBC trailer. */
+    enum {
+        HLEN = 32, SALTLEN = 20, EMLEN = 256, DBLEN = EMLEN - HLEN - 1,
+        SEP = DBLEN - SALTLEN - 1
+    };
+    gcry_sexp_t skey = rsa_vector_key(1);
+    gcry_sexp_t pkey = rsa_vector_key(0);
+    gcry_sexp_t data = NULL;
+    gcry_sexp_t sig = NULL;
+    gcry_mpi_t n = hex_mpi(RSA_N);
+    gcry_mpi_t e = gcry_mpi_set_ui(NULL, RSA_E_DEC);
+    gcry_mpi_t s;
+    gcry_mpi_t em_mpi = gcry_mpi_new(0);
+    unsigned char em[EMLEN];
+    unsigned char bad[EMLEN];
+    unsigned char salt[SALTLEN];
+
+    memset(salt, 0x5a, sizeof salt);
+    ASSERT_OK(gcry_sexp_build(&data, NULL,
+                              "(data (flags pss) (random-override %b)"
+                              " (hash sha256 #" RSA_DIGEST "#))",
+                              (int)sizeof salt, salt));
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    gcry_sexp_release(data);
+    s = param_mpi(sig, "s");
+    gcry_sexp_release(sig);
+    ASSERT_NOT_NULL(s);
+
+    /* The public operation recovers the encoded message; signing it
+     * again with raw RSA gives back a valid signature. */
+    gcry_mpi_powm(em_mpi, s, e, n);
+    ASSERT_TRUE(mpi_to_bytes(em_mpi, em, sizeof em));
+    ASSERT_EQ(0xbc, em[EMLEN - 1]);
+    ASSERT_EQ(0, em[0] & 0x80);
+    ASSERT_OK(verify_pss_em(em, sizeof em, PSS_SHA256_DATA, skey, pkey));
+
+    /* Wrong trailer byte. */
+    memcpy(bad, em, sizeof em);
+    bad[EMLEN - 1] ^= 0x01;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* The high bit must be clear (0x80... is still below n = 0xB7...). */
+    memcpy(bad, em, sizeof em);
+    bad[0] = 0x80;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* A flipped bit in the masked DB flips the same bit of PS. */
+    memcpy(bad, em, sizeof em);
+    bad[100] ^= 0x01;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* The 0x01 separator turned into 0x00. */
+    memcpy(bad, em, sizeof em);
+    bad[SEP] ^= 0x01;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* A changed salt byte gives another H. */
+    memcpy(bad, em, sizeof em);
+    bad[SEP + 1] ^= 0x01;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* A changed H byte changes the mask, so PS is no longer zero. */
+    memcpy(bad, em, sizeof em);
+    bad[DBLEN] ^= 0x01;
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(bad, sizeof bad, PSS_SHA256_DATA, skey, pkey));
+
+    /* A salt length other than the one signed with: the separator is
+     * looked for in the salt (32) or found inside the padding (8). */
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(em, sizeof em,
+                             "(data (flags pss) (salt-length 2:32)"
+                             " (hash sha256 #" RSA_DIGEST "#))", skey, pkey));
+    ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+               verify_pss_em(em, sizeof em,
+                             "(data (flags pss) (salt-length 1:8)"
+                             " (hash sha256 #" RSA_DIGEST "#))", skey, pkey));
+
+    /* Parameters that cannot describe any frame of this size. */
+    ASSERT_ERR(GPG_ERR_TOO_SHORT,
+               verify_pss_em(em, sizeof em,
+                             "(data (flags pss) (salt-length 3:300)"
+                             " (hash sha256 #" RSA_DIGEST "#))", skey, pkey));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               verify_pss_em(em, sizeof em,
+                             "(data (flags pss) (hash sha256 #0102#))", skey,
+                             pkey));
+    ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+               verify_pss_em(em, sizeof em,
+                             "(data (flags pss) (hash md2 #" D20 "#))", skey,
+                             pkey));
+
+    gcry_mpi_release(s);
+    gcry_mpi_release(em_mpi);
+    gcry_mpi_release(e);
+    gcry_mpi_release(n);
+    gcry_sexp_release(skey);
+    gcry_sexp_release(pkey);
+
+    /* With a 2049 bit modulus the frame has 257 bytes but the encoded
+     * message only 256, so a leading zero byte is stripped on
+     * verification; a frame with that byte set is too long. */
+    skey = rsa_key_from_hex(RSA2049_N, RSA2049_D, RSA2049_P, RSA2049_Q, 1, 1);
+    pkey = rsa_public_of(skey);
+    ASSERT_NOT_NULL(pkey);
+    ASSERT_EQ(2049, gcry_pk_get_nbits(skey));
+    ASSERT_OK(gcry_pk_testkey(skey));
+    data = sexp(PSS_SHA256_DATA);
+    ASSERT_OK(gcry_pk_sign(&sig, data, skey));
+    {
+        size_t slen;
+        void *sbuf = param_bytes(sig, "s", &slen);
+
+        ASSERT_EQ(257, slen);
+        gcry_free(sbuf);
+    }
+    ASSERT_OK(gcry_pk_verify(sig, data, pkey));
+    gcry_sexp_release(sig);
+    gcry_sexp_release(data);
+    {
+        unsigned char top[257];
+
+        memset(top, 0, sizeof top);
+        top[0] = 0x01; /* 2^2048, below n but longer than EM. */
+        ASSERT_ERR(GPG_ERR_BAD_SIGNATURE,
+                   verify_pss_em(top, sizeof top, PSS_SHA256_DATA, skey, pkey));
+    }
+    gcry_sexp_release(skey);
+    gcry_sexp_release(pkey);
+}
+
+TEST(rsa_key_without_crt_values)
+{
+    gcry_sexp_t full = rsa_vector_key(1);
+    gcry_sexp_t pub = rsa_vector_key(0);
+    gcry_sexp_t no_u = rsa_key_from_hex(RSA_N, RSA_D, RSA_P, RSA_Q, 1, 0);
+    gcry_sexp_t no_pq = rsa_key_from_hex(RSA_N, RSA_D, RSA_P, RSA_Q, 0, 0);
+    gcry_sexp_t data = sexp(PKCS1_SHA256_DATA);
+    gcry_sexp_t sig = NULL;
+    gcry_sexp_t enc = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_mpi_t a;
+    unsigned char grip_full[20];
+    unsigned char grip[20];
+
+    ASSERT_NOT_NULL(no_u);
+    ASSERT_NOT_NULL(no_pq);
+    ASSERT_FALSE(has_token(no_u, "u"));
+    ASSERT_FALSE(has_token(no_pq, "p"));
+
+    /* Without u the CRT coefficient is derived from p and q; without the
+     * primes the plain private exponent is used.  Both give the known
+     * signature. */
+    ASSERT_OK(gcry_pk_sign(&sig, data, no_u));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_SIG));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+    ASSERT_OK(gcry_pk_sign(&sig, data, no_pq));
+    ASSERT_TRUE(param_is_hex(sig, "s", RSA_SIG));
+    ASSERT_OK(gcry_pk_verify(sig, data, pub));
+    gcry_sexp_release(sig);
+
+    /* Decryption of the same ciphertext gives the message with every
+     * form of the key. */
+    ASSERT_OK(encrypt_text(&enc, "(data (flags pkcs1) (value 5:hello))", pub));
+    a = param_mpi(enc, "a");
+    ASSERT_NOT_NULL(a);
+    gcry_sexp_release(enc);
+    ASSERT_OK(gcry_sexp_build(&enc, NULL, "(enc-val (flags pkcs1) (rsa (a %m)))",
+                              a));
+    ASSERT_OK(gcry_pk_decrypt(&plain, enc, full));
+    ASSERT_TRUE(param_is_hex(plain, "value", "68656c6c6f"));
+    gcry_sexp_release(plain);
+    ASSERT_OK(gcry_pk_decrypt(&plain, enc, no_u));
+    ASSERT_TRUE(param_is_hex(plain, "value", "68656c6c6f"));
+    gcry_sexp_release(plain);
+    ASSERT_OK(gcry_pk_decrypt(&plain, enc, no_pq));
+    ASSERT_TRUE(param_is_hex(plain, "value", "68656c6c6f"));
+    gcry_sexp_release(plain);
+    gcry_sexp_release(enc);
+    gcry_mpi_release(a);
+
+    /* The key check wants all of n, e, d, p, q and u, as in the reference
+     * library; size and keygrip only depend on the public part. */
+    ASSERT_OK(gcry_pk_testkey(full));
+    ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_testkey(no_u));
+    ASSERT_ERR(GPG_ERR_NO_OBJ, gcry_pk_testkey(no_pq));
+    ASSERT_EQ(2048, gcry_pk_get_nbits(no_u));
+    ASSERT_EQ(2048, gcry_pk_get_nbits(no_pq));
+    ASSERT_NOT_NULL(gcry_pk_get_keygrip(full, grip_full));
+    ASSERT_NOT_NULL(gcry_pk_get_keygrip(no_u, grip));
+    ASSERT_MEM_EQ(grip_full, grip, sizeof grip);
+    ASSERT_NOT_NULL(gcry_pk_get_keygrip(no_pq, grip));
+    ASSERT_MEM_EQ(grip_full, grip, sizeof grip);
+
+    gcry_sexp_release(data);
+    gcry_sexp_release(full);
+    gcry_sexp_release(pub);
+    gcry_sexp_release(no_u);
+    gcry_sexp_release(no_pq);
+}
+
+/* Encrypt the number FRAME with raw ElGamal and decrypt the result as a
+ * PKCS#1 block, which hands exactly FRAME (left padded to the key size)
+ * to the block decoder. */
+static gcry_error_t
+elg_pkcs1_decrypt_frame(gcry_sexp_t *r_plain, const unsigned char *frame,
+                        size_t framelen, gcry_sexp_t pub, gcry_sexp_t sec)
+{
+    gcry_mpi_t m = NULL;
+    gcry_mpi_t a = NULL;
+    gcry_mpi_t b = NULL;
+    gcry_sexp_t data = NULL;
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t enc = NULL;
+    gcry_error_t err;
+
+    *r_plain = NULL;
+    err = gcry_mpi_scan(&m, GCRYMPI_FMT_USG, frame, framelen, NULL);
+
+    if (!err) {
+        err = gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", m);
+    }
+
+    if (!err) {
+        err = gcry_pk_encrypt(&ciph, data, pub);
+    }
+
+    if (!err) {
+        a = param_mpi(ciph, "a");
+        b = param_mpi(ciph, "b");
+        err = gcry_sexp_build(&enc, NULL,
+                              "(enc-val (flags pkcs1) (elg (a %m) (b %m)))", a,
+                              b);
+    }
+
+    if (!err) {
+        err = gcry_pk_decrypt(r_plain, enc, sec);
+    }
+
+    gcry_sexp_release(enc);
+    gcry_sexp_release(ciph);
+    gcry_sexp_release(data);
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    gcry_mpi_release(m);
+    return err;
+}
+
+TEST(elgamal_crafted_ciphertexts)
+{
+    gcry_sexp_t key;
+    gcry_sexp_t pub;
+    gcry_sexp_t sec;
+    gcry_sexp_t enc = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_mpi_t p;
+    unsigned char frame[128];
+    void *v;
+    size_t vlen;
+
+    if (gcry_fips_mode_active()) {
+        /* ElGamal is refused before any ciphertext is looked at. */
+        gcry_sexp_t bad = sexp("(private-key (elg (p #0b#) (g #02#) (y #04#)"
+                               " (x #03#)))");
+
+        ASSERT_ERR(GPG_ERR_PUBKEY_ALGO,
+                   decrypt_text(&plain, "(enc-val (flags pkcs1)"
+                                " (elg (a #00#) (b #05#)))", bad));
+        ASSERT_NULL(plain);
+        gcry_sexp_release(bad);
+        return;
+    }
+
+    key = genkey("(genkey (elg (nbits 4:1024)))");
+    ASSERT_NOT_NULL(key);
+    pub = gcry_sexp_find_token(key, "public-key", 0);
+    sec = gcry_sexp_find_token(key, "private-key", 0);
+    p = param_mpi(sec, "p");
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(1024, gcry_mpi_get_nbits(p));
+
+    /* A well formed block: 00 02, eight non-zero padding bytes, 00 and
+     * the message. */
+    memset(frame, 0xaa, sizeof frame);
+    frame[0] = 0x00;
+    frame[1] = 0x02;
+    frame[10] = 0x00;
+    memset(frame + 11, 'm', sizeof frame - 11);
+    ASSERT_OK(elg_pkcs1_decrypt_frame(&plain, frame, sizeof frame, pub, sec));
+    v = param_bytes(plain, "value", &vlen);
+    ASSERT_EQ(sizeof frame - 11, vlen);
+    ASSERT_MEM_EQ(frame + 11, v, vlen);
+    gcry_free(v);
+    gcry_sexp_release(plain);
+
+    /* The number may have lost its leading zero byte, so a block that
+     * starts with the type byte is accepted too. */
+    frame[0] = 0x02;
+    frame[1] = 0xaa;
+    ASSERT_OK(elg_pkcs1_decrypt_frame(&plain, frame, sizeof frame, pub, sec));
+    v = param_bytes(plain, "value", &vlen);
+    ASSERT_EQ(sizeof frame - 11, vlen);
+    ASSERT_MEM_EQ(frame + 11, v, vlen);
+    gcry_free(v);
+    gcry_sexp_release(plain);
+
+    /* Block type 1 (a signature block) is not an encryption block. */
+    frame[0] = 0x00;
+    frame[1] = 0x01;
+    ASSERT_ERR(GPG_ERR_ENCODING_PROBLEM,
+               elg_pkcs1_decrypt_frame(&plain, frame, sizeof frame, pub, sec));
+    ASSERT_NULL(plain);
+
+    /* Only seven padding bytes before the separator. */
+    frame[1] = 0x02;
+    frame[9] = 0x00;
+    frame[10] = 0xaa;
+    ASSERT_ERR(GPG_ERR_ENCODING_PROBLEM,
+               elg_pkcs1_decrypt_frame(&plain, frame, sizeof frame, pub, sec));
+
+    /* No separator at all. */
+    memset(frame + 2, 0xaa, sizeof frame - 2);
+    ASSERT_ERR(GPG_ERR_ENCODING_PROBLEM,
+               elg_pkcs1_decrypt_frame(&plain, frame, sizeof frame, pub, sec));
+
+    /* a = 0 and a = p have no inverse modulo p, whatever the encoding. */
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               decrypt_text(&plain, "(enc-val (flags pkcs1)"
+                            " (elg (a #00#) (b #05#)))", sec));
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               decrypt_text(&plain, "(enc-val (elg (a #00#) (b #05#)))", sec));
+    ASSERT_OK(gcry_sexp_build(&enc, NULL,
+                              "(enc-val (flags pkcs1) (elg (a %m) (b #05#)))",
+                              p));
+    ASSERT_ERR(GPG_ERR_INV_DATA, gcry_pk_decrypt(&plain, enc, sec));
+    ASSERT_NULL(plain);
+    gcry_sexp_release(enc);
+
+    gcry_mpi_release(p);
+    gcry_sexp_release(pub);
+    gcry_sexp_release(sec);
+    gcry_sexp_release(key);
+}
+
 int
 main(void)
 {
@@ -3993,6 +4599,10 @@ main(void)
     RUN_TEST(elgamal_encodings);
     RUN_TEST(dsa_sizes);
     RUN_TEST(ecc_sm2_and_curve_rules);
+    RUN_TEST(rsa_pkcs1_verify_mismatch);
+    RUN_TEST(rsa_pss_verify_corruptions);
+    RUN_TEST(rsa_key_without_crt_values);
+    RUN_TEST(elgamal_crafted_ciphertexts);
     RUN_TEST(disable_algorithm);
     RUN_TEST(null_arguments);
     return TEST_RESULT();
