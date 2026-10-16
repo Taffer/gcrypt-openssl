@@ -163,14 +163,40 @@ TEST(mlkem1024)
 
 TEST(raw_x25519)
 {
-    unsigned char pk[GCRY_KEM_ECC_X25519_PUBKEY_LEN];
-    unsigned char sk[GCRY_KEM_ECC_X25519_SECKEY_LEN];
+    unsigned char pk[GCRY_KEM_ECC_X25519_PUBKEY_LEN] = { 0 };
+    unsigned char sk[GCRY_KEM_ECC_X25519_SECKEY_LEN] = { 0 };
     unsigned char ct[GCRY_KEM_ECC_X25519_ENCAPS_LEN];
     unsigned char ss1[GCRY_KEM_RAW_X25519_SHARED_LEN];
     unsigned char ss2[GCRY_KEM_RAW_X25519_SHARED_LEN];
     unsigned char *alice_sk;
     unsigned char *bob_pk;
     unsigned char zero[32] = { 0 };
+
+    /* RFC 7748 section 6.1. */
+    unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+          &alice_sk);
+    unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+          &bob_pk);
+
+    if (gcry_fips_mode_active()) {
+        /* OpenSSL's FIPS provider has no X25519.  The argument checks
+         * still come first. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, sizeof pk, sk,
+                                    sizeof sk));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_encap(GCRY_KEM_RAW_X25519, bob_pk, 32, ct, sizeof ct,
+                                  ss1, sizeof ss1, NULL, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_decap(GCRY_KEM_RAW_X25519, alice_sk, 32, bob_pk, 32,
+                                  ss1, sizeof ss1, NULL, 0));
+        ASSERT_ERR(GPG_ERR_INV_VALUE,
+                   gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, sizeof pk, ct, 31, ss1,
+                                  sizeof ss1, NULL, 0));
+        free(alice_sk);
+        free(bob_pk);
+        return;
+    }
 
     ASSERT_OK(gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, sizeof pk, sk,
                                sizeof sk));
@@ -183,11 +209,7 @@ TEST(raw_x25519)
                              ss2, sizeof ss2, NULL, 0));
     ASSERT_MEM_EQ(ss1, ss2, sizeof ss1);
 
-    /* RFC 7748 section 6.1: decapsulation is plain X25519. */
-    unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
-          &alice_sk);
-    unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
-          &bob_pk);
+    /* Decapsulation is plain X25519. */
     ASSERT_OK(gcry_kem_decap(GCRY_KEM_RAW_X25519, alice_sk, 32, bob_pk, 32,
                              ss1, sizeof ss1, NULL, 0));
     ASSERT_HEX_EQ("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
@@ -209,14 +231,27 @@ TEST(raw_x25519)
 
 TEST(raw_x448)
 {
-    unsigned char pk[GCRY_KEM_ECC_X448_PUBKEY_LEN];
-    unsigned char sk[GCRY_KEM_ECC_X448_SECKEY_LEN];
-    unsigned char ct[GCRY_KEM_ECC_X448_ENCAPS_LEN];
+    unsigned char pk[GCRY_KEM_ECC_X448_PUBKEY_LEN] = { 0 };
+    unsigned char sk[GCRY_KEM_ECC_X448_SECKEY_LEN] = { 0 };
+    unsigned char ct[GCRY_KEM_ECC_X448_ENCAPS_LEN] = { 0 };
     unsigned char ss1[GCRY_KEM_RAW_X448_SHARED_LEN];
     unsigned char ss2[GCRY_KEM_RAW_X448_SHARED_LEN];
 
-    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_RAW_X448, pk, sizeof pk, sk,
-                               sizeof sk));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_kem_keypair(GCRY_KEM_RAW_X448, pk, sizeof pk, sk,
+                                           sizeof sk));
+
+    if (gcry_fips_mode_active()) {
+        /* OpenSSL's FIPS provider has no X448 either. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_encap(GCRY_KEM_RAW_X448, pk, sizeof pk, ct, sizeof ct,
+                                  ss1, sizeof ss1, NULL, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_decap(GCRY_KEM_RAW_X448, sk, sizeof sk, ct, sizeof ct,
+                                  ss2, sizeof ss2, NULL, 0));
+        return;
+    }
+
     ASSERT_EQ(0, sk[0] & 0x03);
     ASSERT_EQ(0x80, sk[55] & 0x80);
     ASSERT_OK(gcry_kem_encap(GCRY_KEM_RAW_X448, pk, sizeof pk, ct, sizeof ct,
@@ -265,6 +300,31 @@ TEST(raw_weierstrass)
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_P256R1, 32);
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_P384R1, 48);
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_P521R1, 66);
+
+    if (gcry_fips_mode_active()) {
+        /* The brainpool curves and secp256k1 are not approved curves. */
+        unsigned char pk[129] = { 0 };
+        unsigned char sk[64] = { 0 };
+        unsigned char ct[129];
+        unsigned char ss[129];
+
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_RAW_BP256, pk, 65, sk, 32));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_RAW_BP384, pk, 97, sk, 48));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_RAW_BP512, pk, 129, sk, 64));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_RAW_P256K1, pk, 65, sk, 32));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_encap(GCRY_KEM_RAW_BP256, pk, 65, ct, 65, ss, 65, NULL,
+                                  0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_decap(GCRY_KEM_RAW_P256K1, sk, 32, ct, 65, ss, 65,
+                                  NULL, 0));
+        return;
+    }
+
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_BP256, 32);
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_BP384, 48);
     raw_weierstrass_roundtrip(GCRY_KEM_RAW_BP512, 64);
@@ -303,16 +363,64 @@ TEST(raw_p256_low_y_key)
 /* DHKEM                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Decapsulation of a known ciphertext must give the known secret. */
+static void
+dhkem_known_answer(int algo, const char *sk_hex, const char *enc_hex,
+                   const char *ss_hex)
+{
+    unsigned char *sk;
+    unsigned char *enc;
+    unsigned char *expected;
+    unsigned char ss[64];
+    size_t sklen = unhex(sk_hex, &sk);
+    size_t enclen = unhex(enc_hex, &enc);
+    size_t sslen = unhex(ss_hex, &expected);
+
+    ASSERT_OK(gcry_kem_decap(algo, sk, sklen, enc, enclen, ss, sslen, NULL, 0));
+    ASSERT_MEM_EQ(expected, ss, sslen);
+    free(sk);
+    free(enc);
+    free(expected);
+}
+
 TEST(dhkem_x25519)
 {
-    unsigned char pk[GCRY_KEM_DHKEM25519_PUBKEY_LEN];
-    unsigned char sk[GCRY_KEM_DHKEM25519_SECKEY_LEN];
+    unsigned char pk[GCRY_KEM_DHKEM25519_PUBKEY_LEN] = { 0 };
+    unsigned char sk[GCRY_KEM_DHKEM25519_SECKEY_LEN] = { 0 };
     unsigned char ct[GCRY_KEM_DHKEM25519_ENCAPS_LEN];
     unsigned char ss1[GCRY_KEM_DHKEM25519_SHARED_LEN];
     unsigned char ss2[GCRY_KEM_DHKEM25519_SHARED_LEN];
     unsigned char *skR;
     unsigned char *pkR;
     unsigned char *enc;
+
+    /* RFC 9180 appendix A.1 (DHKEM(X25519, HKDF-SHA256), base mode). */
+    unhex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
+          &skR);
+    unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
+          &pkR);
+    unhex("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
+          &enc);
+
+    if (gcry_fips_mode_active()) {
+        /* No X25519 in OpenSSL's FIPS provider; argument checks first. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_keypair(GCRY_KEM_DHKEM25519, pk, sizeof pk, sk,
+                                    sizeof sk));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_encap(GCRY_KEM_DHKEM25519, pkR, 32, ct, sizeof ct,
+                                  ss1, sizeof ss1, NULL, 0));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_kem_decap(GCRY_KEM_DHKEM25519, skR, 32, enc, 32, ss1,
+                                  sizeof ss1, pkR, 32));
+        ASSERT_ERR(GPG_ERR_INV_ARG,
+                   gcry_kem_decap(GCRY_KEM_DHKEM25519, skR, 32, enc, 32, ss1,
+                                  sizeof ss1, pkR, 31));
+        free(skR);
+        free(pkR);
+        free(enc);
+        return;
+    }
 
     ASSERT_OK(gcry_kem_keypair(GCRY_KEM_DHKEM25519, pk, sizeof pk, sk,
                                sizeof sk));
@@ -328,13 +436,6 @@ TEST(dhkem_x25519)
                gcry_kem_decap(GCRY_KEM_DHKEM25519, sk, sizeof sk, ct, sizeof ct,
                               ss2, sizeof ss2, pk, 31));
 
-    /* RFC 9180 appendix A.1 (DHKEM(X25519, HKDF-SHA256), base mode). */
-    unhex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
-          &skR);
-    unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
-          &pkR);
-    unhex("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
-          &enc);
     ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEM25519, skR, 32, enc, 32, ss1,
                              sizeof ss1, pkR, 32));
     ASSERT_HEX_EQ("fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
@@ -346,18 +447,29 @@ TEST(dhkem_x25519)
 
 TEST(dhkem_x448)
 {
-    unsigned char pk[GCRY_KEM_DHKEM448_PUBKEY_LEN];
-    unsigned char sk[GCRY_KEM_DHKEM448_SECKEY_LEN];
+    unsigned char pk[GCRY_KEM_DHKEM448_PUBKEY_LEN] = { 0 };
+    unsigned char sk[GCRY_KEM_DHKEM448_SECKEY_LEN] = { 0 };
     unsigned char ct[GCRY_KEM_DHKEM448_ENCAPS_LEN];
     unsigned char ss1[64];
     unsigned char ss2[GCRY_KEM_DHKEM448_SHARED_LEN];
 
-    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_DHKEM448, pk, sizeof pk, sk,
-                               sizeof sk));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_kem_keypair(GCRY_KEM_DHKEM448, pk, sizeof pk, sk,
+                                           sizeof sk));
     /* The full 64 byte RFC 9180 secret and the header's 56 byte length are
      * both accepted; the shorter one is a prefix of the longer. */
-    ASSERT_OK(gcry_kem_encap(GCRY_KEM_DHKEM448, pk, sizeof pk, ct, sizeof ct,
-                             ss1, sizeof ss1, NULL, 0));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_kem_encap(GCRY_KEM_DHKEM448, pk, sizeof pk, ct,
+                                         sizeof ct, ss1, sizeof ss1, NULL, 0));
+
+    if (gcry_fips_mode_active()) {
+        /* The length check precedes the availability check. */
+        ASSERT_ERR(GPG_ERR_INV_ARG,
+                   gcry_kem_encap(GCRY_KEM_DHKEM448, pk, sizeof pk, ct, sizeof ct,
+                                  ss1, 48, NULL, 0));
+        return;
+    }
+
     ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEM448, sk, sizeof sk, ct, sizeof ct,
                              ss2, sizeof ss2, NULL, 0));
     ASSERT_MEM_EQ(ss1, ss2, sizeof ss2);
@@ -381,6 +493,44 @@ TEST(dhkem_p256)
     ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP256R1, sk, sizeof sk, ct,
                              sizeof ct, ss2, sizeof ss2, NULL, 0));
     ASSERT_MEM_EQ(ss1, ss2, sizeof ss1);
+
+    /* RFC 9180 appendix A.3.1 (DHKEM(P-256, HKDF-SHA256), base mode). */
+    dhkem_known_answer(GCRY_KEM_DHKEMP256R1,
+                       "f3ce7fdae57e1a310d87f1ebbde6f328be0a99cdbcadf4d6589cf29de4b8ffd2",
+                       "04a92719c6195d5085104f469a8b9814d5838ff72b60501e2c4466e5e67b325ac9"
+                       "8536d7b61a1af4b78e5b7f951c0900be863c403ce65c9bfcb9382657222d18c4",
+                       "c0d26aeab536609a572b07695d933b589dcf363ff9d93c93adea537aeabb8cb8");
+    {
+        unsigned char *skR;
+        unsigned char *pkR;
+        unsigned char *enc;
+
+        unhex("f3ce7fdae57e1a310d87f1ebbde6f328be0a99cdbcadf4d6589cf29de4b8ffd2",
+              &skR);
+        unhex("04fe8c19ce0905191ebc298a9245792531f26f0cece2460639e8bc39cb7f706a82"
+              "6a779b4cf969b8a0e539c7f62fb3d30ad6aa8f80e30f1d128aafd68a2ce72ea0",
+              &pkR);
+        unhex("04a92719c6195d5085104f469a8b9814d5838ff72b60501e2c4466e5e67b325ac9"
+              "8536d7b61a1af4b78e5b7f951c0900be863c403ce65c9bfcb9382657222d18c4",
+              &enc);
+        /* The recipient's public key may be passed along. */
+        ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP256R1, skR, 32, enc, 65, ss1,
+                                 32, pkR, 65));
+        ASSERT_HEX_EQ("c0d26aeab536609a572b07695d933b589dcf363ff9d93c93adea537aeabb8cb8",
+                      ss1, 32);
+        /* A ciphertext that is not a curve point is rejected. */
+        enc[64] ^= 0x01;
+        ASSERT_ERR(GPG_ERR_INV_DATA,
+                   gcry_kem_decap(GCRY_KEM_DHKEMP256R1, skR, 32, enc, 65, ss1,
+                                  32, NULL, 0));
+        enc[0] = 0x02;
+        ASSERT_ERR(GPG_ERR_INV_DATA,
+                   gcry_kem_encap(GCRY_KEM_DHKEMP256R1, enc, 65, ct, 65, ss1,
+                                  32, NULL, 0));
+        free(skR);
+        free(pkR);
+        free(enc);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -429,6 +579,28 @@ TEST(dhkem_p384_p521)
     ASSERT_OK(gcry_kem_decap(GCRY_KEM_DHKEMP521R1, sk, 66, ct, 133, ss2, 64,
                              NULL, 0));
     ASSERT_MEM_EQ(ss1, ss2, 64);
+
+    /* Known answers produced by OpenSSL's own DHKEM implementation (the
+     * default provider's EC KEM), so that the ECDH + HKDF composition used
+     * here agrees with it. */
+    dhkem_known_answer(GCRY_KEM_DHKEMP384R1,
+                       "807143d402a0db3d40ece77cb02ef44af0992e9e31ee7004745f7c85af49dcc4"
+                       "5ed3adf165739a47ade21f3bd82fb25e",
+                       "0476dc118012e57ea32901776300bd0c857268a1c24035b74ff132ff18af7d3869"
+                       "9e19712b451f2d7b4316a59bbc41ea16f58fb69b75c3f2ed9f6ceb6b3cd64f4925"
+                       "e0674dc72cc3b2b17865718c3d36e678e4f3ff14feb9f43e044e2cbfa7d7d7",
+                       "ecc3fbfae23718db87c4dc7617c33acbb88672c36616fb5752caee7f8b37a7f1"
+                       "7af2a4854540d0f9c4104dadf51634ef");
+    dhkem_known_answer(GCRY_KEM_DHKEMP521R1,
+                       "00519dd7c9c3ef0c7ffc1bcb45b4f76cac85ca00d89a4951725ddeeefbc52464b2"
+                       "61879ad1bce7d316c61a443453edaa79c43736451f0a35a00965a2e0e000c7c4a2",
+                       "04014acf2756f28378e46854d917adab357ece492adb3f93abcb7438252c6da66f"
+                       "e246b66f326b4bbcf8ebb17a185edbe30dbe7657b67dc4d947e2ee5d73d70d43bb"
+                       "410120191c635c15a7b2c7b774f7d262628e5986b040f8e661f8b031b542319340"
+                       "f49867b3f338ac28bc35d5e8391eca243cbaf8695c931a2b69264765acb53d4e6c"
+                       "b2",
+                       "3f644b220ddd3412c10bfd7f3e7571faad1aa9e2e495d5839c544780fad9d6e1"
+                       "9e58d8ca33ddb4a70f8c0559358ae32b78fa323065abaef29b0d21d8234db93b");
 }
 
 TEST(argument_validation)
@@ -441,7 +613,8 @@ TEST(argument_validation)
     /* Buffer lengths must match the algorithm exactly. */
     ASSERT_ERR(GPG_ERR_INV_ARG,
                gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, 31, sk, 32));
-    ASSERT_OK(gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, 32, sk, 32));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_kem_keypair(GCRY_KEM_RAW_X25519, pk, 32, sk, 32));
     ASSERT_ERR(GPG_ERR_INV_VALUE, /* raw ECC: ciphertext is a public key */
                gcry_kem_encap(GCRY_KEM_RAW_X25519, pk, 32, ct, 31, ss, 32, NULL,
                               0));

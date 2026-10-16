@@ -430,6 +430,21 @@ TEST(curve25519_context)
     gcry_mpi_t x = gcry_mpi_new(0);
     gcry_mpi_t q;
 
+    if (gcry_fips_mode_active()) {
+        /* Curve25519 is not an approved curve. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        ASSERT_NULL(ctx);
+        gcry_mpi_point_release(P);
+        gcry_mpi_point_release(W);
+        gcry_mpi_release(x);
+        gcry_mpi_release(k);
+        gcry_mpi_release(u);
+        gcry_mpi_release(expected);
+        gcry_mpi_release(pub);
+        return;
+    }
+
     ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
     G = gcry_mpi_ec_get_point("g", ctx, 1);
     ASSERT_NOT_NULL(G);
@@ -677,6 +692,16 @@ TEST(montgomery_context_queries)
     gcry_mpi_t x = gcry_mpi_new(0);
     gcry_mpi_t h;
 
+    if (gcry_fips_mode_active()) {
+        /* Curve25519 is not an approved curve. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        ASSERT_NULL(ctx);
+        gcry_mpi_release(m);
+        gcry_mpi_release(x);
+        return;
+    }
+
     ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
     G = gcry_mpi_ec_get_point("g", ctx, 1);
     ASSERT_NOT_NULL(G);
@@ -762,15 +787,26 @@ TEST(context_from_odd_keys)
               "0102030405060708091011121314151617181920212223242526272829303132#)))"
           );
     ASSERT_NOT_NULL(key);
-    ASSERT_OK(gcry_mpi_ec_new(&ctx, key, NULL));
+    /* Curve25519 is not an approved curve. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_NOT_SUPPORTED,
+                          gcry_mpi_ec_new(&ctx, key, NULL));
     gcry_ctx_release(ctx);
     ctx = NULL;
     gcry_sexp_release(key);
 
     /* Raw scalar multiplication helpers. */
-    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, point));
-    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE448, out, scalar, point));
-    ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, NULL));
+    if (gcry_fips_mode_active()) {
+        /* OpenSSL's FIPS provider has neither X25519 nor X448. */
+        ASSERT_TRUE(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar,
+                                       point) != 0);
+        ASSERT_TRUE(gcry_ecc_mul_point(GCRY_ECC_CURVE448, out, scalar,
+                                       point) != 0);
+    } else {
+        ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, point));
+        ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE448, out, scalar, point));
+        ASSERT_OK(gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, scalar, NULL));
+    }
+
     ASSERT_ERR(GPG_ERR_UNKNOWN_CURVE, gcry_ecc_mul_point(999, out, scalar, point));
     ASSERT_EQ(32, gcry_ecc_get_algo_keylen(GCRY_ECC_CURVE25519));
     ASSERT_EQ(56, gcry_ecc_get_algo_keylen(GCRY_ECC_CURVE448));
@@ -909,44 +945,51 @@ TEST(montgomery_and_degenerate_arithmetic)
     gcry_mpi_t z = gcry_mpi_new(0);
     gcry_mpi_t p;
 
-    /* Curve25519: scalar multiplication does not clamp the scalar. */
-    ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
-    G = gcry_mpi_ec_get_point("g", ctx, 1);
-    gcry_mpi_set_ui(k, 2);
-    gcry_mpi_ec_mul(R, k, G, ctx);
-    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
-    ASSERT_TRUE(mpi_eq_hex(x, "20D342D51873F1B7D9750C687D1571148F3F5CED1E350B"
-                           "5C5CAE469CDD684EFB"));
-    gcry_mpi_set_ui(k, 3);
-    gcry_mpi_ec_mul(R, k, G, ctx);
-    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
-    ASSERT_TRUE(mpi_eq_hex(x, "1C12BC1A6D57ABE645534D91C21BBA64F8824E67621C08"
-                           "59C00A03AFFB713C12"));
-    gcry_mpi_set_ui(k, 7);
-    gcry_mpi_ec_mul(R, k, G, ctx);
-    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
-    ASSERT_TRUE(mpi_eq_hex(x, "0DAF32E7ED8099122B2DFA4C1D8C4A20C0972A1538BF05"
-                           "75338AAE0FE0841828"));
-    /* The RFC 7748 vector with the scalar taken literally (unclamped). */
-    gcry_mpi_release(k);
-    k = hex_mpi("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
-    gcry_mpi_release(x);
-    x = hex_mpi("4c1cabd0a603a9103b35b326ec2466727c5fb124a4c19435db3030586768dbe6");
-    gcry_mpi_point_set(P, x, NULL, GCRYMPI_CONST_ONE);
-    gcry_mpi_ec_mul(R, k, P, ctx);
-    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
-    ASSERT_TRUE(mpi_eq_hex(x, "500384E4C0426C961DF7EE4850C412A9746A56E9721876"
-                           "2A52200FB00F6F285C"));
-    /* Montgomery points are not normalised by get_affine. */
-    gcry_mpi_set_ui(x, 18);
-    gcry_mpi_set_ui(y, 0);
-    gcry_mpi_set_ui(z, 2);
-    gcry_mpi_point_set(P, x, y, z);
-    ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, P, ctx));
-    ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 18));
-    ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, P, ctx));
-    gcry_mpi_point_release(G);
-    gcry_ctx_release(ctx);
+    if (gcry_fips_mode_active()) {
+        /* Curve25519 is not an approved curve. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        ASSERT_NULL(ctx);
+    } else {
+        /* Curve25519: scalar multiplication does not clamp the scalar. */
+        ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        G = gcry_mpi_ec_get_point("g", ctx, 1);
+        gcry_mpi_set_ui(k, 2);
+        gcry_mpi_ec_mul(R, k, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        ASSERT_TRUE(mpi_eq_hex(x, "20D342D51873F1B7D9750C687D1571148F3F5CED1E350B"
+                               "5C5CAE469CDD684EFB"));
+        gcry_mpi_set_ui(k, 3);
+        gcry_mpi_ec_mul(R, k, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        ASSERT_TRUE(mpi_eq_hex(x, "1C12BC1A6D57ABE645534D91C21BBA64F8824E67621C08"
+                               "59C00A03AFFB713C12"));
+        gcry_mpi_set_ui(k, 7);
+        gcry_mpi_ec_mul(R, k, G, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        ASSERT_TRUE(mpi_eq_hex(x, "0DAF32E7ED8099122B2DFA4C1D8C4A20C0972A1538BF05"
+                               "75338AAE0FE0841828"));
+        /* The RFC 7748 vector with the scalar taken literally (unclamped). */
+        gcry_mpi_release(k);
+        k = hex_mpi("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+        gcry_mpi_release(x);
+        x = hex_mpi("4c1cabd0a603a9103b35b326ec2466727c5fb124a4c19435db3030586768dbe6");
+        gcry_mpi_point_set(P, x, NULL, GCRYMPI_CONST_ONE);
+        gcry_mpi_ec_mul(R, k, P, ctx);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, R, ctx));
+        ASSERT_TRUE(mpi_eq_hex(x, "500384E4C0426C961DF7EE4850C412A9746A56E9721876"
+                               "2A52200FB00F6F285C"));
+        /* Montgomery points are not normalised by get_affine. */
+        gcry_mpi_set_ui(x, 18);
+        gcry_mpi_set_ui(y, 0);
+        gcry_mpi_set_ui(z, 2);
+        gcry_mpi_point_set(P, x, y, z);
+        ASSERT_EQ(0, gcry_mpi_ec_get_affine(x, NULL, P, ctx));
+        ASSERT_EQ(0, gcry_mpi_cmp_ui(x, 18));
+        ASSERT_EQ(-1, gcry_mpi_ec_get_affine(x, y, P, ctx));
+        gcry_mpi_point_release(G);
+        gcry_ctx_release(ctx);
+    }
 
     /* Weierstrass corner cases: the point at infinity is no curve point,
      * a zero scalar gives (0, 0, 0), a multiple of infinity is (0, p, 1). */
@@ -1055,6 +1098,18 @@ TEST(montgomery_clamped_scalars)
     gcry_sexp_t ciph = NULL;
     gcry_sexp_t plain = NULL;
     gcry_mpi_t m;
+
+    if (gcry_fips_mode_active()) {
+        /* Neither Montgomery curve is an approved curve. */
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED,
+                   gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
+        ASSERT_ERR(GPG_ERR_NOT_SUPPORTED, gcry_mpi_ec_new(&ctx, NULL, "X448"));
+        ASSERT_NULL(ctx);
+        gcry_mpi_point_release(P);
+        gcry_mpi_point_release(R);
+        gcry_mpi_release(x);
+        return;
+    }
 
     /* Curve25519: Alice's public key and the shared secret with Bob. */
     ASSERT_OK(gcry_mpi_ec_new(&ctx, NULL, "Curve25519"));
