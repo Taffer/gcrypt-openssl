@@ -1355,6 +1355,21 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
         }
     }
 
+    /* OpenSSL's SM4-XTS defaults to the GB/T 17964-2021 tweak schedule;
+     * the reference library uses IEEE 1619 for every cipher. */
+    if (h->mode == GCRY_CIPHER_MODE_XTS && h->algo == GCRY_CIPHER_SM4) {
+        OSSL_PARAM params[2];
+        char ieee[] = "IEEE";
+
+        params[0] = OSSL_PARAM_construct_utf8_string(
+                        OSSL_CIPHER_PARAM_XTS_STANDARD, ieee, 0);
+        params[1] = OSSL_PARAM_construct_end();
+
+        if (!EVP_CIPHER_CTX_set_params(h->ctx, params)) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+    }
+
     if (h->mode == GCRY_CIPHER_MODE_CBC && (h->flags & GCRY_CIPHER_CBC_CTS)) {
         OSSL_PARAM params[2];
         char cs3[] = "CS3";
@@ -2362,8 +2377,12 @@ generic_xts_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out,
     if (tail) {
         unsigned char t2[16];
         unsigned char block[16];
+        unsigned char partial[16];
         size_t j;
 
+        /* Taken now: in place, the partial output written below lands on
+         * top of the partial input. */
+        memcpy(partial, in + 16, tail);
         memcpy(t2, t, 16);
         xts_next_tweak(t2);
 
@@ -2392,10 +2411,7 @@ generic_xts_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out,
          * completed with the partial input and processed with the other
          * tweak to become the full output block. */
         memcpy(out + 16, block, tail);
-
-        for (j = 0; j < tail; j++) {
-            block[j] = in[16 + j];
-        }
+        memcpy(block, partial, tail);
 
         for (j = 0; j < 16; j++) {
             block[j] = (unsigned char)(block[j] ^ t2[j]);
