@@ -12,6 +12,7 @@
 
 #include <gcrypt.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -180,6 +181,42 @@ TEST(control_unsupported)
     /* Cipher handle commands are not global commands. */
     ASSERT_ERR(GPG_ERR_INV_OP, gcry_control(GCRYCTL_SET_CCM_LENGTHS));
     ASSERT_ERR(GPG_ERR_INV_OP, gcry_control(GCRYCTL_SET_TAGLEN));
+}
+
+TEST(control_argument_checks)
+{
+    int type = -1;
+
+    /* Pointer arguments of the commands that take one are checked. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, (int *)NULL));
+    ASSERT_OK(gcry_control(GCRYCTL_GET_CURRENT_RNG_TYPE, &type));
+    ASSERT_TRUE(type > 0);
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_control(GCRYCTL_SET_RANDOM_SEED_FILE, (const char *)NULL));
+    ASSERT_OK(gcry_control(GCRYCTL_SET_RANDOM_SEED_FILE, "/nonexistent"));
+    /* The reference treats a NULL feature name as "nothing to disable". */
+    ASSERT_OK(gcry_control(GCRYCTL_DISABLE_HWF, (const char *)NULL));
+    /* The service indicators already refused NULL names. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION,
+                            (const char *)NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS,
+                            (const char *)NULL));
+    /* The version string and the configuration report accept NULL. */
+    ASSERT_NOT_NULL(gcry_check_version(NULL));
+    {
+        char *all = gcry_get_config(0, NULL);
+
+        ASSERT_NOT_NULL(all);
+        ASSERT_NOT_NULL(strstr(all, "version:"));
+        gcry_free(all);
+        errno = 0;
+        ASSERT_NULL(gcry_get_config(1, NULL));
+        ASSERT_EQ(EINVAL, errno);
+    }
+    gcry_ctx_release(NULL);
 }
 
 TEST(fips_mode_off)
@@ -650,6 +687,7 @@ main(void)
     RUN_TEST(version_parser);
     RUN_TEST(control_noops);
     RUN_TEST(control_unsupported);
+    RUN_TEST(control_argument_checks);
     RUN_TEST(fips_mode_off);
     RUN_TEST(fips_service_indicators);
     RUN_TEST(selftest);

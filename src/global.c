@@ -779,7 +779,10 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_SET_RANDOM_SEED_FILE:
-        (void)va_arg(arg_ptr, const char *);
+        if (!va_arg(arg_ptr, const char *)) {
+            rc = GPG_ERR_INV_ARG;
+        }
+
         break;
 
     case GCRYCTL_UPDATE_RANDOM_SEED_FILE:
@@ -959,7 +962,9 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
     case GCRYCTL_GET_CURRENT_RNG_TYPE: {
         int *ip = va_arg(arg_ptr, int *);
 
-        if (ip) {
+        if (!ip) {
+            rc = GPG_ERR_INV_ARG;
+        } else {
             *ip = _gcry_get_rng_type();
         }
 

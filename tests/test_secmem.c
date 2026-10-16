@@ -330,6 +330,36 @@ TEST(fatal_without_handler_aborts)
     ASSERT_EQ(1000 + SIGABRT, run_child(child_fatal_abort));
 }
 
+static void
+fatal_inv_arg_exit44(void *opaque, int rc, const char *text)
+{
+    (void)opaque;
+
+    if (rc == (int)GPG_ERR_INV_ARG && text && strstr(text, "gcry_xstrdup")) {
+        _exit(44);
+    }
+
+    _exit(45);
+}
+
+static void
+child_xstrdup_null(void)
+{
+    char *s;
+
+    gcry_set_fatalerror_handler(fatal_inv_arg_exit44, NULL);
+    s = gcry_xstrdup(NULL);
+    free(s);
+    _exit(1); /* Unreachable. */
+}
+
+TEST(xstrdup_null_is_fatal)
+{
+    /* The x-functions never return NULL, so a NULL input is reported
+     * through the fatal error handler instead. */
+    ASSERT_EQ(44, run_child(child_xstrdup_null));
+}
+
 int
 main(void)
 {
@@ -344,6 +374,7 @@ main(void)
     RUN_TEST(disable_secmem_in_child);
     RUN_TEST(fatal_handler_called);
     RUN_TEST(fatal_without_handler_aborts);
+    RUN_TEST(xstrdup_null_is_fatal);
     RUN_TEST(outofcore_handler_retries); /* Last: it swaps the allocator. */
     return TEST_RESULT();
 }
