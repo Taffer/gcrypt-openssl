@@ -2315,6 +2315,10 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
         } else if (*s == '%') {
             s++;
 
+            if (!*s) {
+                break; /* A trailing '%' ends the list, as below. */
+            }
+
             if (*s == 'l' && (s[1] == 'u' || s[1] == 'd')) {
                 s++;
             } else if (*s == 'z' && s[1] == 'u') {

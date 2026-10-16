@@ -2693,9 +2693,14 @@ TEST(xts_ciphertext_stealing)
     ASSERT_MEM_EQ(expect, ref, 20);
     gcry_cipher_close(hd);
 
-    /* The native AES-256 path agrees with the construction as well. */
+    /* The native AES-256 path agrees with the construction as well; this
+     * one uses 31 bytes, more than the vectors above initialised. */
     for (i = 0; i < sizeof key; i++) {
         key[i] = (unsigned char)(0x80 | i);
+    }
+
+    for (i = 0; i < sizeof pt; i++) {
+        pt[i] = (unsigned char)(0xa0 + i);
     }
 
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_XTS,
