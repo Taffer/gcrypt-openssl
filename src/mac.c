@@ -84,7 +84,9 @@ static const struct mac_spec mac_specs[] = {
     { GCRY_MAC_CMAC_SM4, "CMAC_SM4", MAC_CMAC, 0, "SM4", 0, 16, 16, 0 },
     { GCRY_MAC_CMAC_ARIA, "CMAC_ARIA", MAC_CMAC, 0, "ARIA", 1, 16, 16, 0 },
 
-    { GCRY_MAC_GMAC_AES, "GMAC_AES", MAC_GMAC, 0, "AES", 1, 16, 16, 1 },
+    /* The reference refuses GMAC in FIPS mode, whatever the provider
+     * offers, so GMAC_AES is not marked approved. */
+    { GCRY_MAC_GMAC_AES, "GMAC_AES", MAC_GMAC, 0, "AES", 1, 16, 16, 0 },
     { GCRY_MAC_GMAC_CAMELLIA, "GMAC_CAMELLIA", MAC_GMAC, 0, NULL, 1, 16, 16, 0 },
     { GCRY_MAC_GMAC_TWOFISH, "GMAC_TWOFISH", MAC_GMAC, 0, NULL, 0, 32, 16, 0 },
     { GCRY_MAC_GMAC_SERPENT, "GMAC_SERPENT", MAC_GMAC, 0, NULL, 0, 32, 16, 0 },
@@ -759,6 +761,17 @@ gcry_mac_ctl(gcry_mac_hd_t h, int cmd, void *buffer, size_t buflen)
 
     switch (cmd) {
     case GCRYCTL_RESET:
+
+        /* A reset forgets the GMAC IV as well, as in the reference: the
+         * next message runs under the all-zero IV unless a new one is
+         * set.  The key stays. */
+        if (h->spec->kind == MAC_GMAC && h->iv_set) {
+            _gcry_free(h->iv);
+            h->iv = NULL;
+            h->ivlen = 0;
+            h->iv_set = 0;
+        }
+
         rc = mac_init_ctx(h);
         break;
 

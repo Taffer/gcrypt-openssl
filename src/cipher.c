@@ -566,6 +566,13 @@ struct gcry_cipher_handle {
     unsigned char lastct[MAX_BLOCKSIZE];
     size_t unused;
 
+    /* CFB: the chaining block whose encryption is the keystream of the
+     * block in progress, and that block's ciphertext so far (CFB_POS
+     * bytes), to resume after a change of direction (cfb_replay). */
+    unsigned char cfb_prev[MAX_BLOCKSIZE];
+    unsigned char cfb_cur[MAX_BLOCKSIZE];
+    size_t cfb_pos;
+
     int allow_weak_key;
     int finalize;
 
@@ -605,6 +612,14 @@ struct gcry_cipher_handle {
     OCB128_CONTEXT *ocb;
     int ocb_native;
     int ocb_nonce_applied;        /* Nonce applied for this message. */
+    unsigned char ocb_aadbuf[16]; /* OCB128 driver: partial AAD block. */
+    size_t ocb_aadbuflen;
+
+    /* GCM in FIPS mode: once the handle has taken a caller supplied IV,
+     * or started a message without any, it may no longer encrypt or hand
+     * out a tag; only IVs from gcry_cipher_geniv() qualify.  The lock
+     * holds for the life of the handle, as in the reference. */
+    int gcm_fips_locked;
 
     /* XTS for variants OpenSSL has no native cipher for (AES-192, other
      * 128 bit block ciphers): the XTS128 driver over two ECB contexts. */
@@ -647,6 +662,25 @@ static int
 is_single_shot_mode(int mode)
 {
     return mode == GCRY_CIPHER_MODE_SIV || mode == GCRY_CIPHER_MODE_GCM_SIV;
+}
+
+/* Keystream modes: the same function in both directions.  They always
+ * run as encryption so that the stream continues when the caller turns
+ * from gcry_cipher_encrypt() to gcry_cipher_decrypt() or back, as it does
+ * in the reference library.  CCM is here for its CTR data path. */
+static int
+is_direction_independent_mode(int mode)
+{
+    switch (mode) {
+    case GCRY_CIPHER_MODE_STREAM:
+    case GCRY_CIPHER_MODE_OFB:
+    case GCRY_CIPHER_MODE_CTR:
+    case GCRY_CIPHER_MODE_CCM:
+        return 1;
+
+    default:
+        return 0;
+    }
 }
 
 static void *
@@ -768,6 +802,7 @@ reset_message_state(gcry_cipher_hd_t h)
 
     memset(h->lastct, 0, sizeof h->lastct);
     h->unused = 0;
+    h->cfb_pos = 0;
     h->finalize = 0;
 
     if (h->aad || h->aad_chunks || h->aad_done) {
@@ -788,6 +823,7 @@ reset_message_state(gcry_cipher_hd_t h)
     h->ccm_mac_started = 0;
     h->ccm_mac_buflen = 0;
     h->ocb_nonce_applied = 0;
+    h->ocb_aadbuflen = 0;
     memset(h->wrap_plen, 0, sizeof h->wrap_plen);
 
     if (h->mode == GCRY_CIPHER_MODE_OCB) {
@@ -1240,6 +1276,81 @@ flush_aad(gcry_cipher_hd_t h, EVP_CIPHER_CTX *ctx)
     return 0;
 }
 
+/* Follow LEN bytes of CFB ciphertext CT: remember the chaining block of
+ * the block in progress and that block's ciphertext so far.  Only the
+ * bytes of the block in progress are copied. */
+static void
+cfb_track(gcry_cipher_hd_t h, const unsigned char *ct, size_t len)
+{
+    size_t bs = h->spec->blocksize;
+    size_t first = bs - h->cfb_pos; /* Completes the block in progress. */
+    size_t last;                    /* Just past the last whole block. */
+
+    if (len < first) {
+        memcpy(h->cfb_cur + h->cfb_pos, ct, len);
+        h->cfb_pos += len;
+        return;
+    }
+
+    last = first + ((len - first) / bs) * bs;
+
+    if (last >= bs) {
+        memcpy(h->cfb_prev, ct + last - bs, bs);
+    } else {
+        memcpy(h->cfb_cur + h->cfb_pos, ct, first);
+        memcpy(h->cfb_prev, h->cfb_cur, bs);
+    }
+
+    h->cfb_pos = len - last;
+    memcpy(h->cfb_cur, ct + last, h->cfb_pos);
+}
+
+/* Bring a CFB context just initialised in direction ENC with the chaining
+ * block of the block in progress to the N bytes already processed of
+ * that block, by replaying their ciphertext: as the input when
+ * decrypting, as the plaintext that yields it when encrypting.  Either
+ * way the context ends up holding the ciphertext as the next chaining
+ * input, which is what the reference library's CFB state holds. */
+static gcry_err_code_t
+cfb_replay(gcry_cipher_hd_t h, int enc, size_t n)
+{
+    unsigned char ks[MAX_BLOCKSIZE];
+    unsigned char in[MAX_BLOCKSIZE];
+    unsigned char out[MAX_BLOCKSIZE];
+    gcry_err_code_t rc = 0;
+    int outl = 0;
+    size_t i;
+
+    if (enc) {
+        /* The keystream of the block is the chaining block encrypted. */
+        rc = init_ecb_ctx(h, &h->ecb_enc, &h->ecb_enc_keyed, 1);
+
+        if (rc) {
+            return rc;
+        }
+
+        if (!EVP_EncryptUpdate(h->ecb_enc, ks, &outl, h->cfb_prev,
+                               (int)h->spec->blocksize)) {
+            return _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+        }
+
+        for (i = 0; i < n; i++) {
+            in[i] = (unsigned char)(h->cfb_cur[i] ^ ks[i]);
+        }
+    } else {
+        memcpy(in, h->cfb_cur, n);
+    }
+
+    if (!EVP_CipherUpdate(h->ctx, out, &outl, in, (int)n)) {
+        rc = _gcry_err_from_openssl(GPG_ERR_INTERNAL);
+    }
+
+    _gcry_wipememory(ks, sizeof ks);
+    _gcry_wipememory(in, sizeof in);
+    _gcry_wipememory(out, sizeof out);
+    return rc;
+}
+
 /* Initialise the main context for direction ENC with the current key and
  * IV unless that already happened. */
 static gcry_err_code_t
@@ -1251,11 +1362,15 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
     size_t ivlen;
     int chained = h->mode == GCRY_CIPHER_MODE_CBC
                   || h->mode == GCRY_CIPHER_MODE_CFB
-                  || h->mode == GCRY_CIPHER_MODE_CFB8
-                  || h->mode == GCRY_CIPHER_MODE_OFB;
+                  || h->mode == GCRY_CIPHER_MODE_CFB8;
+    size_t replay = 0;
 
     if (!h->have_key) {
         return GPG_ERR_MISSING_KEY;
+    }
+
+    if (is_direction_independent_mode(h->mode)) {
+        enc = 1;
     }
 
     if (h->ctx_ready && h->enc == enc) {
@@ -1264,9 +1379,20 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
 
     if (h->ctx_ready && chained && !(h->flags & GCRY_CIPHER_CBC_CTS)) {
         /* Switching direction in the middle of a message: carry the
-         * chaining state over. */
-        if (EVP_CIPHER_CTX_get_updated_iv(h->ctx, h->iv,
-                                          h->spec->blocksize)) {
+         * chaining state over.  On a block boundary that is the last
+         * ciphertext block, which OpenSSL reports as the updated IV.
+         * Inside a block (CFB) OpenSSL's state cannot be restored: its
+         * provider resets the block offset at every initialisation and
+         * refuses to set it (the CFB ciphers report a block size of
+         * one), so the context restarts from the chaining block of the
+         * block in progress and replays that block once initialised. */
+        if (h->mode == GCRY_CIPHER_MODE_CFB && h->cfb_pos) {
+            replay = h->cfb_pos;
+            memcpy(h->iv, h->cfb_prev, h->spec->blocksize);
+            h->ivlen = h->spec->blocksize;
+            h->have_iv = 1;
+        } else if (EVP_CIPHER_CTX_get_updated_iv(h->ctx, h->iv,
+                                                 h->spec->blocksize)) {
             h->ivlen = h->spec->blocksize;
             h->have_iv = 1;
         } else {
@@ -1303,9 +1429,12 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
     /* A context that still holds this key's schedule for this direction
      * only needs the new IV; OpenSSL keeps the key when none is given.
      * The single shot modes and key wrap carry per-message parameters
-     * through their initialisation and always start afresh. */
+     * through their initialisation and always start afresh, and so must
+     * a stream cipher without an IV (ARCFOUR), whose keystream only the
+     * key schedule can restart. */
     if (h->ctx_keyed && h->ctx_enc == enc && !is_single_shot_mode(h->mode)
-        && h->mode != GCRY_CIPHER_MODE_AESWRAP) {
+        && h->mode != GCRY_CIPHER_MODE_AESWRAP
+        && !(h->mode == GCRY_CIPHER_MODE_STREAM && !ivlen)) {
         if ((h->mode == GCRY_CIPHER_MODE_GCM
              || h->mode == GCRY_CIPHER_MODE_POLY1305)
             && ivlen != (size_t)EVP_CIPHER_CTX_get_iv_length(h->ctx)
@@ -1426,6 +1555,21 @@ ensure_ctx(gcry_cipher_hd_t h, int enc)
 ready:
     h->ctx_ready = 1;
     h->enc = enc;
+
+    if (h->mode == GCRY_CIPHER_MODE_CFB) {
+        if (replay) {
+            rc = cfb_replay(h, enc, replay);
+
+            if (rc) {
+                h->ctx_ready = 0;
+                return rc;
+            }
+        } else {
+            /* A fresh start: the IV is the first chaining block. */
+            memcpy(h->cfb_prev, iv, h->spec->blocksize);
+            h->cfb_pos = 0;
+        }
+    }
 
     if (is_aead_mode(h->mode) && h->mode != GCRY_CIPHER_MODE_CCM) {
         rc = flush_aad(h, h->ctx);
@@ -1774,6 +1918,24 @@ check_keylen(gcry_cipher_hd_t h, size_t keylen,
     return 0;
 }
 
+/* A refused key leaves the handle without one: the key it had before is
+ * wiped and the next data call reports GPG_ERR_MISSING_KEY, as it does in
+ * the reference library after a bad key length or a weak DES key. */
+static gcry_err_code_t
+setkey_failed(gcry_cipher_hd_t h, gcry_err_code_t rc)
+{
+    _gcry_wipememory(h->key, sizeof h->key);
+    h->keylen = 0;
+    h->have_key = 0;
+    h->ctx_ready = 0;
+    h->ctx_keyed = 0;
+    h->ecb_enc_keyed = 0;
+    h->ecb_dec_keyed = 0;
+    h->ecb2_enc_keyed = 0;
+    h->ccm_mac_keyed = 0;
+    return rc;
+}
+
 static gcry_err_code_t
 cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
 {
@@ -1782,12 +1944,12 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
     int weak = 0;
 
     if (rc) {
-        return rc;
+        return setkey_failed(h, rc);
     }
 
     /* RFC 8452 defines AES-GCM-SIV for 128 and 256 bit keys only. */
     if (h->mode == GCRY_CIPHER_MODE_GCM_SIV && keylen != 16 && keylen != 32) {
-        return GPG_ERR_INV_KEYLEN;
+        return setkey_failed(h, GPG_ERR_INV_KEYLEN);
     }
 
     if (ospec != h->ospec) {
@@ -1797,7 +1959,7 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
         rc = fetch_mode_ciphers(h);
 
         if (rc) {
-            return rc;
+            return setkey_failed(h, rc);
         }
     }
 
@@ -1812,8 +1974,7 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
         }
 
         if (weak && !h->allow_weak_key) {
-            h->have_key = 0;
-            return GPG_ERR_WEAK_KEY;
+            return setkey_failed(h, GPG_ERR_WEAK_KEY);
         }
     }
 
@@ -1823,7 +1984,7 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
     if (h->mode == GCRY_CIPHER_MODE_XTS && _gcry_fips_mode()
         && !CRYPTO_memcmp(key, (const unsigned char *)key + keylen / 2,
                           keylen / 2)) {
-        return GPG_ERR_WEAK_KEY;
+        return setkey_failed(h, GPG_ERR_WEAK_KEY);
     }
 
     _gcry_wipememory(h->key, sizeof h->key);
@@ -1888,8 +2049,7 @@ cipher_setkey(gcry_cipher_hd_t h, const void *key, size_t keylen)
     }
 
     if (rc) {
-        h->have_key = 0;
-        return rc;
+        return setkey_failed(h, rc);
     }
 
     /* A new key starts a new message; the OCB tag length is a handle
@@ -1919,8 +2079,12 @@ gcry_cipher_setkey(gcry_cipher_hd_t hd, const void *key, size_t keylen)
     return GCRY_ERR(cipher_setkey(hd, key, keylen));
 }
 
+/* Set the IV for the next message.  GENERATED says it comes from
+ * gcry_cipher_geniv() rather than from the caller, which is what FIPS
+ * mode requires for GCM encryption. */
 static gcry_err_code_t
-cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
+cipher_setiv_common(gcry_cipher_hd_t h, const void *iv, size_t ivlen,
+                    int generated)
 {
     size_t bs = h->spec->blocksize;
     const unsigned char *ivb = iv;
@@ -1928,7 +2092,12 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
     int allow;
     size_t taglen;
     unsigned char dectag[16];
+    unsigned char ctr[MAX_BLOCKSIZE];
     int dectag_set;
+
+    if (h->mode == GCRY_CIPHER_MODE_GCM && !generated && _gcry_fips_mode()) {
+        h->gcm_fips_locked = 1;
+    }
 
     switch (h->mode) {
     case GCRY_CIPHER_MODE_GCM:
@@ -2053,13 +2222,30 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
         break;
     }
 
-    /* A new IV starts a new message; the key and settings stay. */
+    /* A new IV starts a new message; the key and settings stay.  So does
+     * the CTR counter: only gcry_cipher_setctr() and GCRYCTL_RESET touch
+     * it, as in the reference, where a new IV merely drops the unused
+     * keystream.  A native CTR context that has run holds the current
+     * counter block, which is taken back before the context is reset. */
+    if (h->mode == GCRY_CIPHER_MODE_CTR) {
+        if (!h->generic_ctr && h->ctx_ready
+            && !EVP_CIPHER_CTX_get_updated_iv(h->ctx, h->ctr, bs)) {
+            ERR_clear_error();
+        }
+
+        memcpy(ctr, h->ctr, sizeof ctr);
+    }
+
     allow = h->allow_weak_key;
     taglen = h->taglen;
     dectag_set = h->dectag_set;
     memcpy(dectag, h->dectag, sizeof dectag);
     reset_message_state(h);
     h->allow_weak_key = allow;
+
+    if (h->mode == GCRY_CIPHER_MODE_CTR) {
+        memcpy(h->ctr, ctr, sizeof ctr);
+    }
 
     if (h->mode == GCRY_CIPHER_MODE_OCB) {
         h->taglen = taglen;
@@ -2086,6 +2272,12 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
     }
 
     return 0;
+}
+
+static gcry_err_code_t
+cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
+{
+    return cipher_setiv_common(h, iv, ivlen, 0);
 }
 
 gcry_error_t
@@ -2200,11 +2392,15 @@ generic_ctr_crypt(gcry_cipher_hd_t h, unsigned char *out,
 /* Encrypt / decrypt                                                   */
 /* ------------------------------------------------------------------ */
 
-/* Remember the last block of ciphertext for CFB resynchronisation. */
+/* Follow the CFB ciphertext: the block in progress for direction changes
+ * (cfb_track) and, with GCRY_CIPHER_ENABLE_SYNC, the last block for
+ * OpenPGP resynchronisation. */
 static void
 track_ciphertext(gcry_cipher_hd_t h, const unsigned char *ct, size_t len)
 {
     size_t bs = h->spec->blocksize;
+
+    cfb_track(h, ct, len);
 
     if (!(h->flags & GCRY_CIPHER_ENABLE_SYNC)) {
         return;
@@ -2236,6 +2432,10 @@ do_cbc_mac(gcry_cipher_hd_t h, unsigned char *out, size_t outsize,
         return GPG_ERR_INV_LENGTH;
     }
 
+    if (!inlen) {
+        return 0; /* Nothing to MAC: the output is left alone. */
+    }
+
     rc = ensure_ctx(h, 1);
 
     if (rc) {
@@ -2262,6 +2462,9 @@ do_cts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
        const unsigned char *in, size_t inlen)
 {
     size_t bs = h->spec->blocksize;
+    unsigned char carry[MAX_BLOCKSIZE];
+    size_t nfull;
+    size_t pos;
     gcry_err_code_t rc;
 
     if (outsize < inlen) {
@@ -2276,6 +2479,25 @@ do_cts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
         return 0;
     }
 
+    /* Later calls chain from the last block the CBC chain produced, C_n,
+     * which ciphertext stealing puts before the final partial block, or
+     * swaps with the block before it when the length is a multiple of
+     * the block size.  That is the block the reference carries when
+     * encrypting; its decryption carries another, so two chained calls
+     * do not round trip there, and here they do.  When decrypting in
+     * place the block is taken before the output overwrites it. */
+    nfull = inlen / bs;
+
+    if (inlen % bs) {
+        pos = (nfull - 1) * bs;
+    } else {
+        pos = nfull >= 2 ? (nfull - 2) * bs : 0;
+    }
+
+    if (!enc) {
+        memcpy(carry, in + pos, bs);
+    }
+
     /* OpenSSL's CTS cipher processes one message per initialisation. */
     h->ctx_ready = 0;
     rc = ensure_ctx(h, enc);
@@ -2286,7 +2508,19 @@ do_cts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 
     rc = evp_update(h->ctx, out, in, inlen);
     h->ctx_ready = 0;
-    return rc;
+
+    if (rc) {
+        return rc;
+    }
+
+    if (enc) {
+        memcpy(carry, out + pos, bs);
+    }
+
+    memcpy(h->iv, carry, bs);
+    h->ivlen = bs;
+    h->have_iv = 1;
+    return 0;
 }
 
 /* XTS (IEEE 1619) composed from the ECB contexts for the variants OpenSSL
@@ -2430,6 +2664,30 @@ generic_xts_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out,
     return 0;
 }
 
+/* Each call processes one data unit; afterwards the data unit sequence
+ * number in the tweak, a 128 bit little endian integer, advances by one,
+ * as it does in the reference library, so that consecutive calls walk
+ * through consecutive units.  gcry_cipher_setiv() starts over. */
+static void
+xts_advance_tweak(gcry_cipher_hd_t h)
+{
+    size_t i;
+
+    if (h->ivlen < 16) {
+        /* effective_iv() zero pads a short tweak; keep the padded form. */
+        memset(h->iv + h->ivlen, 0, 16 - h->ivlen);
+        h->ivlen = 16;
+    }
+
+    for (i = 0; i < 16; i++) {
+        if (++h->iv[i] != 0) {
+            break;
+        }
+    }
+
+    h->have_iv = 1;
+}
+
 static gcry_err_code_t
 do_xts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
        const unsigned char *in, size_t inlen)
@@ -2445,18 +2703,22 @@ do_xts(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
     }
 
     if (h->xts_generic) {
-        return generic_xts_crypt(h, enc, out, in, inlen);
+        rc = generic_xts_crypt(h, enc, out, in, inlen);
+    } else {
+        h->ctx_ready = 0; /* One data unit per call, from the tweak. */
+        rc = ensure_ctx(h, enc);
+
+        if (!rc) {
+            rc = evp_update(h->ctx, out, in, inlen);
+        }
+
+        h->ctx_ready = 0;
     }
 
-    h->ctx_ready = 0; /* One data unit per call, always from the tweak. */
-    rc = ensure_ctx(h, enc);
-
-    if (rc) {
-        return rc;
+    if (!rc) {
+        xts_advance_tweak(h);
     }
 
-    rc = evp_update(h->ctx, out, in, inlen);
-    h->ctx_ready = 0;
     return rc;
 }
 
@@ -2671,6 +2933,26 @@ gcm_finish_evp_decrypt(gcry_cipher_hd_t h)
     return 0;
 }
 
+/* FIPS mode allows GCM encryption only under an IV the library generated
+ * (gcry_cipher_geniv()).  A handle that took a caller supplied IV, or
+ * that starts a message without any IV, is locked for encryption and for
+ * handing out a tag (part of encrypting) for the rest of its life; it
+ * still decrypts and verifies.  ENCRYPTING says which side asks.  This
+ * mirrors the reference library, including the lock surviving a reset. */
+static gcry_err_code_t
+gcm_fips_gate(gcry_cipher_hd_t h, int encrypting)
+{
+    if (h->mode != GCRY_CIPHER_MODE_GCM || !_gcry_fips_mode()) {
+        return 0;
+    }
+
+    if (!h->have_iv) {
+        h->gcm_fips_locked = 1;
+    }
+
+    return (encrypting && h->gcm_fips_locked) ? GPG_ERR_INV_STATE : 0;
+}
+
 /* Compute the tag of a GCM message: by flipping the context when
  * decrypting, from the EVP context directly otherwise. */
 static gcry_err_code_t
@@ -2708,6 +2990,12 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 
     if (h->data_started && h->enc != enc) {
         return GPG_ERR_INV_STATE; /* Cannot turn around mid-message. */
+    }
+
+    rc = gcm_fips_gate(h, enc);
+
+    if (rc) {
+        return rc;
     }
 
     if (h->mode == GCRY_CIPHER_MODE_GCM && !enc && !gcm_flip_supported()) {
@@ -3005,6 +3293,17 @@ do_ccm_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
         }
     }
 
+    /* The MAC covers the plaintext: when encrypting it is fed before CTR
+     * runs, since an in place call overwrites the input; when decrypting
+     * the plaintext is the output. */
+    if (enc) {
+        rc = ccm_mac_feed(h, in, inlen);
+
+        if (rc) {
+            return rc;
+        }
+    }
+
     if (h->generic_ctr) {
         rc = generic_ctr_crypt(h, out, in, inlen);
     } else {
@@ -3020,7 +3319,7 @@ do_ccm_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
     }
 
     h->ccm_processed += inlen;
-    return ccm_mac_feed(h, enc ? in : out, inlen);
+    return enc ? 0 : ccm_mac_feed(h, out, inlen);
 }
 
 /* Finish the CBC-MAC: pad the last block and XOR the result with the
@@ -3292,6 +3591,74 @@ ocb_apply_nonce(gcry_cipher_hd_t h)
     return 0;
 }
 
+/* Associated data for the OCB128 driver, which closes its AAD hash at
+ * the first partial block it sees: whole blocks go in as they complete,
+ * a trailing partial block waits in the handle until the tag is computed
+ * (ocb_generic_flush_aad), so that the chunking of the AAD does not
+ * change the tag, as in the reference library. */
+static gcry_err_code_t
+ocb_generic_aad(gcry_cipher_hd_t h, const unsigned char *abuf,
+                size_t abuflen)
+{
+    if (h->ocb_aadbuflen) {
+        size_t n = 16 - h->ocb_aadbuflen;
+
+        if (n > abuflen) {
+            n = abuflen;
+        }
+
+        memcpy(h->ocb_aadbuf + h->ocb_aadbuflen, abuf, n);
+        h->ocb_aadbuflen += n;
+        abuf += n;
+        abuflen -= n;
+
+        if (h->ocb_aadbuflen < 16) {
+            return 0;
+        }
+
+        if (!CRYPTO_ocb128_aad(h->ocb, h->ocb_aadbuf, 16)) {
+            ERR_clear_error();
+            return GPG_ERR_INTERNAL;
+        }
+
+        h->ocb_aadbuflen = 0;
+    }
+
+    if (abuflen >= 16) {
+        size_t whole = abuflen & ~(size_t)15;
+
+        if (!CRYPTO_ocb128_aad(h->ocb, abuf, whole)) {
+            ERR_clear_error();
+            return GPG_ERR_INTERNAL;
+        }
+
+        abuf += whole;
+        abuflen -= whole;
+    }
+
+    if (abuflen) {
+        memcpy(h->ocb_aadbuf, abuf, abuflen);
+        h->ocb_aadbuflen = abuflen;
+    }
+
+    return 0;
+}
+
+static gcry_err_code_t
+ocb_generic_flush_aad(gcry_cipher_hd_t h)
+{
+    if (h->ocb_aadbuflen) {
+        if (!CRYPTO_ocb128_aad(h->ocb, h->ocb_aadbuf, h->ocb_aadbuflen)) {
+            ERR_clear_error();
+            return GPG_ERR_INTERNAL;
+        }
+
+        h->ocb_aadbuflen = 0;
+    }
+
+    return 0;
+}
+
 static gcry_err_code_t
 do_ocb_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
              const unsigned char *in, size_t inlen)
@@ -3340,8 +3707,32 @@ do_ocb_crypt(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
     h->enc = enc;
 
     if (inlen) {
-        int ok = enc ? CRYPTO_ocb128_encrypt(h->ocb, in, out, inlen)
-                 : CRYPTO_ocb128_decrypt(h->ocb, in, out, inlen);
+        size_t tail = inlen % 16;
+        size_t whole = inlen - tail;
+        unsigned char partial[16];
+        int ok = 1;
+
+        /* The driver reads a final partial block again after writing its
+         * output, so an in place encryption would checksum ciphertext:
+         * the partial input is taken aside and handed over separately. */
+        if (tail) {
+            memcpy(partial, in + whole, tail);
+        }
+
+        if (whole) {
+            ok = enc ? CRYPTO_ocb128_encrypt(h->ocb, in, out, whole)
+                 : CRYPTO_ocb128_decrypt(h->ocb, in, out, whole);
+        }
+
+        if (ok && tail) {
+            ok = enc ? CRYPTO_ocb128_encrypt(h->ocb, partial, out + whole,
+                                             tail)
+                 : CRYPTO_ocb128_decrypt(h->ocb, partial, out + whole, tail);
+        }
+
+        if (tail) {
+            _gcry_wipememory(partial, sizeof partial);
+        }
 
         if (!ok) {
             ERR_clear_error();
@@ -3523,6 +3914,10 @@ cipher_authenticate(gcry_cipher_hd_t h, const void *abuf, size_t abuflen)
             return GPG_ERR_INV_STATE;
         }
 
+        /* Data before any IV runs under the implicit zero IV, which in
+         * FIPS mode locks the handle for encryption like a caller IV. */
+        (void)gcm_fips_gate(h, 0);
+
         if (h->ctx_ready) {
             return evp_update(h->ctx, NULL, abuf, abuflen);
         }
@@ -3576,7 +3971,10 @@ cipher_authenticate(gcry_cipher_hd_t h, const void *abuf, size_t abuflen)
                              abuflen);
 
     case GCRY_CIPHER_MODE_OCB:
-        if (h->tag_ready) {
+
+        /* The nonce comes first: data given before it would otherwise be
+         * dropped when the nonce arrives.  The reference refuses it too. */
+        if (h->tag_ready || !h->have_iv) {
             return GPG_ERR_INV_STATE;
         }
 
@@ -3598,9 +3996,10 @@ cipher_authenticate(gcry_cipher_hd_t h, const void *abuf, size_t abuflen)
             return rc;
         }
 
-        if (abuflen && !CRYPTO_ocb128_aad(h->ocb, abuf, abuflen)) {
-            ERR_clear_error();
-            return GPG_ERR_INTERNAL;
+        rc = ocb_generic_aad(h, abuf, abuflen);
+
+        if (rc) {
+            return rc;
         }
 
         h->aad_done = 1; /* Marks that AAD went into the OCB state. */
@@ -3792,7 +4191,11 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
             return GPG_ERR_INV_LENGTH;
         }
 
-        rc = gcm_finish(h);
+        rc = gcm_fips_gate(h, 1);
+
+        if (!rc) {
+            rc = gcm_finish(h);
+        }
 
         if (rc) {
             return rc;
@@ -3886,6 +4289,10 @@ cipher_gettag(gcry_cipher_hd_t h, void *outtag, size_t taglen)
 
         rc = ocb_apply_nonce(h);
 
+        if (!rc) {
+            rc = ocb_generic_flush_aad(h);
+        }
+
         if (rc) {
             return rc;
         }
@@ -3934,7 +4341,11 @@ cipher_checktag(gcry_cipher_hd_t h, const void *intag, size_t taglen)
             return taglen > 16 ? GPG_ERR_CHECKSUM : GPG_ERR_INV_LENGTH;
         }
 
-        rc = gcm_finish(h);
+        rc = gcm_fips_gate(h, 0); /* Verifying is allowed; this locks. */
+
+        if (!rc) {
+            rc = gcm_finish(h);
+        }
 
         if (rc) {
             return rc;
@@ -4053,6 +4464,10 @@ cipher_checktag(gcry_cipher_hd_t h, const void *intag, size_t taglen)
 
         rc = ocb_apply_nonce(h);
 
+        if (!rc) {
+            rc = ocb_generic_flush_aad(h);
+        }
+
         if (rc) {
             return rc;
         }
@@ -4102,7 +4517,9 @@ gcry_cipher_setup_geniv(gcry_cipher_hd_t hd, int method, const void *fixed_iv,
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
-    if (fixed_ivlen + dyn_ivlen > MAX_BLOCKSIZE) {
+    /* Each part on its own first: the sum could wrap. */
+    if (fixed_ivlen > MAX_BLOCKSIZE || dyn_ivlen > MAX_BLOCKSIZE
+        || fixed_ivlen + dyn_ivlen > MAX_BLOCKSIZE) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
@@ -4148,7 +4565,7 @@ gcry_cipher_geniv(gcry_cipher_hd_t hd, void *iv, size_t ivlen)
 
     memcpy(p, hd->geniv_fixed, hd->geniv_fixedlen);
     memcpy(p + hd->geniv_fixedlen, hd->geniv_dyn, hd->geniv_dynlen);
-    rc = cipher_setiv(hd, iv, ivlen);
+    rc = cipher_setiv_common(hd, iv, ivlen, 1);
 
     for (i = hd->geniv_dynlen; i > 0; i--) {
         if (++hd->geniv_dyn[i - 1] != 0) {
@@ -4200,9 +4617,14 @@ ccm_set_lengths(gcry_cipher_hd_t h, unsigned long long encryptlen,
         return GPG_ERR_INV_STATE;
     }
 
-    /* A message longer than the L byte length field can encode is taken
-     * as the reference library takes it: the length is truncated in B_0. */
-    (void)lfield;
+    /* The L byte length field of B_0 must hold the message length.  The
+     * reference truncates a longer one, so its tag covers a wrong length
+     * and its counter runs into the nonce; here it is refused.  Within
+     * the limit the data counter, which starts at one and advances once
+     * per block, stays below 2^(8L) and never carries into the nonce. */
+    if (lfield < 8 && encryptlen >= (1ULL << (8 * lfield))) {
+        return GPG_ERR_INV_LENGTH;
+    }
 
     h->taglen = (size_t)taglen;
     h->ccm_encryptlen = encryptlen;
