@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <errno.h>
 #include <stdlib.h>
 
 #include "test_common.h"
@@ -1254,10 +1255,123 @@ TEST(extract_param_edges)
     gcry_sexp_release(s);
 }
 
+TEST(argument_checks)
+{
+    gcry_sexp_t s = (gcry_sexp_t)1;
+    gcry_sexp_t list = NULL;
+    gcry_mpi_t m = NULL;
+    gcry_error_t err = 0;
+    size_t erroff = 99;
+    size_t n = 99;
+    char buf[32];
+    int one = 1;
+    const char *str = "x";
+    void *args[2];
+
+    /* The builders refuse a NULL format and clear the result. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(&s, NULL, NULL));
+    ASSERT_NULL(s);
+    s = (gcry_sexp_t)1;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build_array(&s, NULL, NULL, args));
+    ASSERT_NULL(s);
+    s = (gcry_sexp_t)1;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build_array(&s, NULL, "(a %d)",
+                                                      NULL));
+    ASSERT_NULL(s);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build_array(NULL, NULL, "(a)", args));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build(NULL, NULL, "(a)"));
+    /* A NULL entry in the argument array is reported at its directive. */
+    args[0] = &one;
+    args[1] = NULL;
+    s = (gcry_sexp_t)1;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_build_array(&s, &erroff, "(a %d %s)",
+                                                      args));
+    ASSERT_NULL(s);
+    ASSERT_EQ(7, erroff); /* The offset of the directive letter. */
+    args[1] = &str;
+    ASSERT_OK(gcry_sexp_build_array(&s, NULL, "(a %d %s)", args));
+    ASSERT_EQ(3, gcry_sexp_length(s));
+
+    /* Token searches need a token. */
+    ASSERT_NULL(gcry_sexp_find_token(s, NULL, 0));
+    ASSERT_NULL(gcry_sexp_find_token(s, NULL, 3));
+
+    /* The copying accessors report a missing list or a bad index via
+     * errno; a plain miss leaves errno alone. */
+    errno = 0;
+    ASSERT_NULL(gcry_sexp_nth_buffer(NULL, 0, &n));
+    ASSERT_EQ(EINVAL, errno);
+    ASSERT_EQ(0, n);
+    errno = 0;
+    n = 99;
+    ASSERT_NULL(gcry_sexp_nth_buffer(s, -1, &n));
+    ASSERT_EQ(EINVAL, errno);
+    ASSERT_EQ(0, n);
+    errno = 0;
+    ASSERT_NULL(gcry_sexp_nth_buffer(s, 7, NULL));
+    ASSERT_EQ(0, errno);
+    errno = 0;
+    ASSERT_NULL(gcry_sexp_nth_string(NULL, 0));
+    ASSERT_EQ(EINVAL, errno);
+    errno = 0;
+    ASSERT_NULL(gcry_sexp_nth_string(s, -1));
+    ASSERT_EQ(EINVAL, errno);
+    errno = 0;
+    ASSERT_NULL(gcry_sexp_nth_string(s, 7));
+    ASSERT_EQ(0, errno);
+    ASSERT_NULL(gcry_sexp_nth_data(NULL, 0, NULL));
+    ASSERT_NULL(gcry_sexp_nth_data(s, -1, NULL));
+    ASSERT_NULL(gcry_sexp_nth_mpi(NULL, 0, GCRYMPI_FMT_USG));
+    ASSERT_NULL(gcry_sexp_nth_mpi(s, -1, GCRYMPI_FMT_USG));
+    ASSERT_NULL(gcry_sexp_nth_mpi(s, 1, 999));
+
+    /* The printer refuses a NULL buffer with a length and unknown modes;
+     * a NULL buffer with length zero still measures. */
+    ASSERT_EQ(0, gcry_sexp_sprint(s, GCRYSEXP_FMT_CANON, NULL, 10));
+    ASSERT_EQ(0, gcry_sexp_sprint(s, -1, buf, sizeof buf));
+    ASSERT_EQ(0, gcry_sexp_sprint(s, 4, buf, sizeof buf));
+    ASSERT_EQ(0, gcry_sexp_sprint(s, 4, NULL, 0));
+    ASSERT_TRUE(gcry_sexp_sprint(s, GCRYSEXP_FMT_CANON, NULL, 0) > 0);
+    ASSERT_TRUE(gcry_sexp_sprint(s, GCRYSEXP_FMT_BASE64, NULL, 0) > 0);
+
+    /* canon_len: NULL with a length is a caller bug, NULL alone is empty. */
+    erroff = 99;
+    ASSERT_EQ(0, gcry_sexp_canon_len(NULL, 5, &erroff, &err));
+    ASSERT_ERR(GPG_ERR_INV_ARG, err);
+    ASSERT_EQ(0, erroff);
+    err = 1;
+    ASSERT_EQ(0, gcry_sexp_canon_len(NULL, 0, NULL, &err));
+    ASSERT_OK(err);
+
+    /* extract_param needs a parameter list; a NULL path is "the top". */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_extract_param(s, NULL, NULL, &m,
+                                                        NULL));
+    ASSERT_NULL(m);
+
+    /* The scanner's NULL buffer check also covers a zero length. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_sscan(&list, NULL, NULL, 5));
+    ASSERT_NULL(list);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_new(&list, NULL, 5, 1));
+    ASSERT_NULL(list);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_new(&list, "(a)", 3, 2));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_sexp_create(NULL, buf, 0, 0, NULL));
+
+    /* The list constructors treat NULL as the empty list. */
+    ASSERT_NULL(gcry_sexp_cons(NULL, NULL));
+    ASSERT_NULL(gcry_sexp_alist(NULL));
+    ASSERT_NULL(gcry_sexp_append(NULL, NULL));
+    ASSERT_NULL(gcry_sexp_prepend(NULL, NULL));
+    ASSERT_NULL(gcry_sexp_cadr(NULL));
+    gcry_sexp_release(NULL);
+
+    gcry_sexp_release(s);
+}
+
 int
 main(void)
 {
     gcry_check_version(NULL);
+    RUN_TEST(argument_checks);
     RUN_TEST(scan_tokens_and_canon_print);
     RUN_TEST(scan_hex_quoted_base64);
     RUN_TEST(scan_errors);

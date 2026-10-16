@@ -207,6 +207,10 @@ gcry_log_debug(const char *fmt, ...)
 {
     va_list ap;
 
+    if (!fmt) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_log_debug: NULL argument");
+    }
+
     va_start(ap, fmt);
     _gcry_logv(GCRY_LOG_DEBUG, fmt, ap);
     va_end(ap);

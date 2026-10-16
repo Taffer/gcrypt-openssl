@@ -527,6 +527,8 @@ do_vsexp_sscan(gcry_sexp_t *retsexp, size_t *erroff, const char *buffer,
     do {                                                          \
         if (!arg_list)                                            \
             storage = va_arg(arg_ptr, type);                      \
+        else if (!arg_list[arg_counter])                          \
+            FAIL(GPG_ERR_INV_ARG);                                \
         else                                                      \
             storage = *((type *)(arg_list[arg_counter++]));       \
     } while (0)
@@ -1076,8 +1078,9 @@ gcry_err_code_t
 _gcry_sexp_vbuild(gcry_sexp_t *retsexp, size_t *erroff, const char *format,
                   va_list arg_ptr)
 {
-    return do_vsexp_sscan(retsexp, erroff, format, strlen(format), 1, NULL,
-                          arg_ptr);
+    /* A NULL format is a NULL buffer: the scanner reports it. */
+    return do_vsexp_sscan(retsexp, erroff, format, format ? strlen(format) : 0,
+                          1, NULL, arg_ptr);
 }
 
 gcry_err_code_t
@@ -1185,6 +1188,17 @@ gcry_error_t
 gcry_sexp_build_array(gcry_sexp_t *retsexp, size_t *erroff,
                       const char *format, void **arg_list)
 {
+    if (!retsexp) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    *retsexp = NULL;
+
+    /* Without an argument array the directives would read garbage. */
+    if (!format || !arg_list) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
     return GCRY_ERR(do_sexp_sscan(retsexp, erroff, format, strlen(format), 1,
                                   arg_list));
 }
@@ -1390,7 +1404,7 @@ gcry_sexp_find_token(gcry_sexp_t list, const char *tok, size_t toklen)
 {
     const unsigned char *p;
 
-    if (!list) {
+    if (!list || !tok) {
         return NULL;
     }
 
@@ -1581,6 +1595,12 @@ gcry_sexp_nth_buffer(const gcry_sexp_t list, int number, size_t *rlength)
     }
 
     *rlength = 0;
+
+    if (!list || number < 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
     s = do_nth_data(list, number, &n);
 
     if (!s || !n) {
@@ -1604,6 +1624,11 @@ gcry_sexp_nth_string(gcry_sexp_t list, int number)
     const char *s;
     size_t n;
     char *buf;
+
+    if (!list || number < 0) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     s = do_nth_data(list, number, &n);
 
@@ -1888,6 +1913,12 @@ gcry_sexp_sprint(gcry_sexp_t list, int mode, void *buffer, size_t maxlength)
     int i;
     int indent = 0;
 
+    /* A NULL buffer asks for the required size, with a zero MAXLENGTH. */
+    if ((!buffer && maxlength) || mode < GCRYSEXP_FMT_DEFAULT
+        || mode > GCRYSEXP_FMT_ADVANCED) {
+        return 0;
+    }
+
     s = list ? list->d : empty;
 
     while (*s != ST_STOP) {
@@ -2096,6 +2127,11 @@ gcry_sexp_canon_len(const unsigned char *buffer, size_t length,
     *erroff = 0;
 
     if (!buffer) {
+        /* NULL is simply empty; with a length it is a caller bug. */
+        if (length) {
+            *errcode = GCRY_ERR(GPG_ERR_INV_ARG);
+        }
+
         return 0;
     }
 
@@ -2267,6 +2303,10 @@ _gcry_sexp_vextract_param(gcry_sexp_t sexp, const char *path,
     const unsigned char *scope_end;  /* NULL: up to ST_STOP. */
     const unsigned char *head;       /* The matching sublist. */
     int secure;
+
+    if (!list) {
+        return GPG_ERR_INV_ARG;
+    }
 
     /* arrayisdesc: 0 MPI, 1 caller buffer, 2 our buffer, 's' string,
      * 'x' plain integer (nothing to free). */

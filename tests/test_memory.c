@@ -1,8 +1,21 @@
 #include <gcrypt.h>
 
+#include <errno.h>
 #include <stdlib.h>
 
 #include "test_common.h"
+
+TEST(argument_checks)
+{
+    /* A NULL string cannot be duplicated; errno says why. */
+    errno = 0;
+    ASSERT_NULL(gcry_strdup(NULL));
+    ASSERT_EQ(EINVAL, errno);
+
+    /* NULL stays a no-op for the release and query functions. */
+    gcry_free(NULL);
+    ASSERT_FALSE(gcry_is_secure(NULL));
+}
 
 TEST(plain_allocation)
 {
@@ -150,6 +163,7 @@ int
 main(void)
 {
     gcry_check_version(NULL);
+    RUN_TEST(argument_checks);
     RUN_TEST(plain_allocation);
     RUN_TEST(secure_allocation);
     RUN_TEST(x_allocation);

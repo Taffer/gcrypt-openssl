@@ -429,6 +429,11 @@ gcry_realloc(void *a, size_t n)
 char *
 gcry_strdup(const char *string)
 {
+    if (!string) {
+        errno = EINVAL;
+        return NULL;
+    }
+
     return _gcry_strdup(string);
 }
 
@@ -465,6 +470,12 @@ gcry_xrealloc(void *a, size_t n)
 char *
 gcry_xstrdup(const char *a)
 {
+    /* The x-functions never return NULL, so a NULL input is fatal, like
+     * running out of memory. */
+    if (!a) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_xstrdup: NULL argument");
+    }
+
     return _gcry_xstrdup(a);
 }
 
