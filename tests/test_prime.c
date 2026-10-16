@@ -363,10 +363,23 @@ TEST(argument_edges)
     gcry_mpi_t g = NULL;
     gcry_mpi_t eleven = gcry_mpi_set_ui(NULL, 11);
     gcry_mpi_t f[3];
+    gcry_mpi_t *f3 = NULL;
 
     /* No room for a q factor of the requested size. */
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_generate(&p, 64, 60, NULL, NULL,
                                                     NULL, GCRY_WEAK_RANDOM, 0));
+    /* A q factor as wide as p, or wider, is rejected at once (the
+     * reference library's factor count wraps around and it runs away
+     * for minutes before allocating a gigabyte). */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_generate(&p, 64, 64, NULL, NULL,
+                                                    NULL, GCRY_WEAK_RANDOM, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_generate(&p, 64, 100, NULL, NULL,
+                                                    NULL, GCRY_WEAK_RANDOM, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_generate(&p, 64, 100, &f3, NULL,
+                                                    NULL, GCRY_WEAK_RANDOM,
+                                                    GCRY_PRIME_FLAG_SPECIAL_FACTOR));
+    ASSERT_NULL(p);
+    ASSERT_NULL(f3);
     ASSERT_ERR(GPG_ERR_INV_ARG,
                gcry_prime_generate(&p, 128, 100, NULL, NULL, NULL,
                                    GCRY_WEAK_RANDOM,

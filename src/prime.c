@@ -274,6 +274,13 @@ prime_generate_internal(int need_q_factor, gcry_mpi_t *r_prime,
         qbits = pbits / 3;
     }
 
+    /* q cannot be as wide as p: the factor count below would wrap around
+     * and the search run away (the reference library spins for minutes,
+     * then allocates a gigabyte). */
+    if (qbits >= pbits) {
+        return GPG_ERR_INV_ARG;
+    }
+
     req_qbits = qbits;
 
     for (n = 1; (pbits - qbits - 1) / n >= qbits; n++) {
