@@ -101,7 +101,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
 | `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
 | `GCRYPT_OPENSSL_BUILD_BENCHMARKS`   | `ON`    | Build benchmarks (top-level)    |
-| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `OFF`   | Pass `-Werror`                  |
+| `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `ON`    | Pass `-Werror` (or `/WX`) to every target that compiles C: libraries, drop-in, tests, benchmarks |
 | `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
@@ -120,7 +120,7 @@ name; every one uses Ninja and writes `compile_commands.json`.
 | Preset     | Build directory  | Configuration                                   |
 |------------|------------------|-------------------------------------------------|
 | `default`  | `build/`         | RelWithDebInfo                                  |
-| `debug`    | `build-debug/`   | Debug, `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS=ON`   |
+| `debug`    | `build-debug/`   | Debug                                           |
 | `release`  | `build-release/` | Release (no test preset)                        |
 | `coverage` | `build-coverage/`| Debug, `GCRYPT_OPENSSL_COVERAGE=ON`, benchmarks off |
 | `fips`     | `build-fips/`    | RelWithDebInfo, `GCRYPT_OPENSSL_FIPS=ON`        |

@@ -52,8 +52,8 @@ option(GCRYPT_OPENSSL_BUILD_TESTS "Build the unit tests"
 option(GCRYPT_OPENSSL_BUILD_BENCHMARKS "Build the benchmarks"
        ${GCRYPT_OPENSSL_IS_TOP_LEVEL}
 )
-option(GCRYPT_OPENSSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"
-       OFF
+option(GCRYPT_OPENSSL_WARNINGS_AS_ERRORS
+       "Treat compiler warnings as errors in every target that compiles C" ON
 )
 option(GCRYPT_OPENSSL_DROP_IN
        "Also build libgcrypt.so.20 plus libgcrypt.pc and libgcrypt-config" OFF

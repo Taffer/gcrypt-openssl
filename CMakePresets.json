@@ -18,12 +18,11 @@
     },
     {
       "name": "debug",
-      "displayName": "Debug (Ninja, warnings are errors)",
+      "displayName": "Debug (Ninja)",
       "inherits": "default",
       "binaryDir": "${sourceDir}/build-debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "GCRYPT_OPENSSL_WARNINGS_AS_ERRORS": "ON"
+        "CMAKE_BUILD_TYPE": "Debug"
       }
     },
     {
