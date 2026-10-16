@@ -394,16 +394,18 @@ fips_provider_version(void)
         return "";
     }
 
-    /* The provider stays loaded; we only need a stable string. */
+    /* The provider answers with a pointer to its own static string; copy
+     * it so that the result does not depend on the provider's lifetime. */
     {
         OSSL_PARAM params[2];
+        char *ptr = NULL;
         static char version[64];
 
-        params[0] = OSSL_PARAM_construct_utf8_string("version", version,
-                                                     sizeof version);
+        params[0] = OSSL_PARAM_construct_utf8_ptr("version", &ptr, 0);
         params[1] = OSSL_PARAM_construct_end();
 
-        if (OSSL_PROVIDER_get_params(prov, params)) {
+        if (OSSL_PROVIDER_get_params(prov, params) && ptr) {
+            snprintf(version, sizeof version, "%s", ptr);
             return version;
         }
 
