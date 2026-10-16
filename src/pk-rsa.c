@@ -184,10 +184,23 @@ leave:
  * reference library's length rules and error codes) are honoured.
  */
 
+/* Is the K byte big endian FRAME equal to N - 1? */
+static int
+frame_is_n_minus_1(const unsigned char *frame, size_t k, gcry_mpi_t n)
+{
+    BIGNUM *f = BN_bin2bn(frame, (int)k, NULL);
+    BIGNUM *t = BN_dup(_gcry_mpi_bn(n));
+    int res = f && t && BN_sub_word(t, 1) && !BN_ucmp(f, t);
+
+    BN_free(f);
+    BN_free(t);
+    return res;
+}
+
 /* OUT = IN^e mod n (public) or IN^d mod n (private, blinded by OpenSSL).
- * IN must be K bytes and smaller than n. */
+ * IN must be K bytes and smaller than N. */
 static gcry_err_code_t
-rsa_raw_op(EVP_PKEY *key, int private, const unsigned char *in,
+rsa_raw_op(EVP_PKEY *key, gcry_mpi_t n, int private, const unsigned char *in,
            unsigned char *out, size_t k)
 {
     EVP_PKEY_CTX *ctx;
@@ -195,13 +208,14 @@ rsa_raw_op(EVP_PKEY *key, int private, const unsigned char *in,
     size_t i;
     int ok;
 
-    /* 0 and 1 are their own powers; the FIPS provider refuses them as
-     * "data too small" and the reference library computes them. */
+    /* 0, 1 and n - 1 are their own powers (e and d are odd); the FIPS
+     * provider refuses them as outside the RSAEP/RSADP range of SP 800-56B
+     * and the reference library computes them. */
     for (i = 0; i < k && !in[i]; i++) {
         ;
     }
 
-    if (i == k || (i + 1 == k && in[i] == 1)) {
+    if (i == k || (i + 1 == k && in[i] == 1) || frame_is_n_minus_1(in, k, n)) {
         memcpy(out, in, k);
         return 0;
     }
@@ -339,7 +353,7 @@ rsa_encrypt(gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         }
     }
 
-    rc = rsa_raw_op(key, 0, frame, out, k);
+    rc = rsa_raw_op(key, n, 0, frame, out, k);
 
     if (rc) {
         goto leave;
@@ -484,7 +498,7 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    rc = rsa_raw_op(key, 1, in, out, k);
+    rc = rsa_raw_op(key, n, 1, in, out, k);
 
     if (rc) {
         goto leave;
@@ -599,7 +613,7 @@ rsa_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    rc = rsa_raw_op(key, 1, frame, sig, k);
+    rc = rsa_raw_op(key, n, 1, frame, sig, k);
 
     if (rc) {
         goto leave;
@@ -607,7 +621,7 @@ rsa_sign(gcry_sexp_t *r_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 
     /* Verify the fresh signature, as the reference library does, which
      * also catches a faulty CRT computation. */
-    rc = rsa_raw_op(key, 0, sig, check, k);
+    rc = rsa_raw_op(key, n, 0, sig, check, k);
 
     if (!rc && memcmp(check, frame, k)) {
         rc = GPG_ERR_BAD_SIGNATURE;
@@ -723,7 +737,7 @@ rsa_verify(gcry_sexp_t s_sig, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         goto leave;
     }
 
-    rc = rsa_raw_op(key, 0, sigbuf, em, k);
+    rc = rsa_raw_op(key, n, 0, sigbuf, em, k);
 
     if (rc) {
         goto leave;
