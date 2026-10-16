@@ -27,10 +27,14 @@ static OSSL_LIB_CTX *libctx;
 
 /* Does the operating system ask for FIPS mode?  Mirrors the reference
  * implementation's checks of /proc/sys/crypto/fips_enabled and the
- * /etc/gcrypt/fips_enabled marker file. */
+ * /etc/gcrypt/fips_enabled marker file.  A build with GCRYPT_OPENSSL_FIPS
+ * answers yes unconditionally, as if the marker file were present. */
 static int
 system_wants_fips(void)
 {
+#ifdef GCRYPT_OPENSSL_FIPS
+    return 1;
+#else
     FILE *fp;
     int c;
 
@@ -50,6 +54,7 @@ system_wants_fips(void)
     c = fgetc(fp);
     fclose(fp);
     return c == '1';
+#endif
 }
 
 static int

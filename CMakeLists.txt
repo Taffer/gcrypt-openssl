@@ -62,11 +62,27 @@ option(GCRYPT_OPENSSL_COVERAGE
        "Instrument for code coverage (gcc/clang --coverage) and add the
        coverage target" OFF
 )
+option(GCRYPT_OPENSSL_FIPS
+       "Start the library in FIPS mode by default (as if the system asked
+       for it) and define GCRYPT_OPENSSL_FIPS for every target" OFF
+)
 
 if(NOT GCRYPT_OPENSSL_BUILD_SHARED AND NOT GCRYPT_OPENSSL_BUILD_STATIC)
     message(FATAL_ERROR "At least one of GCRYPT_OPENSSL_BUILD_SHARED or "
                         "GCRYPT_OPENSSL_BUILD_STATIC must be ON"
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# FIPS mode. The definition reaches every target configured below (the
+# libraries, the drop-in, the tests, the benchmarks and the coverage build)
+# so that the library enables FIPS mode at initialisation and the tests can
+# adapt their expectations. Whether FIPS mode actually works depends on the
+# OpenSSL installation providing a FIPS provider.
+# ---------------------------------------------------------------------------
+if(GCRYPT_OPENSSL_FIPS)
+    add_compile_definitions(GCRYPT_OPENSSL_FIPS=1)
+    message(STATUS "FIPS mode enabled by default (GCRYPT_OPENSSL_FIPS)")
 endif()
 
 # ---------------------------------------------------------------------------

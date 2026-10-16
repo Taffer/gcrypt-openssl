@@ -45,6 +45,15 @@
         "GCRYPT_OPENSSL_COVERAGE": "ON",
         "GCRYPT_OPENSSL_BUILD_BENCHMARKS": "OFF"
       }
+    },
+    {
+      "name": "fips",
+      "displayName": "RelWithDebInfo, FIPS mode on by default (Ninja)",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build-fips",
+      "cacheVariables": {
+        "GCRYPT_OPENSSL_FIPS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -70,6 +79,10 @@
       "targets": [
         "coverage"
       ]
+    },
+    {
+      "name": "fips",
+      "configurePreset": "fips"
     }
   ],
   "testPresets": [
@@ -90,6 +103,13 @@
     {
       "name": "coverage",
       "configurePreset": "coverage",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "fips",
+      "configurePreset": "fips",
       "output": {
         "outputOnFailure": true
       }
