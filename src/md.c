@@ -687,6 +687,10 @@ entry_init_keyed_blake2(struct md_entry *e, const unsigned char *key,
         return _gcry_err_from_openssl(GPG_ERR_INV_KEYLEN);
     }
 
+    /* A digest produced before the key was set must not be handed out
+     * again: the keyed computation starts afresh. */
+    e->have_digest = 0;
+    memset(e->digest, 0, sizeof e->digest);
     e->keyed = 1;
     return 0;
 }
