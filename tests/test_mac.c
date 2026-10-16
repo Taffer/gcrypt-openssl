@@ -232,21 +232,32 @@ TEST(cmac_rfc4493)
 
 TEST(gmac_and_poly1305)
 {
-    /* NIST GCM test case 1: zero key and IV, no data. */
-    ASSERT_TRUE(check_mac(GCRY_MAC_GMAC_AES, "00000000000000000000000000000000",
-                          "000000000000000000000000", "", 0,
-                          "58e2fccefa7e3061367f1d57a4e7455a"));
-    /* GCM test case with AAD only: key/IV from test case 2 with 16 bytes
-     * of zero AAD; value derived from the GHASH definition and
-     * cross-checked against OpenSSL. */
-    {
+    /* GMAC is not approved in FIPS mode: the reference library refuses
+     * it there whatever the provider offers. */
+    if (mac_unavailable(GCRY_MAC_GMAC_AES)) {
+        gcry_mac_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_GMAC_AES));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
+        ASSERT_NULL(hd);
+    } else {
         gcry_mac_hd_t hd;
         unsigned char tag1[16];
         unsigned char tag2[16];
+        unsigned char zero_iv_tag[16];
         size_t len = 16;
         unsigned char key[16] = { 0 };
         unsigned char iv[12] = { 0 };
 
+        /* NIST GCM test case 1: zero key and IV, no data. */
+        ASSERT_TRUE(check_mac(GCRY_MAC_GMAC_AES,
+                              "00000000000000000000000000000000",
+                              "000000000000000000000000", "", 0,
+                              "58e2fccefa7e3061367f1d57a4e7455a"));
+        /* GCM test case with AAD only: key/IV from test case 2 with 16
+         * bytes of zero AAD; value derived from the GHASH definition and
+         * cross-checked against OpenSSL. */
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
         ASSERT_OK(gcry_mac_setkey(hd, key, 16));
         /* Data before any IV is authenticated under a 16 byte zero IV,
@@ -254,19 +265,35 @@ TEST(gmac_and_poly1305)
         ASSERT_OK(gcry_mac_write(hd, key, 16));
         ASSERT_OK(gcry_mac_read(hd, tag1, &len));
         ASSERT_EQ(16, len);
-        unhex("9103a01f968fd51aaf65695d40cf88d8", tag2, 16);
-        ASSERT_MEM_EQ(tag2, tag1, 16);
+        unhex("9103a01f968fd51aaf65695d40cf88d8", zero_iv_tag, 16);
+        ASSERT_MEM_EQ(zero_iv_tag, tag1, 16);
         ASSERT_ERR(GPG_ERR_INV_LENGTH, gcry_mac_setiv(hd, iv, 0));
-        /* A new IV starts a fresh message. */
+        /* A new IV starts a fresh message under that IV. */
         ASSERT_OK(gcry_mac_setiv(hd, iv, 12));
         ASSERT_OK(gcry_mac_write(hd, key, 16));
         ASSERT_OK(gcry_mac_read(hd, tag1, &len));
         ASSERT_EQ(16, len);
+        ASSERT_TRUE(memcmp(zero_iv_tag, tag1, 16) != 0);
+        /* A reset forgets the IV along with the data, as in the
+         * reference: the next message runs under the zero IV again. */
         ASSERT_OK(gcry_mac_reset(hd));
         ASSERT_OK(gcry_mac_write(hd, key, 8));
         ASSERT_OK(gcry_mac_write(hd, key, 8));
         ASSERT_OK(gcry_mac_read(hd, tag2, &len));
+        ASSERT_MEM_EQ(zero_iv_tag, tag2, 16);
+        /* Setting the IV again after a reset brings its tag back. */
+        ASSERT_OK(gcry_mac_reset(hd));
+        ASSERT_OK(gcry_mac_setiv(hd, iv, 12));
+        ASSERT_OK(gcry_mac_write(hd, key, 16));
+        ASSERT_OK(gcry_mac_read(hd, tag2, &len));
         ASSERT_MEM_EQ(tag1, tag2, 16);
+        /* A reset in the middle of a message drops data and IV alike. */
+        ASSERT_OK(gcry_mac_setiv(hd, iv, 12));
+        ASSERT_OK(gcry_mac_write(hd, key, 8));
+        ASSERT_OK(gcry_mac_reset(hd));
+        ASSERT_OK(gcry_mac_write(hd, key, 16));
+        ASSERT_OK(gcry_mac_read(hd, tag2, &len));
+        ASSERT_MEM_EQ(zero_iv_tag, tag2, 16);
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 15));
         gcry_mac_close(hd);
     }
@@ -432,7 +459,9 @@ TEST(algorithm_tables)
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA3_256));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA512_256));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_CMAC_AES));
-    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_GMAC_AES));
+    /* GMAC is refused in FIPS mode, as the reference library does. */
+    ASSERT_OK_UNLESS(mac_unavailable(GCRY_MAC_GMAC_AES), GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_GMAC_AES));
     /* BLAKE2, SM3 and Whirlpool are not FIPS-approved, so HMAC over them
      * is refused in FIPS mode, and a strict provider may lack the digests
      * outside it; TEST_ALGO is the probe, so these are only consistent
@@ -557,19 +586,40 @@ TEST(key_and_state_rules)
     ASSERT_EQ(16, len);
     gcry_mac_close(hd);
 
-    /* GMAC needs an IV before data and keeps the key across a reset. */
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
-    ASSERT_OK(gcry_mac_setkey(hd, key, 16));
-    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, NULL, 12));
-    ASSERT_OK(gcry_mac_setiv(hd, key, 12));
-    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
-    len = sizeof tag;
-    ASSERT_OK(gcry_mac_read(hd, tag, &len));
-    ASSERT_OK(gcry_mac_ctl(hd, GCRYCTL_RESET, NULL, 0));
-    ASSERT_OK(gcry_mac_setiv(hd, key, 12));
-    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
-    ASSERT_OK(gcry_mac_verify(hd, tag, len));
-    gcry_mac_close(hd);
+    /* GMAC keeps the key across a reset, but not the IV.  FIPS mode has
+     * no GMAC (see gmac_and_poly1305 for that). */
+    if (!mac_unavailable(GCRY_MAC_GMAC_AES)) {
+        gcry_mac_hd_t fresh;
+        unsigned char tag2[16];
+        size_t len2 = sizeof tag2;
+
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_GMAC_AES, 0, NULL));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 16));
+        ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, NULL, 12));
+        ASSERT_OK(gcry_mac_setiv(hd, key, 12));
+        ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+        len = sizeof tag;
+        ASSERT_OK(gcry_mac_read(hd, tag, &len));
+        ASSERT_OK(gcry_mac_ctl(hd, GCRYCTL_RESET, NULL, 0));
+        ASSERT_OK(gcry_mac_setiv(hd, key, 12));
+        ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+        ASSERT_OK(gcry_mac_verify(hd, tag, len));
+        /* Without a new IV the reset handle authenticates under the
+         * all-zero IV, exactly like a fresh handle that never had one;
+         * the reference library behaves the same. */
+        ASSERT_OK(gcry_mac_ctl(hd, GCRYCTL_RESET, NULL, 0));
+        ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+        ASSERT_OK(gcry_mac_read(hd, tag2, &len2));
+        ASSERT_EQ(16, len2);
+        ASSERT_TRUE(memcmp(tag, tag2, 16) != 0);
+        ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_mac_verify(hd, tag, len));
+        ASSERT_OK(gcry_mac_open(&fresh, GCRY_MAC_GMAC_AES, 0, NULL));
+        ASSERT_OK(gcry_mac_setkey(fresh, key, 16));
+        ASSERT_OK(gcry_mac_write(fresh, "abc", 3));
+        ASSERT_OK(gcry_mac_verify(fresh, tag2, len2));
+        gcry_mac_close(fresh);
+        gcry_mac_close(hd);
+    }
 
     /* Poly1305 takes exactly 32 key bytes; FIPS mode has no Poly1305. */
     if (mac_unavailable(GCRY_MAC_POLY1305)) {
