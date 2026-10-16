@@ -113,27 +113,76 @@ check_mac(int algo, const char *keyhex, const char *ivhex, const void *data,
 TEST(hmac_rfc4231)
 {
     const char *jefe = "4a656665";
+    const char *key0b = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
     const char *data = "what do ya want for nothing?";
+    const char *sha256_hi_there =
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+    const char *sha3_msg = "Sample message for keylen<blocklen";
 
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA224, jefe, NULL, data, 28,
-                          "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44"));
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256, jefe, NULL, data, 28,
-                          "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA384, jefe, NULL, data, 28,
-                          "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e"
-                          "8e2240ca5e69e2c78b3239ecfab21649"));
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA512, jefe, NULL, data, 28,
-                          "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554"
-                          "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"));
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_MD5, jefe, NULL, data, 28,
-                          "750c783e6ab0b503eaa86e310a5db738"));
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA1, jefe, NULL, data, 28,
-                          "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"));
-    /* RFC 4231 case 1 (20 byte 0x0b key, "Hi There"). */
-    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256,
-                          "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", NULL,
-                          "Hi There", 8,
-                          "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+    /* RFC 4231 case 1 (20 byte 0x0b key, "Hi There"), the same key and
+     * data as RFC 2202 case 1 for SHA-1, and the NIST HMAC-SHA3-256
+     * sample with a 32 byte key.  All keys reach the 112 bit minimum
+     * FIPS mode insists on, so these run in both modes. */
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA224, key0b, NULL, "Hi There", 8,
+                          "896fb1128abbdf196832107cd49df33f47b4b1169912ba4f53684b22"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256, key0b, NULL, "Hi There", 8,
+                          sha256_hi_there));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA384, key0b, NULL, "Hi There", 8,
+                          "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c"
+                          "faea9ea9076ede7f4af152e8b2fa9cb6"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA512, key0b, NULL, "Hi There", 8,
+                          "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde"
+                          "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA1, key0b, NULL, "Hi There", 8,
+                          "b617318655057264e28bc0b6fb378c8ef146be00"));
+    ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA3_256,
+                          "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                          NULL, sha3_msg, strlen(sha3_msg),
+                          "4fe8e202c4f058e8dddc23d8c34e467343e23555e24fc2f025d598f558f67205"));
+
+    /* RFC 4231 case 2 uses the four byte key "Jefe", which is below the
+     * FIPS minimum; HMAC-MD5 is not offered in FIPS mode at all. */
+    if (gcry_fips_mode_active()) {
+        gcry_mac_hd_t hd;
+        unsigned char key[20];
+        unsigned char expect[32];
+        unsigned char got[32];
+        size_t len = sizeof got;
+
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0, NULL));
+        unhex(jefe, key, sizeof key);
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 4));
+        /* The refused key leaves the handle unkeyed and still usable. */
+        ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, data, 28));
+        unhex(key0b, key, sizeof key);
+        ASSERT_OK(gcry_mac_setkey(hd, key, 20));
+        ASSERT_OK(gcry_mac_write(hd, "Hi There", 8));
+        ASSERT_OK(gcry_mac_read(hd, got, &len));
+        ASSERT_EQ(32, len);
+        unhex(sha256_hi_there, expect, sizeof expect);
+        ASSERT_MEM_EQ(expect, got, 32);
+        gcry_mac_close(hd);
+
+        ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_MD5));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_HMAC_MD5, 0, NULL));
+        ASSERT_NULL(hd);
+    } else {
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA224, jefe, NULL, data, 28,
+                              "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44"));
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA256, jefe, NULL, data, 28,
+                              "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA384, jefe, NULL, data, 28,
+                              "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e"
+                              "8e2240ca5e69e2c78b3239ecfab21649"));
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA512, jefe, NULL, data, 28,
+                              "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554"
+                              "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"));
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_MD5, jefe, NULL, data, 28,
+                              "750c783e6ab0b503eaa86e310a5db738"));
+        ASSERT_TRUE(check_mac(GCRY_MAC_HMAC_SHA1, jefe, NULL, data, 28,
+                              "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"));
+    }
 }
 
 TEST(cmac_rfc4493)
@@ -211,15 +260,23 @@ TEST(gmac_and_poly1305)
         gcry_mac_close(hd);
     }
 
-    /* RFC 8439 section 2.5.2. */
-    ASSERT_TRUE(check_mac(GCRY_MAC_POLY1305,
-                          "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
-                          NULL, "Cryptographic Forum Research Group", 34,
-                          "a8061dc1305136c6c22b8baf0c0127a9"));
-    {
+    /* RFC 8439 section 2.5.2.  Poly1305 is not a FIPS algorithm and the
+     * FIPS provider does not offer it. */
+    if (gcry_fips_mode_active()) {
+        gcry_mac_hd_t hd = NULL;
+
+        ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_POLY1305));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
+        ASSERT_NULL(hd);
+    } else {
         gcry_mac_hd_t hd;
         unsigned char key[32] = { 0 };
 
+        ASSERT_TRUE(check_mac(GCRY_MAC_POLY1305,
+                              "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
+                              NULL, "Cryptographic Forum Research Group", 34,
+                              "a8061dc1305136c6c22b8baf0c0127a9"));
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
         ASSERT_ERR(GPG_ERR_INV_ARG, gcry_mac_setiv(hd, key, 16));
@@ -237,13 +294,23 @@ TEST(legacy_cmacs)
     };
     size_t i;
 
-    /* These must at least be usable and deterministic. */
+    /* These must at least be usable and deterministic; none of the
+     * ciphers is FIPS-approved, so FIPS mode refuses them all. */
     for (i = 0; i < sizeof algos / sizeof algos[0]; i++) {
         unsigned char key[17] = "0123456789abcdef";
         unsigned char t1[16];
         unsigned char t2[16];
         size_t l1 = sizeof t1;
         size_t l2 = sizeof t2;
+
+        if (gcry_fips_mode_active()) {
+            hd = NULL;
+            ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(algos[i]));
+            ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                       gcry_mac_open(&hd, algos[i], 0, NULL));
+            ASSERT_NULL(hd);
+            continue;
+        }
 
         ASSERT_OK(gcry_mac_test_algo(algos[i]));
         ASSERT_OK(gcry_mac_open(&hd, algos[i], 0, NULL));
@@ -269,7 +336,16 @@ TEST(truncation_and_errors)
     ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0, NULL));
     ASSERT_EQ(GCRY_MAC_HMAC_SHA256, gcry_mac_get_algo(hd));
     ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, "x", 1)); /* no key */
-    ASSERT_OK(gcry_mac_setkey(hd, "key", 3));
+
+    /* Any key length goes, except that FIPS mode wants 112 bits. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, "key", 3));
+        ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_write(hd, "x", 1));
+        ASSERT_OK(gcry_mac_setkey(hd, "key of 16 bytes!", 16));
+    } else {
+        ASSERT_OK(gcry_mac_setkey(hd, "key", 3));
+    }
+
     ASSERT_OK(gcry_mac_write(hd, "message", 7));
     len = sizeof full;
     ASSERT_OK(gcry_mac_read(hd, full, &len));
@@ -302,7 +378,12 @@ TEST(truncation_and_errors)
     gcry_control(GCRYCTL_INIT_SECMEM, 16384u, 0);
     ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA1, GCRY_MAC_FLAG_SECURE, NULL));
     ASSERT_TRUE(gcry_is_secure(hd));
-    ASSERT_OK(gcry_mac_setkey(hd, "k", 1));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, "k", 1));
+    ASSERT_OK(gcry_mac_setkey(hd, "key of 16 bytes!", 16));
+    ASSERT_OK(gcry_mac_write(hd, "message", 7));
+    len = sizeof full;
+    ASSERT_OK(gcry_mac_read(hd, full, &len));
+    ASSERT_EQ(20, len);
     gcry_mac_close(hd);
 }
 
@@ -337,7 +418,12 @@ TEST(algorithm_tables)
     ASSERT_EQ(0, gcry_mac_map_name(NULL));
 
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA3_256));
-    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA512_256));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_CMAC_AES));
+    ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_GMAC_AES));
+    /* BLAKE2 is not FIPS-approved. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
+                          gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
     /* SM3 is not FIPS-approved, so HMAC over it is refused in FIPS mode. */
     ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
                           gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
@@ -410,18 +496,41 @@ TEST(key_and_state_rules)
         memset(key, 7, sizeof key);
         gcry_mac_close(hd);
     }
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
-    ASSERT_OK(gcry_mac_setkey(hd, key, 5));
-    gcry_mac_close(hd);
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 4));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 17));
-    ASSERT_OK(gcry_mac_setkey(hd, key, 10));
-    gcry_mac_close(hd);
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 0));
-    ASSERT_OK(gcry_mac_setkey(hd, key, 128));
+
+    /* The variable-length legacy ciphers; none of them in FIPS mode. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
+    } else {
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 5));
+        gcry_mac_close(hd);
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 4));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 17));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 10));
+        gcry_mac_close(hd);
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 0));
+        ASSERT_OK(gcry_mac_setkey(hd, key, 128));
+        gcry_mac_close(hd);
+    }
+
+    /* HMAC takes any key length, but FIPS mode draws the line at 112
+     * bits (SP 800-131A). */
+    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0, NULL));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 13));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 0));
+    ASSERT_OK(gcry_mac_setkey(hd, key, 14));
+    ASSERT_OK(gcry_mac_write(hd, "abc", 3));
+    len = sizeof tag;
+    ASSERT_OK(gcry_mac_read(hd, tag, &len));
+    ASSERT_EQ(16, len);
     gcry_mac_close(hd);
 
     /* GMAC needs an IV before data and keeps the key across a reset. */
@@ -438,12 +547,17 @@ TEST(key_and_state_rules)
     ASSERT_OK(gcry_mac_verify(hd, tag, len));
     gcry_mac_close(hd);
 
-    /* Poly1305 takes exactly 32 key bytes. */
-    ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
-    ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
-    len = sizeof tag;
-    ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_read(hd, tag, &len));
-    gcry_mac_close(hd);
+    /* Poly1305 takes exactly 32 key bytes; FIPS mode has no Poly1305. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
+    } else {
+        ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
+        ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 16));
+        len = sizeof tag;
+        ASSERT_ERR(GPG_ERR_INV_STATE, gcry_mac_read(hd, tag, &len));
+        gcry_mac_close(hd);
+    }
 
     /* TEST_ALGO takes no output arguments. */
     len = 0;

@@ -284,8 +284,10 @@ check_mac_algo(int algo)
         return GPG_ERR_MAC_ALGO;
     }
 
-    /* FIPS mode allows only the approved MACs (HMAC over SHA-2/SHA-3 and
-     * CMAC-AES), whatever OpenSSL's provider happens to offer. */
+    /* FIPS mode allows only the approved MACs (HMAC over SHA-1, SHA-2 and
+     * SHA-3, CMAC-AES and GMAC-AES: the set the FIPS provider offers,
+     * KMAC aside, which has no algorithm id here), whatever OpenSSL's
+     * provider happens to offer. */
     if (!spec->fips && _gcry_fips_mode()
         && (_gcry_fips_reject_flags() & GCRY_FIPS_FLAG_REJECT_MAC)) {
         return GPG_ERR_MAC_ALGO;
@@ -540,6 +542,14 @@ mac_setkey(gcry_mac_hd_t hd, const void *key, size_t keylen)
 
     switch (hd->spec->kind) {
     case MAC_HMAC:
+
+        /* FIPS 140-3 (SP 800-131A) wants at least 112 bits of HMAC key;
+         * the reference library and the FIPS provider both refuse less.
+         * Checking here keeps the handle's current key in place. */
+        if (keylen < 14 && _gcry_fips_mode()) {
+            return GPG_ERR_INV_KEYLEN;
+        }
+
         break;
 
     case MAC_CMAC:
