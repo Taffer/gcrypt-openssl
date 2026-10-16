@@ -20,6 +20,16 @@ unhex(const char *hex, unsigned char *buf, size_t bufsize)
     return n;
 }
 
+/* Whether a MAC the library's tables list is not offered: always in FIPS
+ * mode (every use of this asks about a non-approved algorithm), and under
+ * a strict provider whenever the provider lacks it. */
+static int
+mac_unavailable(int algo)
+{
+    return gcry_fips_mode_active()
+           || (TEST_STRICT_PROVIDER && gcry_mac_test_algo(algo) != 0);
+}
+
 /* Compute the MAC of DATA under KEY (and IV if given) and compare. */
 static int
 check_mac(int algo, const char *keyhex, const char *ivhex, const void *data,
@@ -204,8 +214,9 @@ TEST(cmac_rfc4493)
                           NULL, "", 0, "028962f61b7bf89efc6b551f4667d983"));
 
     /* 3DES CMAC (NIST SP 800-38B D.4, empty message).  Triple-DES is not
-     * an approved MAC cipher, so FIPS mode refuses to open it. */
-    if (gcry_fips_mode_active()) {
+     * an approved MAC cipher, so FIPS mode refuses to open it; a strict
+     * provider may not have it at all. */
+    if (mac_unavailable(GCRY_MAC_CMAC_3DES)) {
         gcry_mac_hd_t hd = NULL;
 
         ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
@@ -262,7 +273,7 @@ TEST(gmac_and_poly1305)
 
     /* RFC 8439 section 2.5.2.  Poly1305 is not a FIPS algorithm and the
      * FIPS provider does not offer it. */
-    if (gcry_fips_mode_active()) {
+    if (mac_unavailable(GCRY_MAC_POLY1305)) {
         gcry_mac_hd_t hd = NULL;
 
         ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_POLY1305));
@@ -295,7 +306,8 @@ TEST(legacy_cmacs)
     size_t i;
 
     /* These must at least be usable and deterministic; none of the
-     * ciphers is FIPS-approved, so FIPS mode refuses them all. */
+     * ciphers is FIPS-approved, so FIPS mode refuses them all, and a
+     * strict provider may lack any of them. */
     for (i = 0; i < sizeof algos / sizeof algos[0]; i++) {
         unsigned char key[17] = "0123456789abcdef";
         unsigned char t1[16];
@@ -303,7 +315,7 @@ TEST(legacy_cmacs)
         size_t l1 = sizeof t1;
         size_t l2 = sizeof t2;
 
-        if (gcry_fips_mode_active()) {
+        if (mac_unavailable(algos[i])) {
             hd = NULL;
             ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(algos[i]));
             ASSERT_ERR(GPG_ERR_MAC_ALGO,
@@ -421,15 +433,18 @@ TEST(algorithm_tables)
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_HMAC_SHA512_256));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_CMAC_AES));
     ASSERT_OK(gcry_mac_test_algo(GCRY_MAC_GMAC_AES));
-    /* BLAKE2 is not FIPS-approved. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
-                          gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
-    /* SM3 is not FIPS-approved, so HMAC over it is refused in FIPS mode. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
-                          gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
-    /* HMAC over Whirlpool is unavailable in FIPS mode along with the digest. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_MAC_ALGO,
-                          gcry_mac_test_algo(GCRY_MAC_HMAC_WHIRLPOOL));
+    /* BLAKE2, SM3 and Whirlpool are not FIPS-approved, so HMAC over them
+     * is refused in FIPS mode, and a strict provider may lack the digests
+     * outside it; TEST_ALGO is the probe, so these are only consistent
+     * with themselves. */
+    ASSERT_OK_UNLESS(mac_unavailable(GCRY_MAC_HMAC_BLAKE2B_512),
+                     GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_512));
+    ASSERT_OK_UNLESS(mac_unavailable(GCRY_MAC_HMAC_SM3), GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_HMAC_SM3));
+    ASSERT_OK_UNLESS(mac_unavailable(GCRY_MAC_HMAC_WHIRLPOOL),
+                     GPG_ERR_MAC_ALGO,
+                     gcry_mac_test_algo(GCRY_MAC_HMAC_WHIRLPOOL));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_TIGER1));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_STRIBOG256));
     ASSERT_ERR(GPG_ERR_MAC_ALGO, gcry_mac_test_algo(GCRY_MAC_HMAC_BLAKE2B_256));
@@ -482,8 +497,8 @@ TEST(key_and_state_rules)
 
     /* Triple-DES CMAC takes three-key material only, and refuses weak or
      * semi-weak subkeys like the cipher does.  FIPS mode does not offer
-     * it at all. */
-    if (gcry_fips_mode_active()) {
+     * it at all, nor may a strict provider. */
+    if (mac_unavailable(GCRY_MAC_CMAC_3DES)) {
         ASSERT_ERR(GPG_ERR_MAC_ALGO,
                    gcry_mac_open(&hd, GCRY_MAC_CMAC_3DES, 0, NULL));
     } else {
@@ -497,24 +512,33 @@ TEST(key_and_state_rules)
         gcry_mac_close(hd);
     }
 
-    /* The variable-length legacy ciphers; none of them in FIPS mode. */
-    if (gcry_fips_mode_active()) {
+    /* The variable-length legacy ciphers; none of them in FIPS mode, and
+     * a strict provider may lack each of them. */
+    if (mac_unavailable(GCRY_MAC_CMAC_BLOWFISH)) {
         ASSERT_ERR(GPG_ERR_MAC_ALGO,
                    gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
-        ASSERT_ERR(GPG_ERR_MAC_ALGO,
-                   gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
-        ASSERT_ERR(GPG_ERR_MAC_ALGO,
-                   gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
     } else {
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_BLOWFISH, 0, NULL));
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 57));
         ASSERT_OK(gcry_mac_setkey(hd, key, 5));
         gcry_mac_close(hd);
+    }
+
+    if (mac_unavailable(GCRY_MAC_CMAC_CAST5)) {
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
+    } else {
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_CAST5, 0, NULL));
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 4));
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 17));
         ASSERT_OK(gcry_mac_setkey(hd, key, 10));
         gcry_mac_close(hd);
+    }
+
+    if (mac_unavailable(GCRY_MAC_CMAC_RFC2268)) {
+        ASSERT_ERR(GPG_ERR_MAC_ALGO,
+                   gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
+    } else {
         ASSERT_OK(gcry_mac_open(&hd, GCRY_MAC_CMAC_RFC2268, 0, NULL));
         ASSERT_ERR(GPG_ERR_INV_KEYLEN, gcry_mac_setkey(hd, key, 0));
         ASSERT_OK(gcry_mac_setkey(hd, key, 128));
@@ -548,7 +572,7 @@ TEST(key_and_state_rules)
     gcry_mac_close(hd);
 
     /* Poly1305 takes exactly 32 key bytes; FIPS mode has no Poly1305. */
-    if (gcry_fips_mode_active()) {
+    if (mac_unavailable(GCRY_MAC_POLY1305)) {
         ASSERT_ERR(GPG_ERR_MAC_ALGO,
                    gcry_mac_open(&hd, GCRY_MAC_POLY1305, 0, NULL));
     } else {

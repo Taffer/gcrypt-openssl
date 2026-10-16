@@ -9,6 +9,10 @@
 # unexpected is exported; otherwise the differences are printed.
 set -eu
 
+# The expected list is in C-locale order; sort and comm must agree on that
+# whatever the caller's locale (underscores collate differently elsewhere).
+export LC_ALL=C
+
 lib="${1:?usage: $0 <shared-library> [expected-list]}"
 expected="${2:-$(dirname "$0")/../tests/expected-exports.txt}"
 

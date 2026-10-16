@@ -145,6 +145,44 @@ sigval_text(const char *algo, const char *rs, int with_flags)
     return buf;
 }
 
+/* Whether DSA keys can be generated: not in FIPS mode, and under a strict
+ * provider only if the provider has DSA at all, which one key generation
+ * tells (its outcome is cached). */
+static int
+dsa_available(void)
+{
+    static int probed = -1;
+
+    if (gcry_fips_mode_active()) {
+        return 0;
+    }
+
+    if (!TEST_STRICT_PROVIDER) {
+        return 1;
+    }
+
+    if (probed < 0) {
+        gcry_sexp_t parms = sexp("(genkey (dsa (nbits 4:1024)))");
+        gcry_sexp_t key = NULL;
+
+        probed = parms != NULL && gcry_pk_genkey(&key, parms) == 0;
+        gcry_sexp_release(key);
+        gcry_sexp_release(parms);
+    }
+
+    return probed;
+}
+
+/* Whether a digest the library's tables list is not offered: always in
+ * FIPS mode (every use of this asks about a non-approved digest), and
+ * under a strict provider whenever the provider lacks it. */
+static int
+md_unavailable(int algo)
+{
+    return gcry_fips_mode_active()
+           || (TEST_STRICT_PROVIDER && gcry_md_test_algo(algo) != 0);
+}
+
 /* In FIPS mode a non-approved algorithm (DSA, ElGamal) is refused by
  * every operation, as in the reference library; only the keygrip, a pure
  * function of the key material, is still computed. */
@@ -868,6 +906,11 @@ TEST(dsa)
                             "(data (flags raw) (hash sha256 #" RSA_DIGEST "#))",
                             "(sig-val (dsa (r #01#) (s #02#)))",
                             "(enc-val (dsa (a #01#)))");
+        return;
+    }
+
+    if (!dsa_available()) {
+        printf("  (skipping: DSA not available)\n");
         return;
     }
 
@@ -2093,6 +2136,11 @@ TEST(dsa_parameters)
         return;
     }
 
+    if (!dsa_available()) {
+        printf("  (skipping: DSA not available)\n");
+        return;
+    }
+
     /* Default q size for 1024 bits. */
     key = genkey("(genkey (dsa (nbits 4:1024)))");
     ASSERT_NOT_NULL(key);
@@ -2153,11 +2201,12 @@ TEST(dsa_parameters)
 
 TEST(dsa_data_errors)
 {
-    /* The data and signature parsing is shared, so FIPS mode runs the
-     * same checks with an ECDSA key. */
+    /* The data and signature parsing is shared, so FIPS mode (or a strict
+     * provider without DSA) runs the same checks with an ECDSA key. */
     int fips = gcry_fips_mode_active();
-    const char *algo = fips ? "ecdsa" : "dsa";
-    gcry_sexp_t key = genkey(fips ? "(genkey (ecc (curve \"NIST P-256\")))"
+    int ecdsa = !dsa_available();
+    const char *algo = ecdsa ? "ecdsa" : "dsa";
+    gcry_sexp_t key = genkey(ecdsa ? "(genkey (ecc (curve \"NIST P-256\")))"
                              : "(genkey (dsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
@@ -2226,19 +2275,19 @@ TEST(dsa_data_errors)
     }
     gcry_sexp_release(sig);
     /* RIPEMD-160 is not FIPS-approved, so FIPS mode refuses it whether the
-     * library hashes or the caller supplies the digest. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
-                          sign_text(&sig, "(data (flags raw prehash)"
-                                    " (hash-algo rmd160) (value #0102#))",
-                                    priv));
+     * library hashes or the caller supplies the digest; a provider that
+     * lacks the digest has the same effect. */
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_RMD160), GPG_ERR_DIGEST_ALGO,
+                     sign_text(&sig, "(data (flags raw prehash)"
+                               " (hash-algo rmd160) (value #0102#))", priv));
     gcry_sexp_release(sig);
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
-                          sign_text(&sig, "(data (flags raw)"
-                                    " (hash rmd160 #" D20 "#))", priv));
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_RMD160), GPG_ERR_DIGEST_ALGO,
+                     sign_text(&sig, "(data (flags raw)"
+                               " (hash rmd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
-                          sign_text(&sig, "(data (flags raw)"
-                                    " (hash ripemd160 #" D20 "#))", priv));
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_RMD160), GPG_ERR_DIGEST_ALGO,
+                     sign_text(&sig, "(data (flags raw)"
+                               " (hash ripemd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags raw) (value #01#)"
                         " (hash sha256 #" D32 "#))", priv));
@@ -2261,10 +2310,10 @@ TEST(dsa_data_errors)
 TEST(hash_sign_templates)
 {
     /* The templates work the same for every signing algorithm; FIPS mode
-     * uses ECDSA. */
-    gcry_sexp_t key = genkey(gcry_fips_mode_active()
-                             ? "(genkey (ecc (curve \"NIST P-256\")))"
-                             : "(genkey (dsa (nbits 4:1024)))");
+     * (or a strict provider without DSA) uses ECDSA. */
+    gcry_sexp_t key = genkey(dsa_available()
+                             ? "(genkey (dsa (nbits 4:1024)))"
+                             : "(genkey (ecc (curve \"NIST P-256\")))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
     gcry_sexp_t sig = NULL;
@@ -2401,10 +2450,11 @@ TEST(rsa_data_errors)
                          " #0102030405060708091011121314151617#))", priv));
 
     /* PKCS#1 with other digests and with prehashing.  RIPEMD-160 is not
-     * FIPS-approved and is refused in FIPS mode. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
-                          sign_text(&sig, "(data (flags pkcs1)"
-                                    " (hash rmd160 #" D20 "#))", priv));
+     * FIPS-approved and is refused in FIPS mode, or wherever the provider
+     * lacks it. */
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_RMD160), GPG_ERR_DIGEST_ALGO,
+                     sign_text(&sig, "(data (flags pkcs1)"
+                               " (hash rmd160 #" D20 "#))", priv));
     gcry_sexp_release(sig);
     ASSERT_OK(sign_text(&sig, "(data (flags pkcs1 prehash) (hash-algo sha256)"
                         " (value #0102#))", priv));
@@ -2890,12 +2940,13 @@ TEST(genkey_flag_variants)
     gcry_mpi_t q;
 
     /* 2048-bit DSA defaults to a 224-bit q, with or without the FIPS flag;
-     * FIPS mode itself has no DSA at all. */
+     * FIPS mode itself has no DSA at all, and a strict provider may lack
+     * it, in which case the size check is skipped. */
     if (gcry_fips_mode_active()) {
         parms = sexp("(genkey (dsa (nbits 4:2048) (flags use-fips186)))");
         ASSERT_ERR(GPG_ERR_PUBKEY_ALGO, gcry_pk_genkey(&key, parms));
         gcry_sexp_release(parms);
-    } else {
+    } else if (dsa_available()) {
         key = genkey("(genkey (dsa (nbits 4:2048) (flags use-fips186)))");
         ASSERT_NOT_NULL(key);
         q = param_mpi(key, "q");
@@ -2922,7 +2973,8 @@ TEST(genkey_flag_variants)
 TEST(dsa_more_data_handling)
 {
     int fips = gcry_fips_mode_active();
-    gcry_sexp_t key = genkey(fips ? "(genkey (ecc (curve \"NIST P-256\")))"
+    int ecdsa = !dsa_available();
+    gcry_sexp_t key = genkey(ecdsa ? "(genkey (ecc (curve \"NIST P-256\")))"
                              : "(genkey (dsa (nbits 4:1024)))");
     gcry_sexp_t priv;
     gcry_sexp_t pub;
@@ -2937,8 +2989,9 @@ TEST(dsa_more_data_handling)
     pub = gcry_sexp_find_token(key, "public-key", 0);
 
     /* The sm2 flag has no meaning for DSA and is ignored; ECDSA (used in
-     * FIPS mode) has no SM2 on its curves. */
-    if (fips) {
+     * FIPS mode, or where the provider has no DSA) has no SM2 on its
+     * curves. */
+    if (ecdsa) {
         ASSERT_ERR(GPG_ERR_NOT_IMPLEMENTED,
                    sign_text(&sig, "(data (flags sm2) (hash sha256 #" D32 "#))",
                              priv));
@@ -3722,6 +3775,11 @@ TEST(dsa_sizes)
         return;
     }
 
+    if (!dsa_available()) {
+        printf("  (skipping: DSA not available)\n");
+        return;
+    }
+
     key = genkey("(genkey (dsa (nbits 4:1024) (qbits 3:160)"
                  " (flags use-fips186-2)))");
     ASSERT_NOT_NULL(key);
@@ -3759,6 +3817,8 @@ TEST(ecc_sm2_and_curve_rules)
         gcry_sexp_release(data);
         gcry_sexp_release(sec);
     } else {
+        gcry_error_t err;
+
         key = genkey("(genkey (ecc (curve sm2p256v1)))");
         ASSERT_NOT_NULL(key);
         pub = gcry_sexp_find_token(key, "public-key", 0);
@@ -3766,18 +3826,28 @@ TEST(ecc_sm2_and_curve_rules)
         ASSERT_OK(gcry_sexp_build(&data, NULL,
                                   "(data (flags sm2) (hash sha256 %b))", 32,
                                   digest));
-        ASSERT_OK(gcry_pk_sign(&sig, data, sec));
-        ASSERT_TRUE(has_token(sig, "sm2"));
-        ASSERT_OK(gcry_pk_verify(sig, data, pub));
+        err = gcry_pk_sign(&sig, data, sec);
+
+        /* A strict provider may know the curve but have no SM2 key type;
+         * the library then reports the scheme as unsupported. */
+        if (TEST_STRICT_PROVIDER
+            && gcry_err_code(err) == GPG_ERR_NOT_SUPPORTED) {
+            printf("  (skipping SM2 signatures: not available)\n");
+        } else {
+            ASSERT_OK(err);
+            ASSERT_TRUE(has_token(sig, "sm2"));
+            ASSERT_OK(gcry_pk_verify(sig, data, pub));
+            gcry_sexp_release(data);
+            digest[0] ^= 1;
+            ASSERT_OK(gcry_sexp_build(&data, NULL,
+                                      "(data (flags sm2) (hash sha256 %b))", 32,
+                                      digest));
+            ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
+            gcry_sexp_release(sig);
+            digest[0] ^= 1;
+        }
+
         gcry_sexp_release(data);
-        digest[0] ^= 1;
-        ASSERT_OK(gcry_sexp_build(&data, NULL,
-                                  "(data (flags sm2) (hash sha256 %b))", 32,
-                                  digest));
-        ASSERT_ERR(GPG_ERR_BAD_SIGNATURE, gcry_pk_verify(sig, data, pub));
-        gcry_sexp_release(data);
-        gcry_sexp_release(sig);
-        digest[0] ^= 1;
         gcry_sexp_release(pub);
         gcry_sexp_release(sec);
         gcry_sexp_release(key);

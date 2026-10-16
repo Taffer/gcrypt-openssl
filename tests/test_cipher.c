@@ -42,13 +42,23 @@ algo_available(int algo)
     return 1;
 }
 
-/* The error for opening a non-FIPS algorithm in a mode it cannot do: the
- * algorithm check precedes the mode check, so FIPS mode reports the
- * algorithm, as the reference library does. */
-static gcry_err_code_t
-bad_mode_err(void)
+/* Whether a cipher the library's tables list is not offered: always in
+ * FIPS mode (every use of this asks about a non-approved cipher), and
+ * under a strict provider whenever the provider lacks it. */
+static int
+cipher_unavailable(int algo)
 {
-    return gcry_fips_mode_active() ? GPG_ERR_CIPHER_ALGO
+    return gcry_fips_mode_active()
+           || (TEST_STRICT_PROVIDER && gcry_cipher_test_algo(algo) != 0);
+}
+
+/* The error for opening ALGO, a non-FIPS algorithm, in a mode it cannot
+ * do: the algorithm check precedes the mode check, so where the algorithm
+ * is not offered that is reported, as the reference library does. */
+static gcry_err_code_t
+bad_mode_err(int algo)
+{
+    return cipher_unavailable(algo) ? GPG_ERR_CIPHER_ALGO
            : GPG_ERR_INV_CIPHER_MODE;
 }
 
@@ -930,9 +940,9 @@ TEST(errors)
     ASSERT_NULL(hd);
     ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
                gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_STREAM, 0));
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_3DES),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_GCM, 0));
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_ARCFOUR),
                gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR, GCRY_CIPHER_MODE_CBC, 0));
     ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
                gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_POLY1305, 0));
@@ -1103,7 +1113,7 @@ TEST(aes_siv_rfc5297)
     gcry_cipher_close(hd);
 
     /* SIV needs a 128 bit block cipher. */
-    ASSERT_ERR(GPG_ERR_INV_CIPHER_MODE,
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_3DES),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_SIV, 0));
 }
 
@@ -1297,7 +1307,7 @@ TEST(aes_ccm_states)
     ASSERT_ERR(GPG_ERR_CHECKSUM, gcry_cipher_checktag(hd, tag, 8));
     gcry_cipher_close(hd);
 
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_3DES),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_CCM, 0));
 }
 
@@ -1396,7 +1406,7 @@ TEST(xts_and_keywrap_lengths)
     ASSERT_OK(gcry_cipher_decrypt(hd, back, 17, out, 17));
     ASSERT_MEM_EQ(data, back, 17);
     gcry_cipher_close(hd);
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_3DES),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_XTS, 0));
 
     /* RFC 3394 wrap needs at least two whole semiblocks. */
@@ -1514,7 +1524,7 @@ TEST(ocb_generic_block_ciphers)
     }
 
     /* OCB needs a 128 bit block cipher and a key before the nonce. */
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_3DES),
                gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_OCB, 0));
     ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_OCB, 0));
     ASSERT_ERR(GPG_ERR_INV_STATE, gcry_cipher_setiv(hd, nonce, sizeof nonce));
@@ -1595,7 +1605,7 @@ TEST(controls_and_misc)
                                                           GCRYCTL_GET_BLKLEN, NULL, NULL));
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_algo_info(GCRY_CIPHER_AES,
                                                       GCRYCTL_TEST_ALGO, NULL, &n));
-    ASSERT_ERR(bad_mode_err(),
+    ASSERT_ERR(bad_mode_err(GCRY_CIPHER_CHACHA20),
                gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_CBC,
                                 0));
 
@@ -2149,14 +2159,22 @@ TEST(upstream_key_lengths)
         unsigned char k3[24];
         size_t w;
 
-        if (gcry_fips_mode_active()) {
-            /* Neither DES nor 3DES is a FIPS algorithm. */
+        /* Neither DES nor 3DES is a FIPS algorithm, and a strict provider
+         * may lack either. */
+        if (cipher_unavailable(GCRY_CIPHER_DES)) {
             ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
                        gcry_cipher_open(&hd, GCRY_CIPHER_DES, GCRY_CIPHER_MODE_ECB,
                                         0));
+        }
+
+        if (cipher_unavailable(GCRY_CIPHER_3DES)) {
             ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
                        gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_ECB,
                                         0));
+        }
+
+        if (cipher_unavailable(GCRY_CIPHER_DES)
+            || cipher_unavailable(GCRY_CIPHER_3DES)) {
             return;
         }
 
@@ -2261,7 +2279,7 @@ TEST(upstream_iv_conventions)
     gcry_cipher_close(hd);
 
     /* ARCFOUR takes and ignores an IV. */
-    if (gcry_fips_mode_active()) {
+    if (cipher_unavailable(GCRY_CIPHER_ARCFOUR)) {
         ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
                    gcry_cipher_open(&hd, GCRY_CIPHER_ARCFOUR,
                                     GCRY_CIPHER_MODE_STREAM, 0));
@@ -2364,7 +2382,7 @@ TEST(upstream_keywrap_and_ccm)
         gcry_cipher_close(hd);
     }
 
-    if (gcry_fips_mode_active()) {
+    if (cipher_unavailable(GCRY_CIPHER_3DES)) {
         ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
                    gcry_cipher_open(&hd, GCRY_CIPHER_3DES, GCRY_CIPHER_MODE_AESWRAP,
                                     0));
@@ -2713,11 +2731,12 @@ TEST(xts_ciphertext_stealing)
     gcry_cipher_close(hd);
 
     /* The generic path: AES-192 everywhere, the other ciphers only
-     * outside FIPS mode, where they are not available at all. */
+     * outside FIPS mode, where they are not available at all (nor need
+     * a strict provider have them). */
     for (i = 0; i < sizeof variants / sizeof variants[0]; i++) {
         int algo = variants[i].algo;
 
-        if (algo != GCRY_CIPHER_AES192 && gcry_fips_mode_active()) {
+        if (algo != GCRY_CIPHER_AES192 && cipher_unavailable(algo)) {
             ASSERT_ERR(GPG_ERR_CIPHER_ALGO,
                        gcry_cipher_open(&hd, algo, GCRY_CIPHER_MODE_XTS, 0));
             continue;
@@ -2893,11 +2912,12 @@ TEST(ccm_long_aad)
 TEST(disable_algo)
 {
     gcry_cipher_hd_t hd = NULL;
-    /* FIPS mode has already rejected CAST5; disable an AES variant there. */
-    int fips = gcry_fips_mode_active();
-    int algo = fips ? GCRY_CIPHER_AES192 : GCRY_CIPHER_CAST5;
-    const char *name = fips ? "AES192" : "CAST5";
-    size_t keylen = fips ? 24 : 16;
+    /* FIPS mode (or a strict provider) has already rejected CAST5; disable
+     * an AES variant there. */
+    int no_cast5 = cipher_unavailable(GCRY_CIPHER_CAST5);
+    int algo = no_cast5 ? GCRY_CIPHER_AES192 : GCRY_CIPHER_CAST5;
+    const char *name = no_cast5 ? "AES192" : "CAST5";
+    size_t keylen = no_cast5 ? 24 : 16;
 
     if (!algo_available(algo)) {
         return;

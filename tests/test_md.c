@@ -240,11 +240,21 @@ check_unavailable(int algo)
     return 1;
 }
 
-/* CHECK, except that in FIPS mode the algorithm is not offered and must be
- * reported as unknown everywhere instead. */
+/* Whether a digest the library's tables list is not offered: always in
+ * FIPS mode (every use of this asks about a non-approved digest), and
+ * under a strict provider whenever the provider lacks it. */
+static int
+md_unavailable(int algo)
+{
+    return gcry_fips_mode_active()
+           || (TEST_STRICT_PROVIDER && gcry_md_test_algo(algo) != 0);
+}
+
+/* CHECK, except that an algorithm that is not offered must be reported as
+ * unknown everywhere instead. */
 #define CHECK_OR_UNAVAILABLE(algo, data, hex)     \
     do {                                          \
-        if (gcry_fips_mode_active()) {            \
+        if (md_unavailable(algo)) {               \
             ASSERT_TRUE(check_unavailable(algo)); \
         } else {                                  \
             CHECK(algo, data, hex);               \
@@ -962,12 +972,12 @@ TEST(algorithm_info)
     n = sizeof oid;
     ASSERT_OK(gcry_md_get_asnoid(GCRY_MD_SHA1, oid, &n));
     ASSERT_EQ(15, n);
-    /* Whirlpool has no DigestInfo prefix; in FIPS mode the algorithm itself
-     * is unavailable, which is reported first. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO,
-                          gcry_md_get_asnoid(GCRY_MD_WHIRLPOOL, NULL, &n));
+    /* Whirlpool has no DigestInfo prefix; where the algorithm itself is
+     * unavailable (FIPS mode, a strict provider) that is reported first. */
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_WHIRLPOOL), GPG_ERR_DIGEST_ALGO,
+                     gcry_md_get_asnoid(GCRY_MD_WHIRLPOOL, NULL, &n));
 
-    if (!gcry_fips_mode_active()) {
+    if (!md_unavailable(GCRY_MD_WHIRLPOOL)) {
         ASSERT_EQ(0, n);
     }
 

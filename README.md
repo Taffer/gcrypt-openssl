@@ -263,12 +263,27 @@ providers with `fips=yes` as the default property; the library picks that
 up through `OSSL_LIB_CTX_load_config()`.
 
 Chainguard's strict FIPS provider omits some algorithms that FIPS
-approves and OpenSSL's own provider offers. `-DGCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT=ON`
-defines `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` for every target and
-makes the tests accept those omissions; the library itself is unchanged.
-Currently it covers one case: SHA-512/224 may be reported as an unknown
-digest, in which case `test_md` expects `GPG_ERR_DIGEST_ALGO` instead of
-the known answer.
+approves and OpenSSL's own provider offers, and the default provider
+shipped beside it is stripped of the legacy algorithms too, so even with
+the library outside FIPS mode its tables list algorithms the provider
+lacks. `-DGCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT=ON` defines
+`GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` for every target and makes the
+tests tolerate those omissions; the library has no flag-dependent code.
+Under the flag the tests ask the family's `test_algo` function first: a
+digest, cipher or MAC the provider lacks (SHA-512/224, RIPEMD-160,
+Whirlpool, SM3, DES, Triple-DES, RC4, CAST5, Blowfish, IDEA, RC2, SM4,
+Camellia, ARIA, SEED, ...) is expected to be reported as unknown
+everywhere, with `GPG_ERR_DIGEST_ALGO`, `GPG_ERR_CIPHER_ALGO` or
+`GPG_ERR_MAC_ALGO`, and the `GCRYCTL_FIPS_REJECT_NON_FIPS` flags cannot
+bring it back; a mode error for such a cipher (Triple-DES in GCM, say) is
+the algorithm error, as in FIPS mode. When DSA key generation fails,
+tests that only need a signing key use ECDSA and the DSA-specific tests
+are skipped with a message. When the provider has the SM2 curve but no
+SM2 key type, the library reports `GPG_ERR_NOT_SUPPORTED` for SM2
+signatures (in every build) and the test skips them. `test_curves` skips
+its look-up of a foreign small curve (secp112r1) when the OpenSSL build
+has dropped it. With the flag off nothing changes: the tests expect
+exactly what OpenSSL's own providers offer.
 
 What FIPS mode offers, as seen through OpenSSL 4.0.3's FIPS provider: AES
 in every mode except SIV and GCM-SIV; SHA-1, SHA-2, SHA-3, SHAKE and

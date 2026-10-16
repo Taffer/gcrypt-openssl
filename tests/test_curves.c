@@ -120,9 +120,16 @@ TEST(lookup_misses)
     ASSERT_NULL(_gcry_ecc_curve_by_nbits(255)); /* not a NIST curve */
     ASSERT_NULL(_gcry_ecc_curve_by_index(_gcry_ecc_curve_count()));
     ASSERT_NULL(_gcry_ecc_curve_from_group(NULL));
-    ASSERT_NOT_NULL(foreign);
-    ASSERT_NULL(_gcry_ecc_curve_from_group(foreign));
-    EC_GROUP_free(foreign);
+
+    /* A strict provider may have dropped the small curves altogether. */
+    if (TEST_STRICT_PROVIDER && !foreign) {
+        printf("  (skipping secp112r1: not available)\n");
+    } else {
+        ASSERT_NOT_NULL(foreign);
+        ASSERT_NULL(_gcry_ecc_curve_from_group(foreign));
+        EC_GROUP_free(foreign);
+    }
+
     ASSERT_NULL(_gcry_ecc_curve_param(_gcry_ecc_curve_find("NIST P-256"), "q"));
 }
 

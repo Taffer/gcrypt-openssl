@@ -1,3 +1,4 @@
+_gcry_mpi_get_const
 gcry_calloc
 gcry_calloc_secure
 gcry_check_version
@@ -87,8 +88,8 @@ gcry_md_setkey
 gcry_md_write
 gcry_mpi_abs
 gcry_mpi_add
-gcry_mpi_addm
 gcry_mpi_add_ui
+gcry_mpi_addm
 gcry_mpi_aprint
 gcry_mpi_clear_bit
 gcry_mpi_clear_flag
@@ -111,7 +112,6 @@ gcry_mpi_ec_set_mpi
 gcry_mpi_ec_set_point
 gcry_mpi_ec_sub
 gcry_mpi_gcd
-_gcry_mpi_get_const
 gcry_mpi_get_flag
 gcry_mpi_get_nbits
 gcry_mpi_get_opaque
@@ -122,8 +122,8 @@ gcry_mpi_lshift
 gcry_mpi_mod
 gcry_mpi_mul
 gcry_mpi_mul_2exp
-gcry_mpi_mulm
 gcry_mpi_mul_ui
+gcry_mpi_mulm
 gcry_mpi_neg
 gcry_mpi_new
 gcry_mpi_point_copy
@@ -149,8 +149,8 @@ gcry_mpi_set_ui
 gcry_mpi_snatch
 gcry_mpi_snew
 gcry_mpi_sub
-gcry_mpi_subm
 gcry_mpi_sub_ui
+gcry_mpi_subm
 gcry_mpi_swap
 gcry_mpi_test_bit
 gcry_pk_algo_info
