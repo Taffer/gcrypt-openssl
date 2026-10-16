@@ -84,11 +84,28 @@ run_child(int (*fn)(void))
     return WIFSIGNALED(status) ? 1000 + WTERMSIG(status) : -2;
 }
 
-/* GCRYCTL_FORCE_FIPS_MODE before initialisation: 10 + resulting mode. */
+/* Whether the library says it is operational, which agrees with the
+ * self test and the configuration report; -1 if they disagree. */
+static int
+operational_state(void)
+{
+    int a = gcry_control(GCRYCTL_OPERATIONAL_P) != 0;
+    int b = gcry_err_code(gcry_control(GCRYCTL_SELFTEST))
+            != GPG_ERR_SELFTEST_FAILED;
+    char *cfg = gcry_get_config(0, "fips-error");
+    int c = cfg && strcmp(cfg, "fips-error:n:") == 0;
+
+    gcry_free(cfg);
+    return (a == b && a == c) ? a : -1;
+}
+
+/* GCRYCTL_FORCE_FIPS_MODE before initialisation: 10 + resulting mode,
+ * plus 4 when the library is not operational afterwards. */
 static int
 child_force(void)
 {
     int s;
+    int op;
 
     if (gcry_control(GCRYCTL_FORCE_FIPS_MODE)) {
         return 90;
@@ -96,9 +113,14 @@ child_force(void)
 
     gcry_check_version(NULL);
     s = fips_state();
+    op = operational_state();
 
     if (s < 0) {
         return 91;
+    }
+
+    if (op < 0) {
+        return 97;
     }
 
     /* Too late now, whatever the mode. */
@@ -107,7 +129,14 @@ child_force(void)
         return 92;
     }
 
-    return 10 + s;
+    /* Not operational means FIPS mode was required but no provider could
+     * be activated; that state must refuse to be switched off too. */
+    if (!op && gcry_err_code(gcry_control(GCRYCTL_NO_FIPS_MODE))
+        != GPG_ERR_GENERAL) {
+        return 98;
+    }
+
+    return 10 + s + (op ? 0 : 4);
 }
 
 /* GCRYCTL_NO_FIPS_MODE before initialisation: 20 + resulting mode. */
@@ -142,22 +171,32 @@ child_force_then_no_fips(void)
 }
 
 /* GCRYCTL_NO_FIPS_MODE after initialisation but before the application
- * declared initialisation finished switches the mode off; afterwards it
- * is refused.  Returns 30 on success. */
+ * declared initialisation finished: accepted while nothing established
+ * FIPS mode (the mode stays off), refused once it is active, and refused
+ * in any case afterwards.  Returns 30 + the mode on success. */
 static int
 child_no_fips_before_finished(void)
 {
+    int s;
+
     gcry_check_version(NULL);
 
     if (gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P)) {
         return 93;
     }
 
-    if (gcry_control(GCRYCTL_NO_FIPS_MODE)) {
+    s = fips_state();
+
+    if (s < 0) {
+        return 91;
+    }
+
+    if (gcry_err_code(gcry_control(GCRYCTL_NO_FIPS_MODE))
+        != (s ? GPG_ERR_GENERAL : 0)) {
         return 94;
     }
 
-    if (fips_state() != 0) {
+    if (fips_state() != s) {
         return 95;
     }
 
@@ -167,17 +206,18 @@ child_no_fips_before_finished(void)
         return 96;
     }
 
-    return 30;
+    return 30 + s;
 }
 
 TEST(pre_init_controls)
 {
     ASSERT_TRUE(parent_fips == 0 || parent_fips == 1);
 
-    /* Forcing FIPS mode enables it when a FIPS provider can be loaded;
-     * without one the library carries on in normal mode.  It can never
-     * leave the process with less than the configuration already gave. */
-    ASSERT_TRUE(r_force == 11 || (r_force == 10 && !parent_fips));
+    /* Forcing FIPS mode enables it when a FIPS provider can be loaded.
+     * Without one the library is in FIPS mode but not operational, as the
+     * reference is when FIPS mode is required and cannot be established;
+     * that cannot happen where the configuration already gave FIPS mode. */
+    ASSERT_TRUE(r_force == 11 || (r_force == 15 && !parent_fips));
 
     /* Declining FIPS mode only withdraws the library's own request; a
      * configuration that enables the FIPS provider still applies. */
@@ -185,7 +225,10 @@ TEST(pre_init_controls)
     ASSERT_EQ(40 + parent_fips, r_force_then_no_fips);
 
     /* The window between initialisation and INITIALIZATION_FINISHED. */
-    ASSERT_EQ(30, r_no_fips_before_finished);
+    ASSERT_EQ(30 + parent_fips, r_no_fips_before_finished);
+
+    /* This process is operational: FIPS mode, if any, was established. */
+    ASSERT_TRUE(gcry_control(GCRYCTL_OPERATIONAL_P));
 }
 
 static gcry_sexp_t

@@ -23,6 +23,13 @@ _gcry_random_bytes_into(void *buffer, size_t length,
         return GPG_ERR_INV_ARG;
     }
 
+    /* FIPS mode required without a FIPS provider: no generator may be
+     * used (none could be fetched anyway); say so rather than failing
+     * with a bare "random number generator failed". */
+    if (_gcry_fips_error_state()) {
+        return GPG_ERR_NOT_OPERATIONAL;
+    }
+
     if (level == GCRY_WEAK_RANDOM) {
         ok = RAND_bytes_ex(_gcry_libctx(), buffer, length, 0);
     } else {
@@ -56,9 +63,22 @@ gcry_randomize(void *buffer, size_t length, enum gcry_random_level level)
     do_randomize(buffer, length, level);
 }
 
+/* Mix the caller's bytes into DRBG as additional input of a reseed; the
+ * generator draws fresh entropy from its source at the same time, so the
+ * result can only get better, never worse. */
+static void
+reseed_with(EVP_RAND_CTX *drbg, const void *buffer, size_t length)
+{
+    if (drbg && !EVP_RAND_reseed(drbg, 0, NULL, 0, buffer, length)) {
+        ERR_clear_error();
+    }
+}
+
 gcry_error_t
 gcry_random_add_bytes(const void *buffer, size_t length, int quality)
 {
+    OSSL_LIB_CTX *libctx;
+
     if (!buffer) {
         return GCRY_ERR(GPG_ERR_INV_ARG); /* As the reference, even for 0. */
     }
@@ -79,8 +99,14 @@ gcry_random_add_bytes(const void *buffer, size_t length, int quality)
         return 0;
     }
 
-    RAND_add(buffer, (int)(length > 0x7fffffffu ? 0x7fffffffu : length),
-             (double)length * (double)quality / 100.0);
+    /* The generators in use are those of the library's own context, not
+     * OpenSSL's global one, so that is where the bytes have to go: into
+     * the primary DRBG that seeds the others, and into the public one
+     * directly, which is cheap. */
+    libctx = _gcry_libctx();
+    reseed_with(RAND_get0_primary(libctx), buffer, length);
+    reseed_with(RAND_get0_public(libctx), buffer, length);
+    ERR_clear_error();
     return 0;
 }
 

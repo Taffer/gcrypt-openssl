@@ -78,6 +78,27 @@ TEST(add_bytes)
     /* As in the reference, a NULL buffer is rejected even for 0 bytes. */
     ASSERT_ERR(GPG_ERR_INV_ARG, gcry_random_add_bytes(NULL, 0, 50));
     ASSERT_OK(gcry_control(GCRYCTL_FAST_POLL, NULL));
+
+    /* The bytes are mixed into the generators actually in use, those of
+     * the library's own context.  Nothing about the output can be
+     * asserted, only that every generator still works afterwards. */
+    {
+        unsigned char big[4096];
+        unsigned char out[32];
+        size_t i;
+
+        for (i = 0; i < sizeof big; i++) {
+            big[i] = (unsigned char)(i * 7 + 3);
+        }
+
+        ASSERT_OK(gcry_random_add_bytes(big, sizeof big, 100));
+        ASSERT_OK(gcry_random_add_bytes(big, 1, 100));
+        memset(out, 0, sizeof out);
+        gcry_randomize(out, sizeof out, GCRY_VERY_STRONG_RANDOM);
+        ASSERT_FALSE(all_same(out, sizeof out));
+        gcry_randomize(out, sizeof out, GCRY_WEAK_RANDOM);
+        ASSERT_FALSE(all_same(out, sizeof out));
+    }
 }
 
 /* A NULL buffer with a non-zero length aborts; with zero bytes requested

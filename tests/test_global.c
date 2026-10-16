@@ -146,6 +146,7 @@ TEST(control_noops)
     ASSERT_OK(gcry_control(GCRYCTL_DISABLE_LOCKED_SECMEM));
     ASSERT_OK(gcry_control(GCRYCTL_DISABLE_PRIV_DROP));
     ASSERT_OK(gcry_control(GCRYCTL_AUTO_EXPAND_SECMEM, 65536u));
+    ASSERT_OK(gcry_control(GCRYCTL_AUTO_EXPAND_SECMEM, 0u)); /* Default. */
     ASSERT_OK(gcry_control(GCRYCTL_USE_SECURE_RNDPOOL));
     ASSERT_OK(gcry_control(GCRYCTL_DISABLE_INTERNAL_LOCKING));
     ASSERT_OK(gcry_control(GCRYCTL_SET_THREAD_CBS, NULL));
@@ -234,7 +235,17 @@ TEST(fips_mode_state)
                            (unsigned int)GCRY_FIPS_FLAG_REJECT_DEFAULT));
     /* Too late to leave FIPS mode once initialisation has finished. */
     ASSERT_ERR(GPG_ERR_GENERAL, gcry_control(GCRYCTL_NO_FIPS_MODE));
+
+    /* Operational: whatever mode this is, it was established.  (The not
+     * operational state, FIPS mode required without a FIPS provider, is
+     * exercised by test_fips in a forked child.) */
     ASSERT_TRUE(gcry_control(GCRYCTL_OPERATIONAL_P));
+    {
+        char *line = gcry_get_config(0, "fips-error");
+
+        ASSERT_STR_EQ("fips-error:n:", line);
+        gcry_free(line);
+    }
 }
 
 TEST(fips_service_indicators)
@@ -383,8 +394,8 @@ TEST(config_items)
 {
     static const char *const items[] = {
         "version", "cc", "ciphers", "pubkeys", "digests", "rnd-mod",
-        "cpu-arch", "mpi-asm", "mpi-pow", "hwflist", "fips-mode", "rng-type",
-        "compliance"
+        "cpu-arch", "mpi-asm", "mpi-pow", "hwflist", "fips-mode", "fips-error",
+        "rng-type", "compliance"
     };
     size_t i;
 
@@ -593,6 +604,33 @@ TEST(log_handler_sexp_and_point)
     log_reset();
     gcry_log_debugsxp("nosexp", NULL);
     ASSERT_STR_EQ("nosexp: \n", logbuf);
+
+    {
+        /* The advanced format of a deeply nested expression is quadratic
+         * in the depth; the dump falls back to the canonical format
+         * instead of allocating many MiB (and dying when it cannot). */
+        enum { depth = 4000 };
+        char *text = malloc(3 * depth + 8);
+        gcry_sexp_t deep = NULL;
+        int i;
+
+        ASSERT_NOT_NULL(text);
+
+        for (i = 0; i < depth; i++) {
+            memcpy(text + 2 * i, "(a", 2);
+        }
+
+        memcpy(text + 2 * depth, "1:x", 3);
+        memset(text + 2 * depth + 3, ')', depth);
+        text[3 * depth + 3] = 0;
+        ASSERT_OK(gcry_sexp_sscan(&deep, NULL, text, strlen(text)));
+        free(text);
+        log_reset();
+        gcry_log_debugsxp("deep", deep);
+        gcry_sexp_release(deep);
+        ASSERT_TRUE(strncmp(logbuf, "deep: (1:a(1:a(1:a", 18) == 0);
+        ASSERT_EQ(3, logcalls); /* The text, one line, its newline. */
+    }
 
     log_reset();
     gcry_log_debugsxp(NULL, NULL);

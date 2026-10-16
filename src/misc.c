@@ -304,6 +304,9 @@ gcry_log_debugpnt(const char *text, gcry_mpi_point_t point, gcry_ctx_t ctx)
     gcry_log_debugmpi(buf, point->z);
 }
 
+/* Largest S-expression dump gcry_log_debugsxp produces in one piece. */
+#define DEBUGSXP_MAX_SIZE ((size_t)4 << 20)
+
 /* The number of closing parentheses at P when nothing but closing
  * parentheses and white space follow; 0 otherwise. */
 static int
@@ -345,12 +348,33 @@ gcry_log_debugsxp(const char *text, gcry_sexp_t sexp)
     }
 
     if (sexp) {
-        size_t size = gcry_sexp_sprint(sexp, GCRYSEXP_FMT_ADVANCED, NULL, 0);
-        char *buf = _gcry_xmalloc(size);
-        const char *p = buf;
+        /* The advanced format indents every line by its nesting depth, so
+         * its size grows with the square of the depth: a debug dump of a
+         * deeply nested expression from outside must not take the process
+         * down with an out-of-core error.  Beyond a few MiB fall back to
+         * the canonical format, whose size is linear, and if even that is
+         * too large (or memory is short) say so instead. */
+        int fmt = GCRYSEXP_FMT_ADVANCED;
+        size_t size = gcry_sexp_sprint(sexp, fmt, NULL, 0);
+        char *buf;
+        const char *p;
         int any = 0;
 
-        gcry_sexp_sprint(sexp, GCRYSEXP_FMT_ADVANCED, buf, size);
+        if (size > DEBUGSXP_MAX_SIZE) {
+            fmt = GCRYSEXP_FMT_CANON;
+            size = gcry_sexp_sprint(sexp, fmt, NULL, 0);
+        }
+
+        buf = size && size <= DEBUGSXP_MAX_SIZE ? _gcry_malloc(size) : NULL;
+
+        if (!buf) {
+            _gcry_log(with_lf ? GCRY_LOG_DEBUG : GCRY_LOG_CONT,
+                      "[S-expression of %zu bytes not shown]\n", size);
+            return;
+        }
+
+        gcry_sexp_sprint(sexp, fmt, buf, size);
+        p = buf;
 
         do {
             const char *pend;
