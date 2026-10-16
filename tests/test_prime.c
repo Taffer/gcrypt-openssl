@@ -317,6 +317,37 @@ TEST(argument_edges)
     }
 }
 
+/* The generator search takes only numbers: an opaque prime or starting
+ * value is rejected before any arithmetic, and NULL inputs likewise. */
+TEST(group_generator_arguments)
+{
+    gcry_mpi_t g = NULL;
+    gcry_mpi_t eleven = gcry_mpi_set_ui(NULL, 11);
+    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "abc", 24);
+    gcry_mpi_t f[3];
+
+    f[0] = gcry_mpi_set_ui(NULL, 2);
+    f[1] = gcry_mpi_set_ui(NULL, 5);
+    f[2] = NULL;
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_group_generator(&g, NULL, f, NULL));
+    ASSERT_NULL(g);
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_group_generator(&g, o, f, NULL));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_prime_group_generator(&g, eleven, f, o));
+    ASSERT_NULL(g);
+    gcry_mpi_release(f[1]);
+    f[1] = o;
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_prime_group_generator(&g, eleven, f, NULL));
+    f[1] = gcry_mpi_set_ui(NULL, 5);
+    ASSERT_OK(gcry_prime_group_generator(&g, eleven, f, NULL));
+    ASSERT_EQ(0, gcry_mpi_cmp_ui(g, 6));
+    gcry_mpi_release(g);
+    gcry_mpi_release(f[0]);
+    gcry_mpi_release(f[1]);
+    gcry_mpi_release(eleven);
+    gcry_mpi_release(o);
+}
+
 int
 main(void)
 {
@@ -327,5 +358,6 @@ main(void)
     RUN_TEST(callback);
     RUN_TEST(callback_vetoes_candidates);
     RUN_TEST(argument_edges);
+    RUN_TEST(group_generator_arguments);
     return TEST_RESULT();
 }

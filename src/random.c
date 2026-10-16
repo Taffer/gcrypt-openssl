@@ -49,12 +49,20 @@ do_randomize(void *buffer, size_t length, enum gcry_random_level level)
 void
 gcry_randomize(void *buffer, size_t length, enum gcry_random_level level)
 {
+    if (!buffer && length) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_randomize: NULL argument");
+    }
+
     do_randomize(buffer, length, level);
 }
 
 gcry_error_t
 gcry_random_add_bytes(const void *buffer, size_t length, int quality)
 {
+    if (!buffer) {
+        return GCRY_ERR(GPG_ERR_INV_ARG); /* As the reference, even for 0. */
+    }
+
     if (_gcry_fips_mode()) {
         return 0; /* The FIPS DRBG must not be fed from outside. */
     }
@@ -65,10 +73,6 @@ gcry_random_add_bytes(const void *buffer, size_t length, int quality)
         quality = 100;
     } else if (quality < 0) {
         quality = 0;
-    }
-
-    if (!buffer) {
-        return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
     if (!length || quality < 10) {
@@ -101,5 +105,9 @@ gcry_random_bytes_secure(size_t nbytes, enum gcry_random_level level)
 void
 gcry_create_nonce(void *buffer, size_t length)
 {
+    if (!buffer && length) {
+        _gcry_fatal_error(GPG_ERR_INV_ARG, "gcry_create_nonce: NULL argument");
+    }
+
     do_randomize(buffer, length, GCRY_WEAK_RANDOM);
 }
