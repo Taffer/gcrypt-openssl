@@ -242,6 +242,21 @@ fetch_kdf(const char *kdfname)
     return kdf;
 }
 
+/* Does this OpenSSL offer the named KDF?  The FIPS provider, for one,
+ * has neither scrypt nor Argon2. */
+static int
+kdf_available(const char *kdfname)
+{
+    EVP_KDF *kdf = fetch_kdf(kdfname);
+
+    if (!kdf) {
+        return 0;
+    }
+
+    EVP_KDF_free(kdf);
+    return 1;
+}
+
 static gcry_err_code_t
 run_kdf(const char *kdfname, OSSL_PARAM *params, void *out, size_t outlen,
         gcry_err_code_t fallback)
@@ -320,6 +335,15 @@ pbkdf2(const void *passphrase, size_t passphraselen, int hashalgo,
         return GPG_ERR_INV_VALUE;
     }
 
+    /* The SP 800-132 lower bounds of FIPS mode (FIPS 140-3 IG D.N for the
+     * passphrase), as the reference library applies them and as the FIPS
+     * provider would otherwise enforce them a step later. */
+    if (_gcry_fips_mode()
+        && (passphraselen < 8 || saltlen < 16 || iterations < 1000
+            || keysize < 14)) {
+        return GPG_ERR_INV_VALUE;
+    }
+
     params[n++] = octets(OSSL_KDF_PARAM_PASSWORD, passphrase, passphraselen);
     params[n++] = octets(OSSL_KDF_PARAM_SALT, salt, saltlen);
     params[n++] = OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_ITER, &iter);
@@ -347,7 +371,8 @@ scrypt(const void *passphrase, size_t passphraselen, int algo, int subalgo,
     uint64_t maxmem = SCRYPT_MAXMEM;
     size_t n = 0;
 
-    if (subalgo < 1 || !iterations) {
+    /* RFC 7914: N is a power of two greater than one, p is non-zero. */
+    if (subalgo < 2 || (subalgo & (subalgo - 1)) || !iterations) {
         return GPG_ERR_INV_VALUE;
     }
 
@@ -497,12 +522,18 @@ argon2_open(gcry_kdf_hd_t h)
     return 0;
 }
 
+static const char *
+argon2_name(gcry_kdf_hd_t h)
+{
+    return h->subalgo == GCRY_KDF_ARGON2D ? "ARGON2D"
+           : h->subalgo == GCRY_KDF_ARGON2I ? "ARGON2I"
+           : "ARGON2ID";
+}
+
 static gcry_err_code_t
 argon2_compute(gcry_kdf_hd_t h)
 {
-    const char *name = h->subalgo == GCRY_KDF_ARGON2D ? "ARGON2D"
-                       : h->subalgo == GCRY_KDF_ARGON2I ? "ARGON2I"
-                       : "ARGON2ID";
+    const char *name = argon2_name(h);
     OSSL_PARAM params[10];
     size_t n = 0;
     uint32_t iter = (uint32_t)h->param[1];
@@ -649,6 +680,12 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
         } else {
             h->paramlen = paramlen;
             ec = argon2_open(h);
+
+            /* Fail at open rather than at compute when this OpenSSL
+             * (the FIPS provider, say) has no Argon2. */
+            if (!ec && !kdf_available(argon2_name(h))) {
+                ec = GPG_ERR_UNSUPPORTED_ALGORITHM;
+            }
         }
 
         break;

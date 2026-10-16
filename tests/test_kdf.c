@@ -129,6 +129,17 @@ TEST(s2k_vectors)
     unsigned char out[32];
 
     for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
+        /* The S2K functions are iterated digests; the SHA-based ones run
+         * in FIPS mode, MD5 is unavailable there. */
+        if (gcry_fips_mode_active() && tv[i].hashalgo == GCRY_MD_MD5) {
+            ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
+                       gcry_kdf_derive(tv[i].p, tv[i].plen, tv[i].algo,
+                                       tv[i].hashalgo, tv[i].salt,
+                                       tv[i].salt ? 8 : 0, tv[i].c,
+                                       tv[i].dklen, out));
+            continue;
+        }
+
         ASSERT_OK(gcry_kdf_derive(tv[i].p, tv[i].plen, tv[i].algo,
                                   tv[i].hashalgo, tv[i].salt,
                                   tv[i].salt ? 8 : 0, tv[i].c, tv[i].dklen,
@@ -150,7 +161,11 @@ TEST(s2k_vectors)
 
 TEST(pbkdf2_vectors)
 {
-    /* RFC 6070 (SHA-1) and RFC 7914, section 11 (SHA-256). */
+    /* RFC 6070 (SHA-1) and RFC 7914, section 11 (SHA-256), plus one
+     * SHA-256 case within the SP 800-132 bounds of FIPS mode (passphrase
+     * of 8 or more bytes, 16 byte salt, 1000 or more iterations, 14 or
+     * more output bytes), computed with OpenSSL's own PBKDF2.  FIPS_OK
+     * marks the vectors that satisfy those bounds. */
     static const struct {
         const char *p;
         size_t plen;
@@ -159,66 +174,103 @@ TEST(pbkdf2_vectors)
         int hashalgo;
         unsigned long c;
         size_t dklen;
+        int fips_ok;
         const char *dk;
     } tv[] = {
         {
-            "password", 8, "salt", 4, GCRY_MD_SHA1, 1, 20,
+            "password", 8, "salt", 4, GCRY_MD_SHA1, 1, 20, 0,
             "\x0c\x60\xc8\x0f\x96\x1f\x0e\x71\xf3\xa9\xb5\x24\xaf\x60\x12\x06"
             "\x2f\xe0\x37\xa6"
         },
         {
-            "password", 8, "salt", 4, GCRY_MD_SHA1, 1, 10,
+            "password", 8, "salt", 4, GCRY_MD_SHA1, 1, 10, 0,
             "\x0c\x60\xc8\x0f\x96\x1f\x0e\x71\xf3\xa9"
         },
         {
-            "password", 8, "salt", 4, GCRY_MD_SHA1, 2, 20,
+            "password", 8, "salt", 4, GCRY_MD_SHA1, 2, 20, 0,
             "\xea\x6c\x01\x4d\xc7\x2d\x6f\x8c\xcd\x1e\xd9\x2a\xce\x1d\x41\xf0"
             "\xd8\xde\x89\x57"
         },
         {
-            "password", 8, "salt", 4, GCRY_MD_SHA1, 4096, 20,
+            "password", 8, "salt", 4, GCRY_MD_SHA1, 4096, 20, 0,
             "\x4b\x00\x79\x01\xb7\x65\x48\x9a\xbe\xad\x49\xd9\x26\xf7\x21\xd0"
             "\x65\xa4\x29\xc1"
         },
         {
             "passwordPASSWORDpassword", 24,
             "saltSALTsaltSALTsaltSALTsaltSALTsalt", 36, GCRY_MD_SHA1, 4096, 25,
+            1,
             "\x3d\x2e\xec\x4f\xe4\x1c\x84\x9b\x80\xc8\xd8\x36\x62\xc0\xe4\x4a"
             "\x8b\x29\x1a\x96\x4c\xf2\xf0\x70\x38"
         },
         {
-            "pass\0word", 9, "sa\0lt", 5, GCRY_MD_SHA1, 4096, 16,
+            "pass\0word", 9, "sa\0lt", 5, GCRY_MD_SHA1, 4096, 16, 0,
             "\x56\xfa\x6a\xa7\x55\x48\x09\x9d\xcc\x37\xd7\xf0\x34\x25\xe0\xc3"
         },
         {
-            "", 0, "salt", 4, GCRY_MD_SHA1, 2, 20,
+            "", 0, "salt", 4, GCRY_MD_SHA1, 2, 20, 0,
             "\x13\x3a\x4c\xe8\x37\xb4\xd2\x52\x1e\xe2\xbf\x03\xe1\x1c\x71\xca"
             "\x79\x4e\x07\x97"
         },
         {
-            "passwd", 6, "salt", 4, GCRY_MD_SHA256, 1, 64,
+            "passwd", 6, "salt", 4, GCRY_MD_SHA256, 1, 64, 0,
             "\x55\xac\x04\x6e\x56\xe3\x08\x9f\xec\x16\x91\xc2\x25\x44\xb6\x05"
             "\xf9\x41\x85\x21\x6d\xde\x04\x65\xe6\x8b\x9d\x57\xc2\x0d\xac\xbc"
             "\x49\xca\x9c\xcc\xf1\x79\xb6\x45\x99\x16\x64\xb3\x9d\x77\xef\x31"
             "\x7c\x71\xb8\x45\xb1\xe3\x0b\xd5\x09\x11\x20\x41\xd3\xa1\x97\x83"
         },
         {
-            "Password", 8, "NaCl", 4, GCRY_MD_SHA256, 80000, 64,
+            "Password", 8, "NaCl", 4, GCRY_MD_SHA256, 80000, 64, 0,
             "\x4d\xdc\xd8\xf6\x0b\x98\xbe\x21\x83\x0c\xee\x5e\xf2\x27\x01\xf9"
             "\x64\x1a\x44\x18\xd0\x4c\x04\x14\xae\xff\x08\x87\x6b\x34\xab\x56"
             "\xa1\xd4\x25\xa1\x22\x58\x33\x54\x9a\xdb\x84\x1b\x51\xc9\xb3\x17"
             "\x6a\x27\x2b\xde\xbb\xa1\xd0\x78\x47\x8f\x62\xb3\x97\xf3\x3c\x8d"
+        },
+        {
+            "password", 8, "saltSALTsaltSALT", 16, GCRY_MD_SHA256, 4096, 32,
+            1,
+            "\x91\x50\xfa\x34\xce\x25\x8f\x3f\xa0\xf4\x95\x07\xe4\x56\xa9\xa7"
+            "\x19\x24\xf6\x82\xd4\x2f\x36\x48\x2b\x26\x18\x84\x8f\xd3\x8e\x5a"
         },
     };
     size_t i;
     unsigned char out[64];
 
     for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
+        if (gcry_fips_mode_active() && !tv[i].fips_ok) {
+            ASSERT_ERR(GPG_ERR_INV_VALUE,
+                       gcry_kdf_derive(tv[i].p, tv[i].plen, GCRY_KDF_PBKDF2,
+                                       tv[i].hashalgo, tv[i].salt,
+                                       tv[i].saltlen, tv[i].c, tv[i].dklen,
+                                       out));
+            continue;
+        }
+
         ASSERT_OK(gcry_kdf_derive(tv[i].p, tv[i].plen, GCRY_KDF_PBKDF2,
                                   tv[i].hashalgo, tv[i].salt, tv[i].saltlen,
                                   tv[i].c, tv[i].dklen, out));
         ASSERT_MEM_EQ(tv[i].dk, out, tv[i].dklen);
     }
+
+    /* Each FIPS bound on its own: one byte, one iteration short. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE,
+                          gcry_kdf_derive("shortpw", 7, GCRY_KDF_PBKDF2,
+                                          GCRY_MD_SHA256, "saltSALTsaltSALT",
+                                          16, 1000, 14, out));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE,
+                          gcry_kdf_derive("password", 8, GCRY_KDF_PBKDF2,
+                                          GCRY_MD_SHA256, "saltSALTsaltSAL",
+                                          15, 1000, 14, out));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE,
+                          gcry_kdf_derive("password", 8, GCRY_KDF_PBKDF2,
+                                          GCRY_MD_SHA256, "saltSALTsaltSALT",
+                                          16, 999, 14, out));
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE,
+                          gcry_kdf_derive("password", 8, GCRY_KDF_PBKDF2,
+                                          GCRY_MD_SHA256, "saltSALTsaltSALT",
+                                          16, 1000, 13, out));
+    ASSERT_OK(gcry_kdf_derive("password", 8, GCRY_KDF_PBKDF2, GCRY_MD_SHA256,
+                              "saltSALTsaltSALT", 16, 1000, 14, out));
 
     ASSERT_ERR(GPG_ERR_INV_VALUE,
                gcry_kdf_derive("password", 8, GCRY_KDF_PBKDF2, GCRY_MD_SHA1,
@@ -267,15 +319,29 @@ TEST(scrypt_vectors)
         "\xe6\x1e\x85\xdc\x0d\x65\x1e\x40\xdf\xcf\x01\x7b\x45\x57\x58\x87";
     unsigned char out[64];
 
-    ASSERT_OK(gcry_kdf_derive("", 0, 41, 16, "", 0, 1, 64, out));
-    ASSERT_MEM_EQ(dk1, out, 64);
-    ASSERT_OK(gcry_kdf_derive("password", 8, GCRY_KDF_SCRYPT, 1024, "NaCl",
-                              4, 16, 64, out));
-    ASSERT_MEM_EQ(dk2, out, 64);
-    ASSERT_OK(gcry_kdf_derive("pleaseletmein", 13, GCRY_KDF_SCRYPT, 16384,
-                              "SodiumChloride", 14, 1, 64, out));
-    ASSERT_MEM_EQ(dk3, out, 64);
+    /* The FIPS provider has no scrypt, so FIPS mode reports it as not
+     * offered, as a build without it would. */
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+                   gcry_kdf_derive("", 0, 41, 16, "", 0, 1, 64, out));
+        ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+                   gcry_kdf_derive("password", 8, GCRY_KDF_SCRYPT, 1024,
+                                   "NaCl", 4, 16, 64, out));
+    } else {
+        ASSERT_OK(gcry_kdf_derive("", 0, 41, 16, "", 0, 1, 64, out));
+        ASSERT_MEM_EQ(dk1, out, 64);
+        ASSERT_OK(gcry_kdf_derive("password", 8, GCRY_KDF_SCRYPT, 1024,
+                                  "NaCl", 4, 16, 64, out));
+        ASSERT_MEM_EQ(dk2, out, 64);
+        ASSERT_OK(gcry_kdf_derive("pleaseletmein", 13, GCRY_KDF_SCRYPT, 16384,
+                                  "SodiumChloride", 14, 1, 64, out));
+        ASSERT_MEM_EQ(dk3, out, 64);
+    }
 
+    /* Parameter checks come before the algorithm is looked up. */
+    ASSERT_ERR(GPG_ERR_INV_VALUE,
+               gcry_kdf_derive("x", 1, GCRY_KDF_SCRYPT, 1, "s", 1, 1, 64,
+                               out));
     ASSERT_ERR(GPG_ERR_INV_VALUE,
                gcry_kdf_derive("x", 1, GCRY_KDF_SCRYPT, 0, "s", 1, 1, 64,
                                out));
@@ -341,24 +407,41 @@ TEST(argon2_vectors)
     unsigned long bad[4] = { 32, 3, 32, 0 };
 
     for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
-        ASSERT_OK(kdf_derive_hd(GCRY_KDF_ARGON2, tv[i].subalgo, tv[i].param,
-                                4, tv[i].empty_pass ? NULL : pass,
-                                tv[i].empty_pass ? 0 : 32,
-                                tv[i].salt, 16,
-                                tv[i].with_secret_ad ? secret : NULL,
-                                tv[i].with_secret_ad ? 8 : 0,
-                                tv[i].with_secret_ad ? ad : NULL,
-                                tv[i].with_secret_ad ? 12 : 0, 32,
-                                out));
+        gcry_error_t err = kdf_derive_hd(GCRY_KDF_ARGON2, tv[i].subalgo,
+                                         tv[i].param, 4,
+                                         tv[i].empty_pass ? NULL : pass,
+                                         tv[i].empty_pass ? 0 : 32,
+                                         tv[i].salt, 16,
+                                         tv[i].with_secret_ad ? secret : NULL,
+                                         tv[i].with_secret_ad ? 8 : 0,
+                                         tv[i].with_secret_ad ? ad : NULL,
+                                         tv[i].with_secret_ad ? 12 : 0, 32,
+                                         out);
+
+        /* The FIPS provider has no Argon2 either. */
+        if (gcry_fips_mode_active()) {
+            ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM, err);
+            continue;
+        }
+
+        ASSERT_OK(err);
         ASSERT_MEM_EQ(tv[i].dk, out, 32);
     }
 
     /* Three parameters imply a parallelism of one. */
-    ASSERT_OK(kdf_derive_hd(GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, tv[4].param,
-                            3, NULL, 0, salt2, 16, NULL, 0, NULL, 0, 32,
-                            out));
-    ASSERT_MEM_EQ(tv[4].dk, out, 32);
+    if (gcry_fips_mode_active()) {
+        ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+                   kdf_derive_hd(GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
+                                 tv[4].param, 3, NULL, 0, salt2, 16, NULL, 0,
+                                 NULL, 0, 32, out));
+    } else {
+        ASSERT_OK(kdf_derive_hd(GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
+                                tv[4].param, 3, NULL, 0, salt2, 16, NULL, 0,
+                                NULL, 0, 32, out));
+        ASSERT_MEM_EQ(tv[4].dk, out, 32);
+    }
 
+    /* Parameter checks come before the algorithm is looked up. */
     ASSERT_ERR(GPG_ERR_INV_VALUE,
                gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
                              tv[0].param, 4, pass, 32, NULL, 0, NULL, 0, NULL,
@@ -375,13 +458,23 @@ TEST(argon2_vectors)
                              pass, 32, salt, 16, NULL, 0, NULL, 0));
 
     /* Wrong result length at final time. */
-    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
-                            tv[0].param, 4, pass, 32, salt, 16, NULL, 0, NULL,
-                            0));
-    ASSERT_OK(gcry_kdf_compute(hd, NULL));
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 16, out));
-    ASSERT_OK(gcry_kdf_final(hd, 32, out));
-    gcry_kdf_close(hd);
+    if (gcry_fips_mode_active()) {
+        hd = NULL;
+        ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+                   gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
+                                 tv[0].param, 4, pass, 32, salt, 16, NULL, 0,
+                                 NULL, 0));
+        ASSERT_NULL(hd);
+    } else {
+        ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
+                                tv[0].param, 4, pass, 32, salt, 16, NULL, 0,
+                                NULL, 0));
+        ASSERT_OK(gcry_kdf_compute(hd, NULL));
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 16, out));
+        ASSERT_OK(gcry_kdf_final(hd, 32, out));
+        gcry_kdf_close(hd);
+    }
+
     gcry_kdf_close(NULL);
 }
 
@@ -569,6 +662,13 @@ TEST(hkdf_vectors)
                             out));
     ASSERT_MEM_EQ(okm1, out, 42);
 
+    /* The FIPS provider wants at least 112 bits of input keying
+     * material; RFC 5869 sets no minimum. */
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE,
+                          kdf_derive_hd(GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256,
+                                        param, 1, ikm1, 13, NULL, 0, salt1,
+                                        13, info1, 10, 42, out));
+
     param[0] = 255 * 32 + 1;
     ASSERT_ERR(GPG_ERR_INV_VALUE,
                gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param,
@@ -719,27 +819,36 @@ TEST(argument_validation)
     ASSERT_ERR(GPG_ERR_INV_VALUE, /* too few parameters */
                gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 2,
                              "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
-    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
-                            "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
-    ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 16, out));
-    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_kdf_final(hd, 32, NULL));
-    ASSERT_OK(gcry_kdf_compute(hd, NULL));
-    ASSERT_OK(gcry_kdf_final(hd, 32, out));
-    gcry_kdf_close(hd);
-    /* A caller supplied thread dispatcher gives the same result. */
-    {
-        gcry_kdf_thread_ops_t ops;
-        int jobs = 0;
 
-        ops.jobs_context = &jobs;
-        ops.dispatch_job = dispatch_inline;
-        ops.wait_all_jobs = wait_none;
-        ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param, 4,
-                                "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
-        ASSERT_OK(gcry_kdf_compute(hd, &ops));
-        ASSERT_OK(gcry_kdf_final(hd, 32, out2));
+    if (gcry_fips_mode_active()) {
+        /* No Argon2 in the FIPS provider. */
+        ASSERT_ERR(GPG_ERR_UNSUPPORTED_ALGORITHM,
+                   gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param,
+                                 4, "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+    } else {
+        ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID, param,
+                                4, "pw", 2, "saltsalt", 8, NULL, 0, NULL, 0));
+        ASSERT_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 16, out));
+        ASSERT_ERR(GPG_ERR_INV_ARG, gcry_kdf_final(hd, 32, NULL));
+        ASSERT_OK(gcry_kdf_compute(hd, NULL));
+        ASSERT_OK(gcry_kdf_final(hd, 32, out));
         gcry_kdf_close(hd);
-        ASSERT_MEM_EQ(out, out2, 32);
+        /* A caller supplied thread dispatcher gives the same result. */
+        {
+            gcry_kdf_thread_ops_t ops;
+            int jobs = 0;
+
+            ops.jobs_context = &jobs;
+            ops.dispatch_job = dispatch_inline;
+            ops.wait_all_jobs = wait_none;
+            ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_ARGON2, GCRY_KDF_ARGON2ID,
+                                    param, 4, "pw", 2, "saltsalt", 8, NULL, 0,
+                                    NULL, 0));
+            ASSERT_OK(gcry_kdf_compute(hd, &ops));
+            ASSERT_OK(gcry_kdf_final(hd, 32, out2));
+            gcry_kdf_close(hd);
+            ASSERT_MEM_EQ(out, out2, 32);
+        }
     }
 
     ASSERT_ERR(GPG_ERR_INV_VALUE, /* one-step KDF needs FixedInfo */
@@ -838,9 +947,18 @@ TEST(null_buffer_arguments)
                gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
                              "pw", 2, NULL, 0, NULL, 0, NULL, 4));
     ASSERT_NULL(hd);
-    /* NULL with a zero length stays valid. */
+    /* NULL with a zero length stays valid.  The two byte input key is
+     * below the 112 bits the FIPS provider's HKDF insists on, so the
+     * derivation itself fails there. */
     ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
                             "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_NOT_NULL(hd);
+    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_INV_VALUE, gcry_kdf_final(hd, 32, out));
+    gcry_kdf_close(hd);
+    hd = NULL;
+    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                            "key of 16 bytes!", 16, NULL, 0, NULL, 0, NULL,
+                            0));
     ASSERT_NOT_NULL(hd);
     ASSERT_OK(gcry_kdf_final(hd, 32, out));
     gcry_kdf_close(hd);
