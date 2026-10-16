@@ -192,7 +192,19 @@ rsa_raw_op(EVP_PKEY *key, int private, const unsigned char *in,
 {
     EVP_PKEY_CTX *ctx;
     size_t outlen = k;
+    size_t i;
     int ok;
+
+    /* 0 and 1 are their own powers; the FIPS provider refuses them as
+     * "data too small" and the reference library computes them. */
+    for (i = 0; i < k && !in[i]; i++) {
+        ;
+    }
+
+    if (i == k || (i + 1 == k && in[i] == 1)) {
+        memcpy(out, in, k);
+        return 0;
+    }
 
     ctx = EVP_PKEY_CTX_new_from_pkey(_gcry_libctx(), key, _gcry_propq());
 
@@ -847,6 +859,12 @@ rsa_generate(gcry_sexp_t genparms, gcry_sexp_t *r_skey)
         evalue = 65537;
     } else {
         evalue |= 1;
+    }
+
+    /* The FIPS provider implements FIPS 186's 65537 <= e < 2^256; the
+     * reference library would still accept a small exponent here. */
+    if (_gcry_fips_mode() && evalue < 65537) {
+        return GPG_ERR_INV_VALUE;
     }
 
     e = BN_new();

@@ -16,6 +16,20 @@ static const char *const ecc_names[] = {
     "ecc", "ecdsa", "ecdh", "eddsa", "gost", "sm2", NULL
 };
 
+/* The curve named NAME, or NULL when it is unknown or, as in the
+ * reference library, when FIPS mode does not allow it. */
+static const struct gcry_ecc_curve *
+usable_curve(const char *name)
+{
+    const struct gcry_ecc_curve *curve = _gcry_ecc_curve_find(name);
+
+    if (curve && _gcry_fips_mode() && !curve->fips) {
+        return NULL;
+    }
+
+    return curve;
+}
+
 static unsigned int
 ecc_get_nbits(gcry_sexp_t parms)
 {
@@ -49,7 +63,7 @@ ecc_get_nbits(gcry_sexp_t parms)
             return 0;
         }
 
-        curve = _gcry_ecc_curve_find(name);
+        curve = usable_curve(name);
         _gcry_free(name);
         return curve ? curve->nbits : 0;
     }
@@ -158,6 +172,12 @@ eddsa_params(mpi_ec_t ec, struct pk_data *pd, OSSL_PARAM *params)
         if (pd->hash_algo != expected) {
             return GPG_ERR_DIGEST_ALGO;
         }
+    }
+
+    /* FIPS 186-5 approves Ed25519, Ed25519ph, Ed448 and Ed448ph only;
+     * the FIPS provider accordingly has no Ed25519ctx. */
+    if (_gcry_fips_mode() && !strcmp(instance, "Ed25519ctx")) {
+        return GPG_ERR_NOT_SUPPORTED;
     }
 
     return 0;
@@ -1530,6 +1550,87 @@ hex_generator(const struct gcry_ecc_curve *curve, unsigned char **r_buf,
     return 0;
 }
 
+/* Expand the SEC 1 compressed point Q (N bytes, 02 or 03 prefix) of a
+ * table CURVE to "04 || x || y".  Only the table constants and BIGNUM
+ * arithmetic are used, so no curve context is needed: the keygrip is a
+ * pure function of the key material and stays computable in FIPS mode
+ * for curves the providers do not offer. */
+static gcry_err_code_t
+decompress_from_table(const struct gcry_ecc_curve *curve,
+                      const unsigned char *q, size_t n,
+                      unsigned char **r_buf, size_t *r_len)
+{
+    gcry_mpi_t p = _gcry_ecc_curve_param(curve, "p");
+    gcry_mpi_t a = _gcry_ecc_curve_param(curve, "a");
+    gcry_mpi_t b = _gcry_ecc_curve_param(curve, "b");
+    BN_CTX *bctx = BN_CTX_new_ex(_gcry_libctx());
+    BIGNUM *x = NULL;
+    BIGNUM *y = BN_new();
+    BIGNUM *t = BN_new();
+    unsigned char *buf = NULL;
+    size_t pbytes;
+    gcry_err_code_t rc = GPG_ERR_ENOMEM;
+
+    if (!p || !a || !b || !bctx || !y || !t) {
+        goto leave;
+    }
+
+    pbytes = (gcry_mpi_get_nbits(p) + 7) / 8;
+
+    if (n != 1 + pbytes) {
+        rc = GPG_ERR_INV_OBJ;
+        goto leave;
+    }
+
+    x = BN_bin2bn(q + 1, (int)pbytes, NULL);
+    buf = _gcry_malloc(1 + 2 * pbytes);
+
+    if (!x || !buf) {
+        goto leave;
+    }
+
+    /* y^2 = x^3 + a x + b, with the root of the parity the prefix names. */
+    if (BN_ucmp(x, _gcry_mpi_bn(p)) >= 0
+        || !BN_mod_sqr(t, x, _gcry_mpi_bn(p), bctx)
+        || !BN_mod_add(t, t, _gcry_mpi_bn(a), _gcry_mpi_bn(p), bctx)
+        || !BN_mod_mul(t, t, x, _gcry_mpi_bn(p), bctx)
+        || !BN_mod_add(t, t, _gcry_mpi_bn(b), _gcry_mpi_bn(p), bctx)
+        || !BN_mod_sqrt(y, t, _gcry_mpi_bn(p), bctx)) {
+        rc = GPG_ERR_INV_OBJ;
+        goto leave;
+    }
+
+    if (BN_is_odd(y) != (q[0] & 1) && !BN_sub(y, _gcry_mpi_bn(p), y)) {
+        rc = GPG_ERR_INTERNAL;
+        goto leave;
+    }
+
+    buf[0] = 0x04;
+
+    if (BN_bn2binpad(x, buf + 1, (int)pbytes) < 0
+        || BN_bn2binpad(y, buf + 1 + pbytes, (int)pbytes) < 0) {
+        rc = GPG_ERR_INTERNAL;
+        goto leave;
+    }
+
+    *r_buf = buf;
+    *r_len = 1 + 2 * pbytes;
+    buf = NULL;
+    rc = 0;
+
+leave:
+    ERR_clear_error();
+    _gcry_free(buf);
+    BN_free(x);
+    BN_free(y);
+    BN_free(t);
+    BN_CTX_free(bctx);
+    gcry_mpi_release(p);
+    gcry_mpi_release(a);
+    gcry_mpi_release(b);
+    return rc;
+}
+
 static gcry_err_code_t
 compute_keygrip(EVP_MD_CTX *md, gcry_sexp_t keyparms)
 {
@@ -1689,7 +1790,12 @@ compute_keygrip(EVP_MD_CTX *md, gcry_sexp_t keyparms)
             goto leave;
         }
 
-        if (n > 1 && (q[0] == 0x02 || q[0] == 0x03)) {
+        if (n > 1 && (q[0] == 0x02 || q[0] == 0x03) && curve
+            && curve->model == GCRY_ECC_MODEL_WEIERSTRASS) {
+            /* Compressed point on a known curve: expand it from the
+             * table constants. */
+            rc = decompress_from_table(curve, q, n, &raw[5], &rawlen[5]);
+        } else if (n > 1 && (q[0] == 0x02 || q[0] == 0x03)) {
             /* Compressed point: expand it with the curve's group. */
             mpi_ec_t ec = NULL;
             int ecflags = flags;
@@ -1856,7 +1962,7 @@ ecc_get_curve(gcry_sexp_t keyparms, int iterator, unsigned int *r_nbits)
             return NULL;
         }
 
-        curve = _gcry_ecc_curve_find(name);
+        curve = usable_curve(name);
         _gcry_free(name);
 
         if (!curve) {
@@ -1889,6 +1995,10 @@ ecc_get_curve(gcry_sexp_t keyparms, int iterator, unsigned int *r_nbits)
     for (i = 0; i < _gcry_ecc_curve_count(); i++) {
         const struct gcry_ecc_curve *curve = _gcry_ecc_curve_by_index(i);
 
+        if (_gcry_fips_mode() && !curve->fips) {
+            continue;
+        }
+
         if (!param_matches(p, curve->p, NULL) || !param_matches(a, curve->a, p)
             || !param_matches(b, curve->b, p)
             || !param_matches(n, curve->n, NULL)
@@ -1919,7 +2029,7 @@ leave:
 static gcry_sexp_t
 ecc_get_param_sexp(const char *name)
 {
-    const struct gcry_ecc_curve *curve = _gcry_ecc_curve_find(name);
+    const struct gcry_ecc_curve *curve = usable_curve(name);
     gcry_mpi_t p;
     gcry_mpi_t a;
     gcry_mpi_t b;
@@ -1987,6 +2097,7 @@ gcry_ecc_mul_point(int curveid, unsigned char *result,
                    const unsigned char *scalar, const unsigned char *point)
 {
     const char *keytype;
+    const char *curvename;
     size_t len;
     EVP_PKEY *priv = NULL;
     EVP_PKEY *peer = NULL;
@@ -1996,9 +2107,11 @@ gcry_ecc_mul_point(int curveid, unsigned char *result,
 
     if (curveid == GCRY_ECC_CURVE25519) {
         keytype = "X25519";
+        curvename = "Curve25519";
         len = 32;
     } else if (curveid == GCRY_ECC_CURVE448) {
         keytype = "X448";
+        curvename = "X448";
         len = 56;
     } else {
         return GCRY_ERR(GPG_ERR_UNKNOWN_CURVE);
@@ -2006,6 +2119,12 @@ gcry_ecc_mul_point(int curveid, unsigned char *result,
 
     if (!result || !scalar) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    /* The curve table decides what FIPS mode allows, as for the keys of
+     * gcry_pk_*; the FIPS provider has no X25519/X448 anyway. */
+    if (!usable_curve(curvename)) {
+        return GCRY_ERR(GPG_ERR_NOT_SUPPORTED);
     }
 
     priv = EVP_PKEY_new_raw_private_key_ex(_gcry_libctx(), keytype,
