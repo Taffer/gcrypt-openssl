@@ -395,6 +395,10 @@ gcry_kdf_derive(const void *passphrase, size_t passphraselen, int algo,
         return GCRY_ERR(GPG_ERR_INV_VALUE);
     }
 
+    if (!salt && saltlen) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
     _gcry_global_init();
 
     switch (algo) {
@@ -607,6 +611,11 @@ gcry_kdf_open(gcry_kdf_hd_t *hd, int algo, int subalgo,
     _gcry_global_init();
 
     if (paramlen && !param) {
+        return GCRY_ERR(GPG_ERR_INV_ARG);
+    }
+
+    if ((!passphrase && passphraselen) || (!salt && saltlen)
+        || (!key && keylen) || (!ad && adlen)) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 

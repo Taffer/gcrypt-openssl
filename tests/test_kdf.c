@@ -807,6 +807,45 @@ TEST(argument_validation)
     gcry_kdf_close(NULL);
 }
 
+TEST(null_buffer_arguments)
+{
+    gcry_kdf_hd_t hd = NULL;
+    unsigned long param[1] = { 32 };
+    unsigned char out[32];
+
+    /* gcry_kdf_derive: a NULL salt with a non-zero length is refused. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_PBKDF2, GCRY_MD_SHA256, NULL, 4,
+                               1, 32, out));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SALTED_S2K, GCRY_MD_SHA1, NULL,
+                               8, 0, 16, out));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_derive("pw", 2, GCRY_KDF_SCRYPT, 1024, NULL, 4, 1, 32,
+                               out));
+    /* gcry_kdf_open: every pointer/length pair is checked. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             NULL, 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_NULL(hd);
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 4, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 4, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                             "pw", 2, NULL, 0, NULL, 0, NULL, 4));
+    ASSERT_NULL(hd);
+    /* NULL with a zero length stays valid. */
+    ASSERT_OK(gcry_kdf_open(&hd, GCRY_KDF_HKDF, GCRY_MAC_HMAC_SHA256, param, 1,
+                            "pw", 2, NULL, 0, NULL, 0, NULL, 0));
+    ASSERT_NOT_NULL(hd);
+    ASSERT_OK(gcry_kdf_final(hd, 32, out));
+    gcry_kdf_close(hd);
+}
+
 int
 main(void)
 {
@@ -820,5 +859,6 @@ main(void)
     RUN_TEST(hkdf_vectors);
     RUN_TEST(x963_vectors);
     RUN_TEST(argument_validation);
+    RUN_TEST(null_buffer_arguments);
     return TEST_RESULT();
 }

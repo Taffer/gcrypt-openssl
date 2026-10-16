@@ -2317,6 +2317,32 @@ TEST(disable_algo)
     ASSERT_EQ(GCRY_CIPHER_CAST5, gcry_cipher_map_name("CAST5"));
 }
 
+TEST(null_buffer_arguments)
+{
+    gcry_cipher_hd_t hd = NULL;
+    unsigned char key[16] = { 0 };
+    unsigned char iv[16] = { 0 };
+    unsigned char buf[32] = { 0 };
+
+    ASSERT_OK(gcry_cipher_open(&hd, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0));
+    ASSERT_OK(gcry_cipher_setkey(hd, key, sizeof key));
+    /* A NULL buffer with a non-zero length is refused. */
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_setiv(hd, NULL, sizeof iv));
+    ASSERT_OK(gcry_cipher_setiv(hd, iv, sizeof iv));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_encrypt(hd, NULL, 16, buf, 16));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_encrypt(hd, buf, 16, NULL, 16));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_decrypt(hd, NULL, 16, buf, 16));
+    ASSERT_ERR(GPG_ERR_INV_ARG, gcry_cipher_decrypt(hd, buf, 16, NULL, 16));
+    /* In-place operation (NULL input, zero length) still works. */
+    ASSERT_OK(gcry_cipher_encrypt(hd, buf, 16, NULL, 0));
+    ASSERT_OK(gcry_cipher_decrypt(hd, buf, 16, NULL, 0));
+    /* A zero-length call with no buffers at all is a no-op. */
+    ASSERT_OK(gcry_cipher_encrypt(hd, NULL, 0, NULL, 0));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               gcry_cipher_encrypt(NULL, buf, 16, buf, 16));
+    gcry_cipher_close(hd);
+}
+
 int
 main(void)
 {
@@ -2359,5 +2385,6 @@ main(void)
     RUN_TEST(upstream_iv_conventions);
     RUN_TEST(upstream_keywrap_and_ccm);
     RUN_TEST(disable_algo);
+    RUN_TEST(null_buffer_arguments);
     return TEST_RESULT();
 }

@@ -2093,7 +2093,7 @@ cipher_setiv(gcry_cipher_hd_t h, const void *iv, size_t ivlen)
 gcry_error_t
 gcry_cipher_setiv(gcry_cipher_hd_t hd, const void *iv, size_t ivlen)
 {
-    if (!hd) {
+    if (!hd || (!iv && ivlen)) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
@@ -3606,7 +3606,8 @@ gcry_cipher_encrypt(gcry_cipher_hd_t h, void *out, size_t outsize,
 {
     gcry_err_code_t rc;
 
-    if (!h) {
+    /* A NULL IN with INLEN 0 requests an in-place operation on OUT. */
+    if (!h || (!out && outsize) || (!in && inlen)) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
@@ -3624,7 +3625,8 @@ gcry_error_t
 gcry_cipher_decrypt(gcry_cipher_hd_t h, void *out, size_t outsize,
                     const void *in, size_t inlen)
 {
-    if (!h) {
+    /* A NULL IN with INLEN 0 requests an in-place operation on OUT. */
+    if (!h || (!out && outsize) || (!in && inlen)) {
         return GCRY_ERR(GPG_ERR_INV_ARG);
     }
 
