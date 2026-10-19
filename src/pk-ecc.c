@@ -295,6 +295,44 @@ eddsa_verify(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t sig_r,
 /* ECDSA                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Whether the provider turned out unable to derive RFC 6979 nonces: the
+ * FIPS provider of Chainguard's images fails in the HMAC-DRBG it needs.
+ * Signatures requested with the rfc6979 flag are then made with random
+ * nonces, which every verifier accepts; the condition is logged once. */
+static int rfc6979_unavailable;
+
+/* Retry a failed deterministic ECDSA signature with a random nonce.
+ * Returns 1 and the signature in SIG (SIGALLOC bytes, *R_SIGLEN used) on
+ * success.  The error queue is left to the caller when that fails too. */
+static int
+sign_with_random_nonce(EVP_PKEY_CTX *ctx, unsigned char *sig,
+                       size_t *r_siglen, size_t sigalloc,
+                       const unsigned char *digest, size_t digestlen)
+{
+    unsigned int nonce_type = 0;
+    OSSL_PARAM params[2];
+
+    params[0] = OSSL_PARAM_construct_uint(OSSL_SIGNATURE_PARAM_NONCE_TYPE,
+                                          &nonce_type);
+    params[1] = OSSL_PARAM_construct_end();
+    *r_siglen = sigalloc;
+
+    if (EVP_PKEY_CTX_set_params(ctx, params) <= 0
+        || EVP_PKEY_sign(ctx, sig, r_siglen, digest, digestlen) <= 0) {
+        return 0;
+    }
+
+    ERR_clear_error();
+
+    if (!rfc6979_unavailable) {
+        rfc6979_unavailable = 1;
+        log_info("ECDSA: the provider cannot derive RFC 6979 nonces; "
+                 "random nonces are used instead\n");
+    }
+
+    return 1;
+}
+
 static gcry_err_code_t
 ecdsa_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
 {
@@ -305,6 +343,8 @@ ecdsa_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
     size_t digestlen = 0;
     unsigned char *sig = NULL;
     size_t siglen = 0;
+    size_t sigalloc = 0;
+    int deterministic = 0;
 
     if (ec->model != GCRY_ECC_MODEL_WEIERSTRASS) {
         return GPG_ERR_INV_CURVE;
@@ -331,7 +371,7 @@ ecdsa_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
 
     if ((pd->flags & PUBKEY_FLAG_RFC6979) && pd->hash_algo) {
         const char *name = _gcry_pk_md_openssl_name(pd->hash_algo);
-        unsigned int nonce_type = 1;
+        unsigned int nonce_type = rfc6979_unavailable ? 0 : 1;
         OSSL_PARAM params[3];
 
         if (!name) {
@@ -349,6 +389,8 @@ ecdsa_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
             rc = _gcry_err_from_openssl(GPG_ERR_NOT_SUPPORTED);
             goto leave;
         }
+
+        deterministic = nonce_type == 1;
     }
 
     if (EVP_PKEY_sign(ctx, NULL, &siglen, digest, digestlen) <= 0) {
@@ -363,9 +405,15 @@ ecdsa_sign(mpi_ec_t ec, struct pk_data *pd, gcry_mpi_t *r_r, gcry_mpi_t *r_s)
         goto leave;
     }
 
+    sigalloc = siglen;
+
     if (EVP_PKEY_sign(ctx, sig, &siglen, digest, digestlen) <= 0) {
-        rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
-        goto leave;
+        if (!deterministic || !sign_with_random_nonce(ctx, sig, &siglen,
+                                                      sigalloc, digest,
+                                                      digestlen)) {
+            rc = _gcry_err_from_openssl(GPG_ERR_INV_DATA);
+            goto leave;
+        }
     }
 
     rc = _gcry_pk_rs_from_der(sig, siglen, 1, r_r, r_s);

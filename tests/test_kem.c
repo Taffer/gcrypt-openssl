@@ -92,6 +92,18 @@ mlkem_kat(const struct mlkem_vectors *v)
     unsigned char ss2[GCRY_KEM_MLKEM512_SHARED_LEN];
     unsigned char coins[2 * GCRY_KEM_MLKEM_RANDOM_LEN];
 
+    /* Chainguard's FIPS provider (3.4.0) predates ML-KEM. */
+    if (TEST_STRICT_PROVIDER
+        && gpg_err_code(gcry_kem_keypair(v->algo, pk, v->pk_len, sk,
+                                         v->sk_len))
+        == GPG_ERR_UNSUPPORTED_ALGORITHM) {
+        printf("  (skipping ML-KEM algorithm %d: not available)\n", v->algo);
+        free(pk);
+        free(sk);
+        free(ct);
+        return;
+    }
+
     /* Key generation from seed d || z. */
     memcpy(coins, v->gen_d, 32);
     memcpy(coins + 32, v->gen_z, 32);
@@ -627,6 +639,14 @@ TEST(argument_validation)
     unsigned char pk[GCRY_KEM_MLKEM512_PUBKEY_LEN];
     unsigned char sk[GCRY_KEM_MLKEM512_SECKEY_LEN];
     unsigned char ct[GCRY_KEM_MLKEM512_CIPHER_LEN];
+    /* The ML-KEM checks come after the algorithm check: a provider set
+     * without ML-KEM (Chainguard's FIPS provider) answers that first. */
+    gcry_err_code_t mlkem_err =
+        TEST_STRICT_PROVIDER
+        && gpg_err_code(gcry_kem_keypair(GCRY_KEM_MLKEM512, pk, sizeof pk, sk,
+                                         sizeof sk))
+        == GPG_ERR_UNSUPPORTED_ALGORITHM
+        ? GPG_ERR_UNSUPPORTED_ALGORITHM : GPG_ERR_INV_ARG;
     unsigned char ss[65];
 
     /* Buffer lengths must match the algorithm exactly. */
@@ -651,16 +671,16 @@ TEST(argument_validation)
                               32));
     ASSERT_ERR(GPG_ERR_INV_ARG,
                gcry_kem_genkey(GCRY_KEM_RAW_X25519, pk, 32, sk, 32, pk, 32));
-    ASSERT_ERR(GPG_ERR_INV_ARG, /* ML-KEM seed is d || z, 64 bytes */
+    ASSERT_ERR(mlkem_err, /* ML-KEM seed is d || z, 64 bytes */
                gcry_kem_genkey(GCRY_KEM_MLKEM512, pk, sizeof pk, sk, sizeof sk,
                                pk, 10));
-    ASSERT_ERR(GPG_ERR_INV_ARG,
+    ASSERT_ERR(mlkem_err,
                gcry_kem_encap(GCRY_KEM_MLKEM512, pk, sizeof pk, ct, sizeof ct,
                               ss, 32, pk, 10));
-    ASSERT_ERR(GPG_ERR_INV_ARG,
+    ASSERT_ERR(mlkem_err,
                gcry_kem_decap(GCRY_KEM_MLKEM512, sk, sizeof sk, ct, sizeof ct,
                               ss, 32, pk, 10));
-    ASSERT_ERR(GPG_ERR_INV_ARG,
+    ASSERT_ERR(mlkem_err,
                gcry_kem_keypair(GCRY_KEM_MLKEM512, pk, sizeof pk, sk, 100));
 
     /* A point that is not on the curve is rejected. */

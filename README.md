@@ -319,6 +319,45 @@ its look-up of a foreign small curve (secp112r1) when the OpenSSL build
 has dropped it. With the flag off nothing changes: the tests expect
 exactly what OpenSSL's own providers offer.
 
+Chainguard's FIPS images (the `openssl-config-fipshardened` package)
+activate the Chainguard FIPS Provider for OpenSSL 3.4.0 inside an OpenSSL
+4 libcrypto, together with a "legacy allowed" provider that supplies MD5,
+MD4, SHA-1 and SHA-224 under the `fips=yes` property for non-security
+uses. The library copes with that environment as follows, in every build:
+
+- The RSA primitives are taken from the signature interface (a signature
+  without padding is RSADP, its recovery RSAEP) because that provider
+  restricts the asymmetric cipher interface to OAEP. PKCS#1 v1.5
+  decryption asks the provider first and, when it refuses the padding
+  mode, decrypts raw and checks the frame itself with the same implicit
+  rejection OpenSSL applies (a bad frame yields the synthetic plaintext
+  OpenSSL would compute).
+- That provider fails to derive RFC 6979 nonces. An ECDSA signature
+  requested with the `rfc6979` flag is then made with a random nonce,
+  which every verifier accepts; the condition is logged once and later
+  requests skip the attempt. The tests check the RFC 6979 known answers
+  only when two signatures over the same data agree.
+- Digests follow the reference library's FIPS policy before the provider
+  is asked: in FIPS mode MD5 is offered unless
+  `GCRY_FIPS_FLAG_REJECT_MD_MD5` is set, SHA-1 unless
+  `GCRY_FIPS_FLAG_REJECT_MD_SHA1`, every other non-approved digest unless
+  `GCRY_FIPS_FLAG_REJECT_MD_OTHERS` (which the default flags include), so
+  the legacy-allowed provider's MD5 is usable and its MD4 is not. The
+  FIPS provider's HMAC cannot use a digest from another provider, so
+  HMAC-MD5 is reported as unknown by both the digest and the MAC family
+  although MD5 hashes; `gcry_mac_test_algo` probes the HMAC set-up.
+- ML-KEM and cSHAKE are absent from that provider. The KEM functions
+  report `GPG_ERR_UNSUPPORTED_ALGORITHM` for ML-KEM, like the KEMs this
+  library does not implement; the digest family reports cSHAKE as unknown.
+  The tests skip them with a message under the strict flag.
+
+A build with `GCRYPT_OPENSSL_FIPS=ON` needs the FIPS provider and its
+configuration wherever its tests run: without them the library is in the
+error state described above and the log names OpenSSL's reason (the
+module could not be loaded, say). A melange recipe for such a package
+must therefore list `openssl-config-fipshardened` in the build
+environment, not only among the runtime dependencies.
+
 What FIPS mode offers, as seen through OpenSSL 4.0.3's FIPS provider: AES
 in every mode except SIV and GCM-SIV; SHA-1, SHA-2, SHA-3, SHAKE and
 cSHAKE; HMAC over those, CMAC-AES and GMAC-AES; PBKDF2, HKDF, the

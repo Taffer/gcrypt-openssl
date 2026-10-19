@@ -58,6 +58,23 @@ system_wants_fips(void)
 #endif
 }
 
+/* OpenSSL's reason for the most recent failure, for the error-state log.
+ * Empty when the error queue has nothing to say. */
+static char fips_failure_reason[256];
+
+static void
+remember_openssl_error(void)
+{
+    unsigned long err = ERR_peek_last_error();
+
+    if (err) {
+        ERR_error_string_n(err, fips_failure_reason,
+                           sizeof fips_failure_reason);
+    }
+
+    ERR_clear_error();
+}
+
 static int
 try_enable_fips(void)
 {
@@ -65,13 +82,13 @@ try_enable_fips(void)
         OSSL_PROVIDER *fips = OSSL_PROVIDER_load(libctx, "fips");
 
         if (!fips) {
-            ERR_clear_error();
+            remember_openssl_error();
             return 0;
         }
     }
 
     if (!EVP_default_properties_enable_fips(libctx, 1)) {
-        ERR_clear_error();
+        remember_openssl_error();
         return 0;
     }
 
@@ -111,8 +128,14 @@ enter_fips_error_state(void)
         ERR_clear_error();
     }
 
-    log_error("FIPS mode is required but no FIPS provider could be "
-              "activated: the library is not operational\n");
+    if (fips_failure_reason[0]) {
+        log_error("FIPS mode is required but no FIPS provider could be "
+                  "activated (%s): the library is not operational\n",
+                  fips_failure_reason);
+    } else {
+        log_error("FIPS mode is required but no FIPS provider could be "
+                  "activated: the library is not operational\n");
+    }
 }
 
 static void

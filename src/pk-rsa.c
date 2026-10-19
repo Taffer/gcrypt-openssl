@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/proverr.h>
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
 #include <openssl/rsa.h>
@@ -235,7 +236,10 @@ frame_is_n_minus_1(const unsigned char *frame, size_t k, gcry_mpi_t n)
 }
 
 /* OUT = IN^e mod n (public) or IN^d mod n (private, blinded by OpenSSL).
- * IN must be K bytes and smaller than N. */
+ * IN must be K bytes and smaller than N.  The primitives are taken from
+ * the signature interface, where a signature without padding is RSADP
+ * and its recovery RSAEP: the asymmetric cipher interface would serve as
+ * well, but Chainguard's FIPS provider restricts that one to OAEP. */
 static gcry_err_code_t
 rsa_raw_op(EVP_PKEY *key, gcry_mpi_t n, int private, const unsigned char *in,
            unsigned char *out, size_t k)
@@ -264,13 +268,13 @@ rsa_raw_op(EVP_PKEY *key, gcry_mpi_t n, int private, const unsigned char *in,
     }
 
     if (private) {
-        ok = EVP_PKEY_decrypt_init(ctx) > 0
+        ok = EVP_PKEY_sign_init(ctx) > 0
              && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) > 0
-             && EVP_PKEY_decrypt(ctx, out, &outlen, in, k) > 0;
+             && EVP_PKEY_sign(ctx, out, &outlen, in, k) > 0;
     } else {
-        ok = EVP_PKEY_encrypt_init(ctx) > 0
+        ok = EVP_PKEY_verify_recover_init(ctx) > 0
              && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) > 0
-             && EVP_PKEY_encrypt(ctx, out, &outlen, in, k) > 0;
+             && EVP_PKEY_verify_recover(ctx, out, &outlen, in, k) > 0;
     }
 
     EVP_PKEY_CTX_free(ctx);
@@ -426,14 +430,270 @@ leave:
     return rc;
 }
 
-/* PKCS#1 v1.5 decryption of the K byte ciphertext IN. */
+/* Does OpenSSL's error queue say that the provider refuses the padding
+ * mode asked for?  Chainguard's FIPS provider restricts the asymmetric
+ * cipher interface to OAEP.  The queue is emptied. */
+static int
+padding_mode_refused(void)
+{
+    unsigned long e;
+    int refused = 0;
+
+    while ((e = ERR_get_error()) != 0) {
+        if (ERR_GET_LIB(e) == ERR_LIB_PROV
+            && ERR_GET_REASON(e) == PROV_R_INVALID_PADDING_MODE) {
+            refused = 1;
+        }
+    }
+
+    return refused;
+}
+
+/* Constant-time helpers in the style of OpenSSL's: a mask of all ones
+ * for true, zero for false. */
+static unsigned int
+ct_msb(unsigned int a)
+{
+    return 0u - (a >> (sizeof a * 8 - 1));
+}
+
+static unsigned int
+ct_is_zero(unsigned int a)
+{
+    return ct_msb(~a & (a - 1u));
+}
+
+static unsigned int
+ct_eq(unsigned int a, unsigned int b)
+{
+    return ct_is_zero(a ^ b);
+}
+
+static unsigned int
+ct_lt(unsigned int a, unsigned int b)
+{
+    return ct_msb(a ^ ((a ^ b) | ((a - b) ^ b)));
+}
+
+static unsigned int
+ct_ge(unsigned int a, unsigned int b)
+{
+    return ~ct_lt(a, b);
+}
+
+static unsigned int
+ct_select(unsigned int mask, unsigned int a, unsigned int b)
+{
+    return (mask & a) | (~mask & b);
+}
+
+/* HMAC-SHA256 with KEY over the concatenation of the three parts (a part
+ * may be empty) into OUT, through MACCTX. */
+static int
+hmac_sha256(EVP_MAC_CTX *macctx, const unsigned char *key, size_t keylen,
+            const unsigned char *p1, size_t l1, const unsigned char *p2,
+            size_t l2, const unsigned char *p3, size_t l3,
+            unsigned char out[32])
+{
+    OSSL_PARAM params[2];
+    size_t outlen = 0;
+
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                                 (char *)(uintptr_t)"SHA256",
+                                                 0);
+    params[1] = OSSL_PARAM_construct_end();
+    return EVP_MAC_init(macctx, key, keylen, params)
+           && (!l1 || EVP_MAC_update(macctx, p1, l1))
+           && (!l2 || EVP_MAC_update(macctx, p2, l2))
+           && (!l3 || EVP_MAC_update(macctx, p3, l3))
+           && EVP_MAC_final(macctx, out, &outlen, 32) && outlen == 32;
+}
+
+/* The PRF of OpenSSL's implicit rejection: TLEN bytes from HMAC-SHA256
+ * blocks over a 16 bit counter, LABEL and the 16 bit output length in
+ * bits, keyed with the 32 byte KDK. */
+static int
+rsa_prf(EVP_MAC_CTX *macctx, unsigned char *to, size_t tlen,
+        const char *label, size_t llen, const unsigned char *kdk)
+{
+    unsigned char be_iter[2];
+    unsigned char be_bitlen[2];
+    unsigned char block[32];
+    unsigned int iter = 0;
+    size_t pos;
+
+    be_bitlen[0] = (unsigned char)((tlen * 8) >> 8);
+    be_bitlen[1] = (unsigned char)(tlen * 8);
+
+    for (pos = 0; pos < tlen; pos += 32, iter++) {
+        be_iter[0] = (unsigned char)(iter >> 8);
+        be_iter[1] = (unsigned char)iter;
+
+        if (!hmac_sha256(macctx, kdk, 32, be_iter, 2,
+                         (const unsigned char *)label, llen, be_bitlen, 2,
+                         block)) {
+            return 0;
+        }
+
+        memcpy(to + pos, block, tlen - pos < 32 ? tlen - pos : 32);
+    }
+
+    return 1;
+}
+
+/* The key derivation key of OpenSSL's implicit rejection for the K byte
+ * ciphertext CT under KEY: HMAC-SHA256 keyed with SHA-256 of the private
+ * exponent (K bytes, big endian) over the ciphertext. */
+static int
+derive_kdk(EVP_MAC_CTX *macctx, EVP_PKEY *key, const unsigned char *ct,
+           size_t k, unsigned char kdk[32])
+{
+    BIGNUM *d = NULL;
+    unsigned char *dbuf = _gcry_malloc_secure(k);
+    unsigned char d_hash[32];
+    EVP_MD *sha256 = _gcry_md_fetch(GCRY_MD_SHA256);
+    unsigned int hlen = 0;
+    int ok;
+
+    ok = dbuf && sha256 && EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_D, &d)
+         && BN_bn2binpad(d, dbuf, (int)k) == (int)k
+         && EVP_Digest(dbuf, k, d_hash, &hlen, sha256, NULL) && hlen == 32
+         && hmac_sha256(macctx, d_hash, 32, ct, k, NULL, 0, NULL, 0, kdk);
+
+    BN_clear_free(d);
+    EVP_MD_free(sha256);
+
+    if (dbuf) {
+        _gcry_wipememory(dbuf, k);
+        _gcry_free(dbuf);
+    }
+
+    _gcry_wipememory(d_hash, sizeof d_hash);
+    return ok;
+}
+
+/* The message inside the K byte PKCS#1 v1.5 type 2 frame EM, decrypted
+ * from the ciphertext CT under KEY, in a fresh secure buffer.  A bad frame
+ * is rejected implicitly as OpenSSL (and the reference library) do: the
+ * result is then a synthetic message derived from the private key and the
+ * ciphertext, the same one OpenSSL would compute, so that the check never
+ * tells a bad frame from a good one.  The algorithm is the one of
+ * OpenSSL's ossl_rsa_padding_check_PKCS1_type_2(); the frame is scanned
+ * without branching on its bytes. */
 static gcry_err_code_t
-rsa_pkcs1_decrypt(EVP_PKEY *key, const unsigned char *in, size_t k,
-                  unsigned char **r_value, size_t *r_valuelen)
+pkcs1_type2_unpad(EVP_PKEY *key, const unsigned char *ct,
+                  const unsigned char *em, size_t k, unsigned char **r_value,
+                  size_t *r_valuelen)
+{
+    EVP_MAC *mac = NULL;
+    EVP_MAC_CTX *macctx = NULL;
+    unsigned char kdk[32];
+    unsigned char *synthetic = NULL;
+    unsigned char candidates[128 * 2];
+    unsigned char *out = NULL;
+    unsigned int len_mask;
+    unsigned int max_sep_offset;
+    unsigned int synthetic_length = 0;
+    unsigned int synth_msg_index;
+    unsigned int good;
+    unsigned int found_zero = 0;
+    unsigned int zero_index = 0;
+    unsigned int msg_index;
+    unsigned int i;
+    size_t j;
+    gcry_err_code_t rc = GPG_ERR_INTERNAL;
+
+    if (k < 11) {
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    mac = EVP_MAC_fetch(_gcry_libctx(), "HMAC", _gcry_propq());
+    macctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+    synthetic = _gcry_malloc_secure(k);
+    out = _gcry_malloc_secure(k);
+
+    if (!macctx || !synthetic || !out) {
+        rc = GPG_ERR_ENOMEM;
+        goto leave;
+    }
+
+    if (!derive_kdk(macctx, key, ct, k, kdk)
+        || !rsa_prf(macctx, synthetic, k, "message", 7, kdk)
+        || !rsa_prf(macctx, candidates, sizeof candidates, "length", 6, kdk)) {
+        goto leave;
+    }
+
+    /* The synthetic message is at most the frame less the two leading
+     * bytes and eight bytes of padding; the candidate lengths are masked
+     * to the bits of that bound and the last one below it wins. */
+    len_mask = max_sep_offset = (unsigned int)k - 2 - 8;
+    len_mask |= len_mask >> 1;
+    len_mask |= len_mask >> 2;
+    len_mask |= len_mask >> 4;
+    len_mask |= len_mask >> 8;
+
+    for (i = 0; i < sizeof candidates; i += 2) {
+        unsigned int candidate = ((unsigned int)candidates[i] << 8
+                                  | candidates[i + 1]) & len_mask;
+
+        synthetic_length = ct_select(ct_lt(candidate, max_sep_offset),
+                                     candidate, synthetic_length);
+    }
+
+    synth_msg_index = (unsigned int)k - synthetic_length;
+
+    /* The real frame: 00 02, at least eight non-zero bytes, 00, message. */
+    good = ct_is_zero(em[0]) & ct_eq(em[1], 2);
+
+    for (i = 2; i < k; i++) {
+        unsigned int equals0 = ct_is_zero(em[i]);
+
+        zero_index = ct_select(~found_zero & equals0, i, zero_index);
+        found_zero |= equals0;
+    }
+
+    good &= ct_ge(zero_index, 2 + 8);
+    msg_index = ct_select(good, zero_index + 1, synth_msg_index);
+
+    /* Both buffers are read whatever the verdict. */
+    for (i = msg_index, j = 0; i < k; i++, j++) {
+        out[j] = (unsigned char)ct_select(good, em[i], synthetic[i]);
+    }
+
+    *r_value = out;
+    *r_valuelen = j;
+    out = NULL;
+    rc = 0;
+
+leave:
+    ERR_clear_error();
+    EVP_MAC_CTX_free(macctx);
+    EVP_MAC_free(mac);
+    _gcry_wipememory(kdk, sizeof kdk);
+    _gcry_wipememory(candidates, sizeof candidates);
+
+    if (synthetic) {
+        _gcry_wipememory(synthetic, k);
+    }
+
+    _gcry_free(synthetic);
+    _gcry_free(out);
+    return rc;
+}
+
+/* PKCS#1 v1.5 decryption of the K byte ciphertext IN.  OpenSSL's check
+ * comes with implicit rejection (a bad frame yields a synthetic
+ * plaintext instead of an error).  A provider that refuses the padding
+ * mode (Chainguard's FIPS provider) gets the frame decrypted as a raw
+ * operation and checked here the same way. */
+static gcry_err_code_t
+rsa_pkcs1_decrypt(EVP_PKEY *key, gcry_mpi_t n, const unsigned char *in,
+                  size_t k, unsigned char **r_value, size_t *r_valuelen)
 {
     EVP_PKEY_CTX *ctx;
     unsigned char *out;
     size_t outlen = k;
+    gcry_err_code_t rc;
     int ok;
 
     *r_value = NULL;
@@ -452,14 +712,26 @@ rsa_pkcs1_decrypt(EVP_PKEY *key, const unsigned char *in, size_t k,
          && EVP_PKEY_decrypt(ctx, out, &outlen, in, k) > 0;
     EVP_PKEY_CTX_free(ctx);
 
-    if (!ok) {
-        _gcry_free(out);
-        return _gcry_err_from_openssl(GPG_ERR_ENCODING_PROBLEM);
+    if (ok) {
+        *r_value = out;
+        *r_valuelen = outlen;
+        return 0;
     }
 
-    *r_value = out;
-    *r_valuelen = outlen;
-    return 0;
+    if (!padding_mode_refused()) {
+        _gcry_free(out);
+        return GPG_ERR_ENCODING_PROBLEM;
+    }
+
+    rc = rsa_raw_op(key, n, 1, in, out, k);
+
+    if (!rc) {
+        rc = pkcs1_type2_unpad(key, in, out, k, r_value, r_valuelen);
+    }
+
+    _gcry_wipememory(out, k);
+    _gcry_free(out);
+    return rc;
 }
 
 static gcry_err_code_t
@@ -531,7 +803,7 @@ rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
         /* OpenSSL's PKCS#1 v1.5 check with implicit rejection: a bad
          * padding yields a deterministic synthetic plaintext instead of an
          * error, which is also what the reference library does. */
-        rc = rsa_pkcs1_decrypt(key, in, k, &value, &valuelen);
+        rc = rsa_pkcs1_decrypt(key, n, in, k, &value, &valuelen);
 
         if (!rc) {
             rc = _gcry_sexp_build(r_plain, NULL, "(value %b)", (int)valuelen,

@@ -240,14 +240,25 @@ check_unavailable(int algo)
     return 1;
 }
 
-/* Whether a digest the library's tables list is not offered: always in
- * FIPS mode (every use of this asks about a non-approved digest), and
- * under a strict provider whenever the provider lacks it. */
+/* Whether a digest the library's tables list is not offered: in FIPS
+ * mode with OpenSSL's own providers always (every use of this asks about
+ * a non-approved digest), and under a strict provider whenever the
+ * library says so: Chainguard's images add a provider that supplies MD5
+ * (allowed for non-security use) under the fips=yes property, so MD5 may
+ * well be there in FIPS mode, while MD4 and the rest are refused by the
+ * library's FIPS policy and cSHAKE is missing from the provider. */
 static int
 md_unavailable(int algo)
 {
-    return gcry_fips_mode_active()
-           || (TEST_STRICT_PROVIDER && gcry_md_test_algo(algo) != 0);
+    return TEST_STRICT_PROVIDER ? gcry_md_test_algo(algo) != 0
+           : gcry_fips_mode_active();
+}
+
+/* Whether a strict provider lacks ALGO although FIPS approves it. */
+static int
+strict_lacks_md(int algo)
+{
+    return TEST_STRICT_PROVIDER && gcry_md_test_algo(algo) != 0;
 }
 
 /* CHECK, except that an algorithm that is not offered must be reported as
@@ -403,6 +414,11 @@ TEST(sha3_and_shake)
 
 TEST(cshake)
 {
+    if (strict_lacks_md(GCRY_MD_CSHAKE128)) {
+        printf("  (skipping %s: cSHAKE128 not available)\n", __func__);
+        return;
+    }
+
     gcry_md_hd_t hd;
     struct gcry_cshake_customization cust;
     unsigned char out[32];
@@ -712,8 +728,10 @@ TEST(hmac)
                            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"));
 
     /* HMAC over a digest the FIPS provider lacks is an unknown algorithm
-     * however long the key is. */
-    if (gcry_fips_mode_active()) {
+     * however long the key is.  Under a strict provider MD5 may hash but
+     * still be unusable in the FIPS provider's HMAC. */
+    if (TEST_STRICT_PROVIDER ? gcry_mac_test_algo(GCRY_MAC_HMAC_MD5) != 0
+        : gcry_fips_mode_active()) {
         unsigned char out[16];
         gcry_buffer_t iov[2];
 
@@ -789,11 +807,12 @@ TEST(multi_algo_handle)
     ASSERT_OK(gcry_md_enable(hd, GCRY_MD_SHA256)); /* twice is fine */
     /* MD5 is not offered in FIPS mode; the handle keeps its other
      * algorithms when enabling it fails. */
-    ASSERT_OK_OR_FIPS_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_MD5));
+    ASSERT_OK_UNLESS(md_unavailable(GCRY_MD_MD5), GPG_ERR_DIGEST_ALGO,
+                     gcry_md_enable(hd, GCRY_MD_MD5));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, GCRY_MD_TIGER));
     ASSERT_ERR(GPG_ERR_DIGEST_ALGO, gcry_md_enable(hd, 12345));
     ASSERT_TRUE(gcry_md_is_enabled(hd, GCRY_MD_SHA1));
-    ASSERT_EQ(!gcry_fips_mode_active(), gcry_md_is_enabled(hd, GCRY_MD_MD5));
+    ASSERT_EQ(!md_unavailable(GCRY_MD_MD5), gcry_md_is_enabled(hd, GCRY_MD_MD5));
     ASSERT_FALSE(gcry_md_is_enabled(hd, GCRY_MD_SHA512));
     ASSERT_FALSE(gcry_md_is_secure(hd));
 
@@ -802,7 +821,7 @@ TEST(multi_algo_handle)
     ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
     ASSERT_MEM_EQ(sha256, gcry_md_read(hd, GCRY_MD_SHA256), 32);
 
-    if (gcry_fips_mode_active()) {
+    if (md_unavailable(GCRY_MD_MD5)) {
         /* Reading again returns the same digest. */
         ASSERT_MEM_EQ(sha1, gcry_md_read(hd, GCRY_MD_SHA1), 20);
         /* The most recently enabled algorithm is the "first" one. */
@@ -1243,6 +1262,11 @@ TEST(hmac_unkeyed_and_key_lengths)
 
 TEST(cshake_copy)
 {
+    if (strict_lacks_md(GCRY_MD_CSHAKE128)) {
+        printf("  (skipping %s: cSHAKE128 not available)\n", __func__);
+        return;
+    }
+
     gcry_md_hd_t hd;
     gcry_md_hd_t copy;
     struct gcry_cshake_customization cust;
@@ -1773,6 +1797,11 @@ kmac128_prefix(gcry_md_hd_t hd)
 
 TEST(cshake_function_name)
 {
+    if (strict_lacks_md(GCRY_MD_CSHAKE128)) {
+        printf("  (skipping %s: cSHAKE128 not available)\n", __func__);
+        return;
+    }
+
     gcry_md_hd_t hd;
     gcry_md_hd_t copy;
     struct gcry_cshake_customization cust;

@@ -209,6 +209,24 @@ unconst(const void *p)
 /* ML-KEM                                                              */
 /* ------------------------------------------------------------------ */
 
+/* Does the provider set offer the EVP_PKEY algorithm NAME?  Chainguard's
+ * FIPS provider (3.4.0) predates ML-KEM, for one; such an algorithm is
+ * reported as unsupported like the KEMs this library does not implement. */
+static int
+pkey_algo_available(const char *name)
+{
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(_gcry_libctx(), name,
+                                                   _gcry_propq());
+
+    if (!ctx) {
+        ERR_clear_error();
+        return 0;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    return 1;
+}
+
 /* Build an EVP_PKEY from one octet string parameter. */
 static gcry_err_code_t
 pkey_from_octets(const char *name, const char *param, int selection,
@@ -1009,7 +1027,8 @@ kem_genkey(int algo, void *pubkey, size_t pubkey_len, void *seckey,
         return GPG_ERR_UNKNOWN_ALGORITHM;
     }
 
-    if (info->kind == KIND_UNSUPPORTED) {
+    if (info->kind == KIND_UNSUPPORTED
+        || (info->kind == KIND_MLKEM && !pkey_algo_available(info->ossl_name))) {
         return GPG_ERR_UNSUPPORTED_ALGORITHM;
     }
 
@@ -1080,7 +1099,8 @@ kem_encap(int algo, const void *pubkey, size_t pubkey_len, void *ciphertext,
         return GPG_ERR_UNKNOWN_ALGORITHM;
     }
 
-    if (info->kind == KIND_UNSUPPORTED) {
+    if (info->kind == KIND_UNSUPPORTED
+        || (info->kind == KIND_MLKEM && !pkey_algo_available(info->ossl_name))) {
         return GPG_ERR_UNSUPPORTED_ALGORITHM;
     }
 
@@ -1184,7 +1204,8 @@ kem_decap(int algo, const void *seckey, size_t seckey_len,
         return GPG_ERR_UNKNOWN_ALGORITHM;
     }
 
-    if (info->kind == KIND_UNSUPPORTED) {
+    if (info->kind == KIND_UNSUPPORTED
+        || (info->kind == KIND_MLKEM && !pkey_algo_available(info->ossl_name))) {
         return GPG_ERR_UNSUPPORTED_ALGORITHM;
     }
 

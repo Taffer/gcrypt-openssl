@@ -2924,7 +2924,9 @@ ccm_reference(const unsigned char *key, const unsigned char *nonce,
         goto done;
     }
 
-    if (ptlen && !EVP_EncryptUpdate(ctx, ct, &outl, pt, (int)ptlen)) {
+    /* Also for an empty message: OpenSSL 3.4's CCM only computes the tag
+     * for an authentication-only input in the update. */
+    if (!EVP_EncryptUpdate(ctx, ct, &outl, pt, (int)ptlen)) {
         goto done;
     }
 

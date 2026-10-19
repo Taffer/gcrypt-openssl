@@ -232,6 +232,7 @@ EC_GROUP *_gcry_ecc_curve_group(const struct gcry_ecc_curve *curve);
 const char *_gcry_md_openssl_name(int algo);
 /* Fetched EVP_MD for ALGO (caller frees), NULL if unavailable. */
 EVP_MD *_gcry_md_fetch(int algo);
+int _gcry_md_hmac_usable(int algo);
 /* Output size parameter needed for the truncated BLAKE2 variants, else 0. */
 unsigned int _gcry_md_reduced_size(int algo);
 

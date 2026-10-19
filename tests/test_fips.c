@@ -349,8 +349,11 @@ TEST(reject_cipher_and_mac)
                      gcry_cipher_test_algo(GCRY_CIPHER_CAST5));
     ASSERT_OK_UNLESS(strict_lacks_mac(GCRY_MAC_CMAC_3DES), GPG_ERR_MAC_ALGO,
                      gcry_mac_test_algo(GCRY_MAC_CMAC_3DES));
-    ASSERT_OK_UNLESS(gcry_fips_mode_active()
-                     || strict_lacks_mac(GCRY_MAC_HMAC_MD5),
+    /* Chainguard's images add a provider that supplies MD5 in FIPS mode
+     * (allowed for non-security use), so HMAC-MD5 may be there with the
+     * rejection switched off; the strict flag asks the library. */
+    ASSERT_OK_UNLESS(TEST_STRICT_PROVIDER ? strict_lacks_mac(GCRY_MAC_HMAC_MD5)
+                     : gcry_fips_mode_active(),
                      GPG_ERR_MAC_ALGO,
                      gcry_mac_test_algo(GCRY_MAC_HMAC_MD5));
 

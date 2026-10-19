@@ -314,8 +314,42 @@ _gcry_md_reduced_size(int algo)
 static EVP_MD *md_cache[DIM(md_specs)];
 static pthread_mutex_t md_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* A reference to the digest behind ALGO, or NULL if OpenSSL has none.  The
- * caller releases it with EVP_MD_free. */
+/* The reference library's FIPS policy for digests, applied before the
+ * provider is asked: a non-approved digest is only offered in FIPS mode
+ * when the GCRYCTL_FIPS_REJECT_NON_FIPS flags allow it, MD5 unless
+ * GCRY_FIPS_FLAG_REJECT_MD_MD5, SHA-1 unless GCRY_FIPS_FLAG_REJECT_MD_SHA1
+ * and every other one unless GCRY_FIPS_FLAG_REJECT_MD_OTHERS, whatever
+ * the providers supply.  OpenSSL's FIPS provider has none of them, but
+ * Chainguard's images add a provider that offers MD5 and MD4 under the
+ * fips=yes property for non-security uses. */
+static int
+rejected_in_fips_mode(const struct md_spec *spec)
+{
+    unsigned int flags;
+
+    if (!_gcry_fips_mode()) {
+        return 0;
+    }
+
+    flags = _gcry_fips_reject_flags();
+
+    if (spec->algo == GCRY_MD_MD5) {
+        return (flags & GCRY_FIPS_FLAG_REJECT_MD_MD5) != 0;
+    }
+
+    if (spec->algo == GCRY_MD_SHA1) {
+        return (flags & GCRY_FIPS_FLAG_REJECT_MD_SHA1) != 0;
+    }
+
+    if (!(spec->flags & MD_F_FIPS)) {
+        return (flags & GCRY_FIPS_FLAG_REJECT_MD_OTHERS) != 0;
+    }
+
+    return 0;
+}
+
+/* A reference to the digest behind ALGO, or NULL if OpenSSL has none or
+ * the FIPS policy refuses it.  The caller releases it with EVP_MD_free. */
 EVP_MD *
 _gcry_md_fetch(int algo)
 {
@@ -334,6 +368,10 @@ _gcry_md_fetch(int algo)
     libctx = _gcry_libctx();
     propq = _gcry_propq();
     idx = (size_t)(spec - md_specs);
+
+    if (rejected_in_fips_mode(spec)) {
+        return NULL;
+    }
 
     pthread_mutex_lock(&md_cache_lock);
     md = md_cache[idx];
@@ -355,6 +393,65 @@ _gcry_md_fetch(int algo)
 
     pthread_mutex_unlock(&md_cache_lock);
     return md;
+}
+
+/* Can OpenSSL's HMAC be set up over the digest behind ALGO?  The FIPS
+ * provider's HMAC looks its digest up inside the module, so a digest that
+ * another provider supplies (MD5 from the provider Chainguard's images
+ * add) hashes but cannot be used in HMAC.  Probed once per algorithm
+ * with a key long enough for the FIPS provider; 0 also when the digest
+ * itself is not offered. */
+static signed char hmac_usable_cache[DIM(md_specs)]; /* 0 unknown, 1, -1. */
+
+int
+_gcry_md_hmac_usable(int algo)
+{
+    const struct md_spec *spec = spec_from_algo(algo);
+    static const unsigned char probe_key[32] = { 0 };
+    OSSL_PARAM params[2];
+    EVP_MAC *mac = NULL;
+    EVP_MAC_CTX *macctx = NULL;
+    EVP_MD *md;
+    size_t idx;
+    int usable;
+
+    if (!spec || !spec->ossl || (spec->flags & (MD_F_XOF | MD_F_CRC))) {
+        return 0;
+    }
+
+    md = _gcry_md_fetch(algo);
+
+    if (!md) {
+        return 0;
+    }
+
+    EVP_MD_free(md);
+    idx = (size_t)(spec - md_specs);
+
+    pthread_mutex_lock(&md_cache_lock);
+    usable = hmac_usable_cache[idx];
+    pthread_mutex_unlock(&md_cache_lock);
+
+    if (usable) {
+        return usable > 0;
+    }
+
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                                 (char *)(uintptr_t)spec->ossl,
+                                                 0);
+    params[1] = OSSL_PARAM_construct_end();
+    mac = EVP_MAC_fetch(_gcry_libctx(), "HMAC", _gcry_propq());
+    macctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+    usable = macctx
+             && EVP_MAC_init(macctx, probe_key, sizeof probe_key, params);
+    ERR_clear_error();
+    EVP_MAC_CTX_free(macctx);
+    EVP_MAC_free(mac);
+
+    pthread_mutex_lock(&md_cache_lock);
+    hmac_usable_cache[idx] = usable ? 1 : -1;
+    pthread_mutex_unlock(&md_cache_lock);
+    return usable;
 }
 
 /* GPG_ERR_DIGEST_ALGO unless ALGO can actually be used. */
@@ -997,6 +1094,10 @@ md_enable(gcry_md_hd_t hd, int algo)
     if (ctx->hmac && _gcry_md_reduced_size(algo)) {
         /* OpenSSL's HMAC cannot be parameterised with a truncated BLAKE2
          * output length. */
+        return GPG_ERR_DIGEST_ALGO;
+    }
+
+    if (ctx->hmac && !_gcry_md_hmac_usable(algo)) {
         return GPG_ERR_DIGEST_ALGO;
     }
 

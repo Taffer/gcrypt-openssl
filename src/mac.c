@@ -297,19 +297,14 @@ check_mac_algo(int algo)
 
     switch (spec->kind) {
     case MAC_HMAC: {
-        EVP_MD *md;
-
         if (_gcry_md_reduced_size(spec->mdalgo)) {
             return GPG_ERR_MAC_ALGO; /* No truncated BLAKE2 in HMAC. */
         }
 
-        md = _gcry_md_fetch(spec->mdalgo);
-
-        if (!md) {
+        if (!_gcry_md_hmac_usable(spec->mdalgo)) {
             return GPG_ERR_MAC_ALGO;
         }
 
-        EVP_MD_free(md);
         break;
     }
 

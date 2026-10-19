@@ -4,6 +4,15 @@
 
 #include "test_common.h"
 
+/* Whether MD5 is not offered: in FIPS mode with OpenSSL's own providers;
+ * under a strict provider whenever the library says so. */
+static int
+md5_unavailable(void)
+{
+    return TEST_STRICT_PROVIDER ? gcry_md_test_algo(GCRY_MD_MD5) != 0
+           : gcry_fips_mode_active();
+}
+
 /* Decode a hex string into BUF; returns the number of bytes. */
 static size_t
 unhex(const char *hex, unsigned char *buf, size_t bufsize)
@@ -130,8 +139,9 @@ TEST(s2k_vectors)
 
     for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
         /* The S2K functions are iterated digests; the SHA-based ones run
-         * in FIPS mode, MD5 is unavailable there. */
-        if (gcry_fips_mode_active() && tv[i].hashalgo == GCRY_MD_MD5) {
+         * in FIPS mode, MD5 is unavailable there unless the provider set
+         * supplies it (Chainguard's images do; the strict flag asks). */
+        if (tv[i].hashalgo == GCRY_MD_MD5 && md5_unavailable()) {
             ASSERT_ERR(GPG_ERR_DIGEST_ALGO,
                        gcry_kdf_derive(tv[i].p, tv[i].plen, tv[i].algo,
                                        tv[i].hashalgo, tv[i].salt,
