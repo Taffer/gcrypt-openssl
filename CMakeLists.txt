@@ -108,6 +108,29 @@ message(
     STATUS "Using OpenSSL ${OPENSSL_VERSION} from ${OPENSSL_CRYPTO_LIBRARY}"
 )
 
+# The drop-in replacement must not shadow the system libgcrypt, so by
+# default it installs under /opt/gcrypt-openssl with the libraries in lib64
+# (the layout the README documents) instead of the usual prefix and the
+# platform's library directory.  Both remain overridable with
+# -DCMAKE_INSTALL_PREFIX and -DCMAKE_INSTALL_LIBDIR.  The prefix default is
+# only applied on the first configure of a build tree, like CMake's own.
+if(GCRYPT_OPENSSL_DROP_IN)
+    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+        set(CMAKE_INSTALL_PREFIX
+            "/opt/gcrypt-openssl"
+            CACHE PATH
+                  "Install path prefix, prepended onto install directories"
+                  FORCE
+        )
+    endif()
+    if(NOT DEFINED CMAKE_INSTALL_LIBDIR)
+        set(CMAKE_INSTALL_LIBDIR
+            "lib64"
+            CACHE PATH "Object code libraries (lib64)"
+        )
+    endif()
+endif()
+
 # Needed before add_subdirectory(src) so CMAKE_INSTALL_INCLUDEDIR is defined
 # when the library's INSTALL_INTERFACE include path is set.
 include(GNUInstallDirs)

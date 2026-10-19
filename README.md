@@ -111,7 +111,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
 | `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
-| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
+| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config`; installs under `/opt/gcrypt-openssl/lib64` |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
@@ -213,17 +213,28 @@ the installed `gcrypt-openssl.pc`. The package config pulls in
 
 With `-DGCRYPT_OPENSSL_DROP_IN=ON` the install also contains
 `libgcrypt.so.20.8.9` (the reference library's current soname and
-version), `libgcrypt.pc` and a `libgcrypt-config` script. Programs built
-against the reference library run unchanged when the install's library
-directory is on their library path, for example:
+version), `libgcrypt.pc` and a `libgcrypt-config` script. So that it never
+shadows the system libgcrypt, the drop-in build installs under
+`/opt/gcrypt-openssl` with the libraries in `lib64` on every platform,
+rather than under `/usr/local` and the platform's library directory:
+
+```sh
+cmake -S . -B build-drop-in -DGCRYPT_OPENSSL_DROP_IN=ON
+cmake --build build-drop-in
+sudo cmake --install build-drop-in
+```
+
+Programs built against the reference library run unchanged when that
+library directory is on their library path, for example:
 
 ```sh
 LD_LIBRARY_PATH=/opt/gcrypt-openssl/lib64 gpg --version
 ```
 
-Set `CMAKE_INSTALL_PREFIX` at configure time so the pkg-config file and the
-config script carry the right paths. The drop-in requires the shared
-library to be enabled.
+`-DCMAKE_INSTALL_PREFIX` and `-DCMAKE_INSTALL_LIBDIR` override the
+defaults; set them on the first configure of a build tree so the pkg-config
+file and the config script carry the right paths. The drop-in requires the
+shared library to be enabled.
 
 ### FIPS mode
 
