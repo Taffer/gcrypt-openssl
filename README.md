@@ -31,9 +31,18 @@ This project was extruded by Claude. Use at your own risk.
   `gcrypt.h` embeds the subset of libgpg-error it needs (error types, every
   `GPG_ERR_*` value, inline helpers); a real `<gpg-error.h>` included first
   takes precedence.
-- **Clean room.** Upstream was read for behaviour only; the public header,
-  constants and S-expression formats are reproduced because they are the
-  API, the code is new. See [LICENSE](LICENSE).
+- **Relationship to upstream.** The public header, constants and
+  S-expression formats are reproduced because they are the API. The rest of
+  the front-end code is not independent either: the S-expression module,
+  the MPI coders and flag handling, the digest, cipher and public-key
+  dispatch layers, `gcry_control`, logging, the KDF and prime-generation
+  skeletons and the curve tables follow the reference implementation's
+  internal layouts, function names, order of checks and error codes,
+  rewritten rather than copied. Independent designs are the OpenSSL
+  bindings, all arithmetic, the secure memory pool, the cipher mode
+  engine, the KEM module and the test harness. For licensing purposes
+  treat the library as derived from Libgcrypt (LGPL-2.1-or-later); see
+  [LICENSE](LICENSE).
 - **Secure memory** is a pool of the library's own, like the reference
   implementation's: anonymous mappings of 32 KiB (more if
   `GCRYCTL_INIT_SECMEM` or `GCRYCTL_AUTO_EXPAND_SECMEM` ask for it),
@@ -419,5 +428,8 @@ pre-commit run --all-files
 
 ## License
 
-See [LICENSE](LICENSE), but this is entirely Public Domain because it wasn't
-written by a human.
+See [LICENSE](LICENSE). The authors claim no copyright of their own, but a
+side-by-side comparison with Libgcrypt 1.11.2 shows that most of the
+non-cryptographic code reproduces upstream's internal design with new
+text, so assume the terms of Libgcrypt's LGPL-2.1-or-later apply to
+redistribution.

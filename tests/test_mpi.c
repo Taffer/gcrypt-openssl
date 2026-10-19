@@ -997,8 +997,10 @@ TEST(immutable_arithmetic)
 }
 
 /* An MPI turned into a constant can never be released; keeping it
- * reachable from here stops leak checkers from reporting it. */
-static gcry_mpi_t kept_constant;
+ * reachable from here stops leak checkers from reporting it.  Volatile so
+ * that an optimising compiler cannot drop the never-read store and turn
+ * the block into a "definitely lost" report under Valgrind. */
+static gcry_mpi_t volatile kept_constant;
 
 TEST(immutable_refusals)
 {
@@ -1608,10 +1610,16 @@ bug_exit_handler(void *opaque, int level, const char *fmt, va_list ap)
     }
 }
 
+/* The children below exit from inside the log handler, so their MPIs are
+ * never released.  Parking them here keeps them reachable; volatile stops
+ * an optimising compiler from dropping the store, which would make
+ * Valgrind report the block as definitely lost in the child. */
+static gcry_mpi_t volatile fatal_kept[2];
+
 static void
 fatal_mpi_get_opaque_normal(void)
 {
-    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t a = fatal_kept[0] = gcry_mpi_set_ui(NULL, 5);
 
     gcry_set_log_handler(bug_exit_handler, NULL);
     gcry_mpi_get_opaque(a, NULL);
@@ -1620,7 +1628,7 @@ fatal_mpi_get_opaque_normal(void)
 static void
 fatal_mpi_set_flag_opaque(void)
 {
-    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t a = fatal_kept[0] = gcry_mpi_set_ui(NULL, 5);
 
     gcry_set_log_handler(bug_exit_handler, NULL);
     gcry_mpi_set_flag(a, GCRYMPI_FLAG_OPAQUE);
@@ -1629,7 +1637,7 @@ fatal_mpi_set_flag_opaque(void)
 static void
 fatal_mpi_clear_flag_const(void)
 {
-    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t a = fatal_kept[0] = gcry_mpi_set_ui(NULL, 5);
 
     gcry_set_log_handler(bug_exit_handler, NULL);
     gcry_mpi_clear_flag(a, GCRYMPI_FLAG_CONST);
@@ -1638,7 +1646,7 @@ fatal_mpi_clear_flag_const(void)
 static void
 fatal_mpi_get_flag_unknown(void)
 {
-    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t a = fatal_kept[0] = gcry_mpi_set_ui(NULL, 5);
 
     gcry_set_log_handler(bug_exit_handler, NULL);
     gcry_mpi_get_flag(a, (enum gcry_mpi_flag)0x1000);
@@ -1647,8 +1655,8 @@ fatal_mpi_get_flag_unknown(void)
 static void
 fatal_mpi_opaque_arithmetic(void)
 {
-    gcry_mpi_t o = gcry_mpi_set_opaque_copy(NULL, "\x01", 8);
-    gcry_mpi_t r = gcry_mpi_new(0);
+    gcry_mpi_t o = fatal_kept[0] = gcry_mpi_set_opaque_copy(NULL, "\x01", 8);
+    gcry_mpi_t r = fatal_kept[1] = gcry_mpi_new(0);
 
     gcry_set_log_handler(bug_exit_handler, NULL);
     gcry_mpi_add(r, o, o);
@@ -1664,7 +1672,7 @@ fatal_mpi_unknown_constant(void)
 static void
 fatal_mpi_get_opaque_unhandled(void)
 {
-    gcry_mpi_t a = gcry_mpi_set_ui(NULL, 5);
+    gcry_mpi_t a = fatal_kept[0] = gcry_mpi_set_ui(NULL, 5);
 
     gcry_mpi_get_opaque(a, NULL);
 }

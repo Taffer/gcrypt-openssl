@@ -1,8 +1,8 @@
 /*
  * gcrypt.h - Public interface of gcrypt-openssl.
  *
- * This header is a clean-room, API/ABI compatible replacement for the
- * header shipped with Libgcrypt 1.12.  It deliberately carries no
+ * This header is an API/ABI compatible replacement for the header shipped
+ * with Libgcrypt 1.12, written against that header's interface.  It deliberately carries no
  * dependency on libgpg-error: the subset of that library's interface that
  * Libgcrypt exposes (error types, codes and the inline helpers) is defined
  * here, guarded so that a real <gpg-error.h> included *before* this file

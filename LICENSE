@@ -2,3 +2,8 @@ Because slop code cannot be copyrighted, this project is entirely Public
 Domain. It was been extruded by Claude and is therefore derived work of an
 unknown set of existing code, which was covered by various Copyright and
 licensing terms.
+
+In particular, a comparison with Libgcrypt 1.11.2 shows that most of the
+non-cryptographic code follows that library's internal design closely.
+Libgcrypt is licensed under the LGPL-2.1-or-later, and anyone
+redistributing this project should assume those terms apply.
