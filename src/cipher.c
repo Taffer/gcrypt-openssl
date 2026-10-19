@@ -2092,7 +2092,7 @@ cipher_setiv_common(gcry_cipher_hd_t h, const void *iv, size_t ivlen,
     int allow;
     size_t taglen;
     unsigned char dectag[16];
-    unsigned char ctr[MAX_BLOCKSIZE];
+    unsigned char ctr[MAX_BLOCKSIZE] = { 0 };
     int dectag_set;
 
     if (h->mode == GCRY_CIPHER_MODE_GCM && !generated && _gcry_fips_mode()) {

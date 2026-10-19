@@ -35,15 +35,18 @@ This project was extruded by Claude. Use at your own risk.
   constants and S-expression formats are reproduced because they are the
   API, the code is new. See [LICENSE](LICENSE).
 - **Secure memory** is a pool of the library's own, like the reference
-  implementation's: an anonymous mapping of 32 KiB (more if
-  `GCRYCTL_INIT_SECMEM` asks for it), locked into RAM and excluded from
-  core dumps where the system allows, carved up by a small first-fit
-  allocator. Secure allocations are wiped on free and `gcry_is_secure()` is
-  an exact range check. When the pool is exhausted, allocations fall back
-  to the ordinary heap and are reported as not secure. OpenSSL's own
+  implementation's: anonymous mappings of 32 KiB (more if
+  `GCRYCTL_INIT_SECMEM` or `GCRYCTL_AUTO_EXPAND_SECMEM` ask for it),
+  locked into RAM and excluded from core dumps where the system allows,
+  carved up by a small first-fit allocator that validates every block it
+  is handed back. When a pool is full another is mapped; only a failing
+  `mmap` makes a secure allocation fail. Secure allocations are wiped on
+  free and `gcry_is_secure()` is an exact range check. OpenSSL's own
   secure heap is deliberately left alone: it is process-wide with no
   fallback, and sizing it for the application starved OpenSSL's internal
-  users of it, most visibly the FIPS module's self-tests.
+  users of it, most visibly the FIPS module's self-tests. Consequently the
+  limbs of secure MPIs are wiped on free but not locked; they do carry
+  OpenSSL's constant-time flag.
 - **Thread safety** follows the reference library: handles are not shared
   between threads, everything else is. Fetched OpenSSL algorithm objects
   are cached for the life of the process behind mutexes, and each thread
@@ -229,23 +232,34 @@ At initialisation the library asks for FIPS mode when
 `1`, or the application called `GCRYCTL_FORCE_FIPS_MODE` beforehand, just
 like the reference library. Asking means loading OpenSSL's `fips` provider
 into the private library context and enabling the `fips=yes` default
-property, so every algorithm fetch is served by the FIPS provider. If the
-provider cannot be loaded the library carries on without FIPS mode;
-`gcry_get_config(0, "fips-mode")` and `GCRYCTL_FIPS_MODE_P` report what
-actually happened. `GCRYCTL_NO_FIPS_MODE` before initialisation turns the
-request off. Without any request, the library is also in FIPS mode when
-the OpenSSL configuration made `fips=yes` the default property, or when
-it activated the `fips` provider and not the `default` one, so that only
-approved algorithms exist (Chainguard's FIPS images are configured that
-way).
+property, so every algorithm fetch is served by the FIPS provider. If
+FIPS mode was required but the provider cannot be loaded, the library
+enters an error state like the reference: `GCRYCTL_FIPS_MODE_P` still
+reports FIPS mode, `GCRYCTL_OPERATIONAL_P` is false, `GCRYCTL_SELFTEST`
+fails, `gcry_get_config(0, "fips-error")` reports `y`, random numbers are
+refused and no algorithm can be fetched, so every operation fails.
+`GCRYCTL_NO_FIPS_MODE` before initialisation turns the request off; once
+FIPS mode is active it is refused. Without any request, the library is
+also in FIPS mode when the OpenSSL configuration made `fips=yes` the
+default property, or when it activated the `fips` provider and not the
+`default` one, so that only approved algorithms exist (Chainguard's FIPS
+images are configured that way).
+
+A few rules are enforced beyond what OpenSSL's provider checks: GCM
+encryption needs an IV generated through `gcry_cipher_setup_geniv` and
+`gcry_cipher_geniv` (a caller-supplied IV makes the handle refuse to
+encrypt, as the reference does); GMAC is not approved; curves given as
+explicit parameters must match an approved named curve; non-approved
+digests are refused in public key operations.
 
 `-DGCRYPT_OPENSSL_FIPS=ON` (the `fips` preset) makes the build ask for FIPS
 mode unconditionally, as if the marker file were present, and defines
 `GCRYPT_OPENSSL_FIPS=1` for every target in the tree: the libraries, the
 drop-in, the tests, the benchmarks and a coverage build configured with
 both options. With an OpenSSL that has no `fips` module (such as the one
-`scripts/build-openssl.sh` produces) the library silently runs in non-FIPS
-mode.
+`scripts/build-openssl.sh` produces) such a build is in the error state
+described above and most of the test suite fails with "not operational",
+so run the `fips` preset only against a FIPS-capable OpenSSL.
 
 The test suite passes in genuine FIPS mode. `test_fips` covers the
 controls that only work before initialisation (`GCRYCTL_FORCE_FIPS_MODE`,
