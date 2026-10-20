@@ -245,6 +245,11 @@ if(GCRYPT_OPENSSL_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+# After include(CTest) so that the tools' own test is registered.
+if(GCRYPT_OPENSSL_DROP_IN)
+    add_subdirectory(tools)
+endif()
+
 if(GCRYPT_OPENSSL_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()

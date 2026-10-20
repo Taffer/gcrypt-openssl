@@ -17,14 +17,20 @@ set(GCRYPT_API_VERSION "1.12.4")
 set(GCRYPT_DROP_IN_SOVERSION 20)
 set(GCRYPT_DROP_IN_VERSION 20.8.9)
 
+# Algorithm lists for libgcrypt-config --algorithms, in the reference
+# library's configure --enable-* names and output format (lower case, space
+# separated, the order of its default lists) minus what this implementation
+# lacks: twofish, serpent, salsa20 and gost28147 among the ciphers; tiger,
+# gostr3411-94 and stribog among the digests; the balloon KDF.
 string(CONCAT GCRYPT_CONFIG_CIPHERS
-              "idea:3des:cast5:blowfish:aes:rfc2268:seed:"
-              "camellia:chacha20:sm4:aria:arcfour:des"
+              "arcfour blowfish cast5 des aes rfc2268 seed camellia idea "
+              "chacha20 sm4 aria"
 )
-set(GCRYPT_CONFIG_PUBKEYS "dsa:elgamal:rsa:ecc")
+set(GCRYPT_CONFIG_PUBKEYS "dsa elgamal rsa ecc")
 set(GCRYPT_CONFIG_DIGESTS
-    "crc:md4:md5:rmd160:sha1:sha256:sha512:sha3:whirlpool:blake2:sm3"
+    "crc md4 md5 rmd160 sha1 sha256 sha512 sha3 whirlpool blake2 sm3"
 )
+set(GCRYPT_CONFIG_KDFS "s2k pkdf2 scrypt argon2 hkdf")
 
 if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
     set(PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
@@ -99,9 +105,28 @@ endif()
 if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
     set(PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
 endif()
-set(LIBGCRYPT_CONFIG_HOST "${CMAKE_C_COMPILER_TARGET}")
+# The host triplet, as configure's $host that the reference script reports.
+# GCC and Clang print theirs with -dumpmachine; fall back to the explicit
+# cross-compilation target, then to what CMake knows.
+set(LIBGCRYPT_CONFIG_HOST "")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    execute_process(
+        COMMAND "${CMAKE_C_COMPILER}" -dumpmachine
+        OUTPUT_VARIABLE LIBGCRYPT_CONFIG_HOST
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+        RESULT_VARIABLE dumpmachine_result
+    )
+    if(NOT dumpmachine_result EQUAL 0)
+        set(LIBGCRYPT_CONFIG_HOST "")
+    endif()
+endif()
 if(NOT LIBGCRYPT_CONFIG_HOST)
-    set(LIBGCRYPT_CONFIG_HOST "${CMAKE_SYSTEM_PROCESSOR}-${CMAKE_SYSTEM_NAME}")
+    set(LIBGCRYPT_CONFIG_HOST "${CMAKE_C_COMPILER_TARGET}")
+endif()
+if(NOT LIBGCRYPT_CONFIG_HOST)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}-${CMAKE_SYSTEM_NAME}"
+                   LIBGCRYPT_CONFIG_HOST
+    )
 endif()
 
 configure_file(

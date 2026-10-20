@@ -86,7 +86,8 @@ value instead of failing with `GPG_ERR_ENCODING_PROBLEM` as upstream does.
 |----------------|-------------------------------------------------------------|
 | `benchmarks/`  | `bench_gcrypt` sources and `compare.sh`                     |
 | `cmake/`       | Package config, pkg-config and `libgcrypt-config` templates, `drop-in.cmake` |
-| `scripts/`     | `build-openssl.sh`, `check-exports.sh`, `coverage.py`       |
+| `scripts/`     | `build-openssl.sh`, `check-exports.sh`, `check-libgcrypt-config.sh`, `check-tools.sh`, `coverage.py` |
+| `tools/`       | `dumpsexp`, `hmac256` and `mpicalc`, the command-line utilities the reference library installs; built with the drop-in |
 | `src/`         | Library sources, one file per module; `libgcrypt.map` is the symbol version script |
 | `src/include/` | The public header `gcrypt.h`                                |
 | `tests/`       | One `test_*.c` program per module, `test_common.h` assertion helpers, `expected-exports.txt`, KEM vectors and the script that regenerates them |
@@ -157,13 +158,16 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | `bench_gcrypt` | | Benchmark driver linked against this library |
 | `bench_gcrypt_stock` | | The same sources linked against the stock `libgcrypt.so.20`, when one is found |
 | `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
+| `check_libgcrypt_config` | | CTest entry only, with the drop-in: `scripts/check-libgcrypt-config.sh` checks the configured `libgcrypt-config` against the reference script's behaviour and `gcrypt.h` |
+| `dumpsexp`, `hmac256`, `mpicalc` | | With the drop-in: the reference library's command-line utilities, linked against `libgcrypt.so.20` |
+| `check_tools` | | CTest entry only, with the drop-in: `scripts/check-tools.sh` runs the three utilities against the reference programs' documented behaviour |
 | `coverage` | | Runs the tests and writes the coverage report; only with `GCRYPT_OPENSSL_COVERAGE=ON` |
 | `gcrypt-openssl::gcrypt-openssl` | (alias only) | The shared library when built, else the static one; what the tests and benchmarks link |
 | `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
 | `gcrypt_openssl_shared` | `gcrypt-openssl::shared` | `libgcrypt-openssl.so.0.1.0` with soname `libgcrypt-openssl.so.0`; exports exactly the `gcry_*` symbols plus `_gcry_mpi_get_const` via `src/libgcrypt.map` |
 | `gcrypt_openssl_static` | `gcrypt-openssl::static` | `libgcrypt-openssl.a`, built with PIC so it can be linked into other shared objects |
 | `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
-| `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config` |
+| `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config`, `dumpsexp`, `hmac256` and `mpicalc` |
 | `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
 | `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
 | `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
@@ -244,6 +248,39 @@ LD_LIBRARY_PATH=/opt/gcrypt-openssl/lib64 gpg --version
 defaults; set them on the first configure of a build tree so the pkg-config
 file and the config script carry the right paths. The drop-in requires the
 shared library to be enabled.
+
+The `libgcrypt-config` script takes the same options as the reference
+library's and prints the same output in the same order, so
+`AM_PATH_LIBGCRYPT` and hand-written configure checks work unchanged:
+`--prefix`, `--exec-prefix`, `--version` (also `--modversion`),
+`--api-version`, `--cflags`, `--libs`, `--host`, `--algorithms` and
+`--variable=NAME`. `--prefix=DIR` and `--exec-prefix=DIR` are accepted and
+ignored, and `--thread=MODEL` fails, as upstream. The values describe this
+implementation: `--libs` is `-L<libdir> -lgcrypt` with no libgpg-error,
+`--algorithms` lists only the algorithms provided here, and
+`--variable=NAME` additionally answers `includedir`, `libdir`, `version`,
+`kdfs`, `implementation`, `implementation_version` and `openssl_version`.
+
+The drop-in also builds and installs the three command-line utilities the
+reference library ships, with the same options and output:
+
+- `dumpsexp` hex-dumps an S-expression while scanning it, reporting syntax
+  problems under a cursor; `--verbose` shows the parser events,
+  `--assume-hex` reads a hex dump, `--decimal` prints decimal offsets.
+  `--advanced`, which the reference tool accepts but ignores, parses the
+  input with `gcry_sexp_sscan` and prints it in advanced format.
+- `hmac256 [--binary] [--stdkey|KEY] [FILE...]` prints the HMAC-SHA-256 of
+  each file (or stdin) like `sha1sum`; `--stdkey` is the key the reference
+  library's integrity check uses. The MAC is computed through `gcry_mac_*`
+  after an RFC 4231 self-test.
+- `mpicalc` is the RPN calculator on `gcry_mpi_t` values: hexadecimal
+  numbers (a leading digit is required, so `0ff` not `ff`), single-character
+  operators, `?` for the operator table, `--print-config` for the library
+  configuration. Unlike the reference tool, `--` really decrements.
+
+The utilities link `libgcrypt.so.20` and carry an rpath to the install
+library directory, so they run from `/opt/gcrypt-openssl/bin` without
+`LD_LIBRARY_PATH`.
 
 ### FIPS mode
 

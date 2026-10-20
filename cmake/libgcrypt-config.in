@@ -1,89 +1,212 @@
 #!/bin/sh
-# libgcrypt-config - compatibility script provided by gcrypt-openssl.
-# Reports the same information as the script shipped with Libgcrypt so that
-# configure scripts using AM_PATH_LIBGCRYPT keep working.
+# libgcrypt-config - build-flag helper for the gcrypt-openssl drop-in.
+#
+# Command-line compatible with the libgcrypt-config script that ships with
+# the reference Libgcrypt (src/libgcrypt-config.in): the same options, the
+# same output, printed in the same order, so that AM_PATH_LIBGCRYPT and other
+# build systems that drive the script keep working.  The values describe
+# this implementation: it depends on OpenSSL rather than libgpg-error, so
+# --libs and --cflags carry no gpg-error flags, and --algorithms lists the
+# algorithms this library actually provides.
+#
+# This file is in the public domain.  Configured by CMake from
+# cmake/libgcrypt-config.in; do not edit the installed copy.
 
+# General.
 prefix="@CMAKE_INSTALL_PREFIX@"
 exec_prefix="${prefix}"
+version="@GCRYPT_API_VERSION@"
 includedir="@PC_INCLUDEDIR@"
 libdir="@PC_LIBDIR@"
-host="@LIBGCRYPT_CONFIG_HOST@"
+
+# The reference script appends the flags libgpg-error needs.  gcrypt.h here
+# embeds the subset of libgpg-error that the API exposes, so nothing is
+# needed; the variables stay so that the structure matches upstream.
+gpg_error_libs=""
+gpg_error_cflags=""
+
+# libgcrypt values.
+libs="-lgcrypt"
+cflags=""
+
+# API info
 api_version="1"
-version="@GCRYPT_API_VERSION@"
+
+# Configured for host
+my_host="@LIBGCRYPT_CONFIG_HOST@"
+
+# Misc information.  Lower-case, space-separated, in the reference library's
+# naming (its configure --enable-* names) so that scripts parsing the output
+# of the reference script read ours unchanged.
 symmetric_ciphers="@GCRYPT_CONFIG_CIPHERS@"
 asymmetric_ciphers="@GCRYPT_CONFIG_PUBKEYS@"
 digests="@GCRYPT_CONFIG_DIGESTS@"
+kdfs="@GCRYPT_CONFIG_KDFS@"
 
-usage() {
-    cat <<USAGE
-Usage: libgcrypt-config [OPTIONS]
-Options:
-    [--prefix]
-    [--exec-prefix]
-    [--version]
-    [--api-version]
-    [--libs]
-    [--cflags]
-    [--algorithms]
-    [--host]
-USAGE
-    exit "$1"
-}
+# Values specific to this implementation, available through --variable.
+implementation="gcrypt-openssl"
+implementation_version="@PROJECT_VERSION@"
+openssl_version="@OPENSSL_VERSION@"
 
-if [ $# -eq 0 ]; then
-    usage 1 1>&2
-fi
-
+# State variables.
+echo_libs=no
+echo_cflags=no
 echo_prefix=no
+echo_algorithms=no
 echo_exec_prefix=no
 echo_version=no
 echo_api_version=no
-echo_libs=no
-echo_cflags=no
-echo_algorithms=no
 echo_host=no
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-    --prefix) echo_prefix=yes ;;
-    --exec-prefix) echo_exec_prefix=yes ;;
-    --version) echo_version=yes ;;
-    --api-version) echo_api_version=yes ;;
-    --libs) echo_libs=yes ;;
-    --cflags) echo_cflags=yes ;;
-    --algorithms) echo_algorithms=yes ;;
-    --host) echo_host=yes ;;
-    *) usage 1 1>&2 ;;
+# Prints usage information.
+usage()
+{
+    cat <<EOF
+Usage: $0 [OPTIONS]
+Options:
+	[--prefix]
+	[--exec-prefix]
+	[--version]
+	[--api-version]
+	[--libs]
+	[--cflags]
+	[--algorithms]
+	[--host]
+	[--variable=NAME]
+EOF
+    exit $1
+}
+
+if test $# -eq 0; then
+    # Nothing to do.
+    usage 1 1>&2
+fi
+
+while test $# -gt 0; do
+    case $1 in
+	--thread=*)
+	    echo "$0: --thread option obsolete: use the thread callback interface" 1>&2
+	    exit 1
+	    ;;
+	--prefix=*)
+	    # For compatibility reasons with old M4 macros, we ignore
+	    # setting of prefix.
+	    ;;
+	--prefix)
+	    echo_prefix=yes
+	    ;;
+	--exec-prefix=*)
+	    ;;
+	--exec-prefix)
+	    echo_exec_prefix=yes
+	    ;;
+	--variable=*)
+	    case "${1#*=}" in
+		prefix) echo "$prefix" ;;
+		exec_prefix) echo "$exec_prefix" ;;
+		includedir) echo "$includedir" ;;
+		libdir) echo "$libdir" ;;
+		host) echo "$my_host" ;;
+		version) echo "$version" ;;
+		api_version) echo "$api_version" ;;
+		symmetric_ciphers) echo "$symmetric_ciphers" ;;
+		asymmetric_ciphers) echo "$asymmetric_ciphers" ;;
+		digests) echo "$digests" ;;
+		kdfs) echo "$kdfs" ;;
+		implementation) echo "$implementation" ;;
+		implementation_version) echo "$implementation_version" ;;
+		openssl_version) echo "$openssl_version" ;;
+	    esac
+	    exit 0
+	    ;;
+	--modversion|--version)
+	    echo_version=yes
+	    ;;
+	--api-version)
+	    echo_api_version=yes
+	    ;;
+	--cflags)
+	    echo_cflags=yes
+	    ;;
+	--libs)
+	    echo_libs=yes
+	    ;;
+	--algorithms)
+	    echo_algorithms=yes
+	    ;;
+	--host)
+	    echo_host=yes
+	    ;;
+	*)
+	    usage 1 1>&2
+	    ;;
     esac
     shift
 done
 
-[ "$echo_prefix" = yes ] && echo "$prefix"
-[ "$echo_exec_prefix" = yes ] && echo "$exec_prefix"
-[ "$echo_version" = yes ] && echo "$version"
-[ "$echo_api_version" = yes ] && echo "$api_version"
-[ "$echo_host" = yes ] && echo "$host"
-
-if [ "$echo_cflags" = yes ]; then
-    if [ "$includedir" != "/usr/include" ]; then
-        echo "-I$includedir"
-    else
-        echo ""
-    fi
+if test "$echo_prefix" = "yes"; then
+    echo "$prefix"
 fi
 
-if [ "$echo_libs" = yes ]; then
-    if [ "$libdir" != "/usr/lib" ] && [ "$libdir" != "/usr/lib64" ]; then
-        echo "-L$libdir -lgcrypt"
-    else
-        echo "-lgcrypt"
-    fi
+if test "$echo_exec_prefix" = "yes"; then
+    echo "$exec_prefix"
 fi
 
-if [ "$echo_algorithms" = yes ]; then
+if test "$echo_cflags" = "yes"; then
+    includes=""
+    cflags_final="$cflags"
+
+    # Set up `includes'.
+    if test "x$includedir" != "x/usr/include" && test "x$includedir" != "x/include"; then
+	includes="-I$includedir"
+    fi
+    # Set up `cflags_final'.
+    cflags_final="$cflags_final $gpg_error_cflags"
+
+    tmp=""
+    for i in $includes $cflags_final; do
+       if echo "$tmp" | grep -F -v -- "$i" >/dev/null; then
+           tmp="$tmp $i"
+       fi
+    done
+    echo $tmp
+fi
+
+if test "$echo_libs" = "yes"; then
+    libdirs=""
+    libs_final="$libs"
+
+    # Set up `libdirs'.
+    if test "x$libdir" != "x/usr/lib" && test "x$libdir" != "x/lib"; then
+	libdirs="-L$libdir"
+    fi
+
+    # Set up `libs_final'.
+    libs_final="$libs_final $gpg_error_libs"
+
+    tmp=""
+    for i in $libdirs $libs_final; do
+       if echo "$tmp" | grep -F -v -- "$i" >/dev/null; then
+           tmp="$tmp $i"
+       fi
+    done
+    echo $tmp
+fi
+
+if test "$echo_version" = "yes"; then
+    echo "$version"
+fi
+
+if test "$echo_api_version" = "yes"; then
+    echo "$api_version"
+fi
+
+if test "$echo_host" = "yes"; then
+    echo "$my_host"
+fi
+
+if test "$echo_algorithms" = "yes"; then
     echo "Symmetric cipher algorithms: $symmetric_ciphers"
     echo "Public-key cipher algorithms: $asymmetric_ciphers"
     echo "Message digest algorithms: $digests"
 fi
-
-exit 0

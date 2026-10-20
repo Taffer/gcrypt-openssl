@@ -95,3 +95,14 @@ if(GCRYPT_OPENSSL_BUILD_SHARED
             "${CMAKE_CURRENT_SOURCE_DIR}/expected-exports.txt"
     )
 endif()
+
+# The drop-in's libgcrypt-config must answer like the reference script.
+if(GCRYPT_OPENSSL_DROP_IN)
+    add_test(
+        NAME check_libgcrypt_config
+        COMMAND
+            sh "${PROJECT_SOURCE_DIR}/scripts/check-libgcrypt-config.sh"
+            "${PROJECT_BINARY_DIR}/libgcrypt-config"
+            "${PROJECT_SOURCE_DIR}/src/include/gcrypt.h"
+    )
+endif()
