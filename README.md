@@ -85,9 +85,9 @@ value instead of failing with `GPG_ERR_ENCODING_PROBLEM` as upstream does.
 | Path           | Contents                                                    |
 |----------------|-------------------------------------------------------------|
 | `benchmarks/`  | `bench_gcrypt` sources and `compare.sh`                     |
-| `cmake/`       | Package config, pkg-config and `libgcrypt-config` templates, `drop-in.cmake`, the `gpg-error-names.h` generator |
+| `cmake/`       | Package config, pkg-config and `libgcrypt-config` templates, `drop-in.cmake` |
 | `scripts/`     | `build-openssl.sh`, `check-exports.sh`, `check-libgcrypt-config.sh`, `check-tools.sh`, `coverage.py` |
-| `tools/`       | `dumpsexp`, `hmac256`, `mpicalc`, `gpg-error` and `yat2m`, the command-line utilities the reference Libgcrypt and libgpg-error install; built with the drop-in |
+| `tools/`       | `dumpsexp`, `hmac256` and `mpicalc`, the command-line utilities the reference library installs; built with the drop-in |
 | `src/`         | Library sources, one file per module; `libgcrypt.map` is the symbol version script |
 | `src/include/` | The public header `gcrypt.h`                                |
 | `tests/`       | One `test_*.c` program per module, `test_common.h` assertion helpers, `expected-exports.txt`, KEM vectors and the script that regenerates them |
@@ -121,7 +121,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
 | `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
-| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build and install `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config` and the five utilities into the standard directories |
+| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build and install `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config` and the three utilities into the standard directories |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
@@ -159,16 +159,15 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | `bench_gcrypt_stock` | | The same sources linked against the stock `libgcrypt.so.20`, when one is found |
 | `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
 | `check_libgcrypt_config` | | CTest entry only, with the drop-in: `scripts/check-libgcrypt-config.sh` checks the configured `libgcrypt-config` against the reference script's behaviour and `gcrypt.h` |
-| `dumpsexp`, `hmac256`, `mpicalc`, `gpg-error` | | With the drop-in: the reference libraries' command-line utilities, linked against `libgcrypt.so.20` |
-| `yat2m` | | With the drop-in: the Texinfo to man page converter GnuPG builds its manuals with; needs no library |
-| `check_tools` | | CTest entry only, with the drop-in: `scripts/check-tools.sh` runs the five utilities against output recorded from the reference programs |
+| `dumpsexp`, `hmac256`, `mpicalc` | | With the drop-in: the reference library's command-line utilities, linked against `libgcrypt.so.20` |
+| `check_tools` | | CTest entry only, with the drop-in: `scripts/check-tools.sh` runs the three utilities against the reference programs' documented behaviour |
 | `coverage` | | Runs the tests and writes the coverage report; only with `GCRYPT_OPENSSL_COVERAGE=ON` |
 | `gcrypt-openssl::gcrypt-openssl` | (alias only) | The shared library when built, else the static one; what the tests and benchmarks link |
 | `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
 | `gcrypt_openssl_shared` | `gcrypt-openssl::shared` | `libgcrypt-openssl.so.0.1.0` with soname `libgcrypt-openssl.so.0`; exports exactly the `gcry_*` symbols plus `_gcry_mpi_get_const` via `src/libgcrypt.map` |
 | `gcrypt_openssl_static` | `gcrypt-openssl::static` | `libgcrypt-openssl.a`, built with PIC so it can be linked into other shared objects |
 | `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
-| `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config`, `dumpsexp`, `hmac256`, `mpicalc`, `gpg-error` and `yat2m` |
+| `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config`, `dumpsexp`, `hmac256` and `mpicalc` |
 | `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
 | `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
 | `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
@@ -228,8 +227,7 @@ the installed `gcrypt-openssl.pc`. The package config pulls in
 With `-DGCRYPT_OPENSSL_DROP_IN=ON` the install also contains
 `libgcrypt.so.20.8.9` (the reference library's current soname and
 version), `libgcrypt.pc`, a `libgcrypt-config` script and the `dumpsexp`,
-`hmac256`, `mpicalc`, `gpg-error` and `yat2m` utilities. They go into the
-standard directories
+`hmac256` and `mpicalc` utilities. They go into the standard directories
 of the install prefix, the same places the reference library's own
 packages use: the library into `CMAKE_INSTALL_LIBDIR` (`lib64` or `lib`
 as GNUInstallDirs picks for the platform), the pkg-config file into its
@@ -271,8 +269,8 @@ implementation: `--libs` is `-L<libdir> -lgcrypt` with no libgpg-error,
 `--variable=NAME` additionally answers `includedir`, `libdir`, `version`,
 `kdfs`, `implementation`, `implementation_version` and `openssl_version`.
 
-The drop-in also builds and installs the command-line utilities the
-reference Libgcrypt and libgpg-error ship, with the same options and output:
+The drop-in also builds and installs the three command-line utilities the
+reference library ships, with the same options and output:
 
 - `dumpsexp` hex-dumps an S-expression while scanning it, reporting syntax
   problems under a cursor; `--verbose` shows the parser events,
@@ -288,34 +286,10 @@ reference Libgcrypt and libgpg-error ship, with the same options and output:
   numbers (a leading digit is required, so `0ff` not `ff`), single-character
   operators, `?` for the operator table, `--print-config` for the library
   configuration. Unlike the reference tool, `--` really decrements.
-- `gpg-error [commands] [options] error-numbers` maps error values to
-  their source and code, symbolic names and descriptions, and back:
-  arguments may be decimal or `0x` hex numbers, names such as
-  `GPG_ERR_BAD_KEY`, `BAD_KEY`, `EPERM` or `GPG_ERR_SOURCE_GPG`, or
-  descriptions such as `"Bad session key"`. The commands `list`,
-  `defines`, `lib-version`, `fopen`, `chdir`, `mkdir` and `fconcat`, and
-  the options `--quiet`, `--desc` and `--openmode`, behave as in
-  libgpg-error. The names are generated from `gcrypt.h` at build time;
-  the descriptions come from the library. `--desc` prints the entry from
-  libgpg-error's `errorref.txt` when that file is found in this
-  installation's `share/libgpg-error`, in `/usr/share/libgpg-error`, or
-  at the path in `GPG_ERROR_ERRORREF`; libgpg-error's text is not
-  shipped here.
-- `yat2m [OPTION] [FILE]` is the "Yet Another Texi To Man" converter that
-  GnuPG and libgpg-error build their man pages with. It reads the Texinfo
-  subset those manuals use (`@manpage`, `@mansect`, `@manpause` and
-  `@mancont` markers, `@ifset manverb` for verbatim roff, `@c man:`
-  lines, tables, examples, `@include`, `@macro`, `@set`/`@value` and
-  `@ifset`/`@ifclear` with `-D`), and writes roff or, with `--html`, the
-  same HTML the reference produces, including `--gnupgorg`, `--store`,
-  `--select`, `--source`, `--release` and `--date`. Its output is
-  byte-for-byte identical to the reference converter's on the GnuPG 2.4.8
-  and libgpg-error 1.58 manuals, quirks included.
 
-Apart from `yat2m`, which needs no library, the utilities link
-`libgcrypt.so.20` and carry an rpath to the install library directory, so
-they load this library rather than a system libgcrypt even when the prefix
-is not on the loader's search path.
+The utilities link `libgcrypt.so.20` and carry an rpath to the install
+library directory, so they load this library rather than a system
+libgcrypt even when the prefix is not on the loader's search path.
 
 ### FIPS mode
 
