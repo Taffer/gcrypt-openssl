@@ -5,7 +5,9 @@
  * the reference library's integrity check uses.  The reference tool
  * carries its own SHA-256; this one computes the MAC through the library,
  * so it exercises the same OpenSSL code path as gcry_mac_* and the RFC 4231
- * self-test it runs first checks that path.
+ * self-test it runs first checks that path.  In FIPS mode the provider
+ * refuses HMAC keys shorter than 14 bytes; the integrity-check key used by
+ * --stdkey is long enough, a short KEY argument fails with an error.
  *
  * This file is in the public domain.
  */
@@ -66,7 +68,10 @@ hmac_file(const char *key, size_t keylen, FILE *fp,
     return 0;
 }
 
-/* The RFC 4231 test cases the reference tool also checks itself with. */
+/* The RFC 4231 test cases the reference tool also checks itself with.
+ * FIPS mode rejects HMAC keys shorter than 14 bytes, so the short-key case
+ * is skipped there; the others cover the normal and the longer-than-block
+ * key paths. */
 static int
 selftest(void)
 {
@@ -101,6 +106,8 @@ selftest(void)
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         },
     };
+    const size_t fips_min_keylen = 14;
+    int fips = gcry_fips_mode_active();
     size_t i, j;
 
     for (i = 0; i < sizeof tv / sizeof tv[0]; i++) {
@@ -109,6 +116,9 @@ selftest(void)
         char hex[2 * DIGEST_LEN + 1];
         size_t outlen = sizeof digest;
 
+        if (fips && tv[i].keylen < fips_min_keylen) {
+            continue;
+        }
         if (gcry_mac_open(&hd, GCRY_MAC_HMAC_SHA256, 0, NULL)) {
             return -1;
         }

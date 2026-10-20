@@ -60,7 +60,15 @@ printf '(a)' > "$tmp/a.sexp"
 [ "$("$dumpsexp" "$tmp/a.sexp")" = "$expected" ] || fail "dumpsexp file argument"
 
 # ----------------------------------------------------------------- hmac256
+# FIPS mode refuses HMAC keys shorter than 14 bytes, so the RFC 4231 "Jefe"
+# vector is only checked outside FIPS mode; the rest use a 20-byte key.
+fips=no
+"$mpicalc" --print-config | grep -q '^fips-mode:y' && fips=yes
+key='Jefe-Jefe-Jefe-Jefe!'
+mac=8c3cd4e29fb19f5e722fd388e994f6241ea894f32f72fe19b5d3b32f6f311e41
 jefe=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+stdkey_empty=f2353f4c2eae21f5a2113d024a70e9210736cd1663b3c655a3a1e243398baaf2
+
 out="$("$hmac256" --version | head -1)"
 case "$out" in
     "hmac256 (Libgcrypt) "*) ;;
@@ -68,26 +76,32 @@ case "$out" in
 esac
 "$hmac256" >/dev/null 2>&1 && fail "hmac256 without key: expected exit 1"
 
-out="$(printf 'what do ya want for nothing?' | "$hmac256" Jefe)"
-[ "$out" = "$jefe" ] || fail "hmac256 stdin: '$out'"
+if [ "$fips" = no ]; then
+    out="$(printf 'what do ya want for nothing?' | "$hmac256" Jefe)"
+    [ "$out" = "$jefe" ] || fail "hmac256 RFC 4231 Jefe: '$out'"
+else
+    printf 'x' | "$hmac256" Jefe >/dev/null 2>&1 \
+        && fail "hmac256 short key in FIPS mode: expected failure"
+fi
+
+out="$(printf 'what do ya want for nothing?' | "$hmac256" "$key")"
+[ "$out" = "$mac" ] || fail "hmac256 stdin: '$out'"
 
 printf 'what do ya want for nothing?' > "$tmp/data"
-out="$("$hmac256" Jefe "$tmp/data")"
-[ "$out" = "$jefe  $tmp/data" ] || fail "hmac256 file: '$out'"
+out="$("$hmac256" "$key" "$tmp/data")"
+[ "$out" = "$mac  $tmp/data" ] || fail "hmac256 file: '$out'"
 
-out="$("$hmac256" Jefe "$tmp/data" "$tmp/data" | wc -l | tr -d ' ')"
+out="$("$hmac256" "$key" "$tmp/data" "$tmp/data" | wc -l | tr -d ' ')"
 [ "$out" = 2 ] || fail "hmac256 two files: $out lines"
 
-out="$(printf 'what do ya want for nothing?' | "$hmac256" --binary Jefe | od -An -tx1 | tr -d ' \n')"
-[ "$out" = "$jefe" ] || fail "hmac256 --binary: '$out'"
+out="$(printf 'what do ya want for nothing?' | "$hmac256" --binary "$key" | od -An -tx1 | tr -d ' \n')"
+[ "$out" = "$mac" ] || fail "hmac256 --binary: '$out'"
 
 # --stdkey uses the reference library's built-in integrity-check key.
 out="$(printf '' | "$hmac256" --stdkey)"
-[ "$out" = "$(printf '' | "$hmac256" 'What am I, a doctor or a moonshuttle conductor?')" ] \
-    || fail "hmac256 --stdkey differs from the explicit key"
-[ "${#out}" -eq 64 ] || fail "hmac256 --stdkey: '$out'"
+[ "$out" = "$stdkey_empty" ] || fail "hmac256 --stdkey: '$out'"
 
-"$hmac256" Jefe "$tmp/missing" >/dev/null 2>&1 && fail "hmac256 missing file: expected exit 1"
+"$hmac256" "$key" "$tmp/missing" >/dev/null 2>&1 && fail "hmac256 missing file: expected exit 1"
 
 # ----------------------------------------------------------------- mpicalc
 out="$("$mpicalc" --version | head -1)"

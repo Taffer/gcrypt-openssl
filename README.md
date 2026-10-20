@@ -280,7 +280,8 @@ reference library ships, with the same options and output:
 - `hmac256 [--binary] [--stdkey|KEY] [FILE...]` prints the HMAC-SHA-256 of
   each file (or stdin) like `sha1sum`; `--stdkey` is the key the reference
   library's integrity check uses. The MAC is computed through `gcry_mac_*`
-  after an RFC 4231 self-test.
+  after an RFC 4231 self-test. In FIPS mode the provider refuses HMAC keys
+  shorter than 14 bytes; `--stdkey` is long enough, a short `KEY` fails.
 - `mpicalc` is the RPN calculator on `gcry_mpi_t` values: hexadecimal
   numbers (a leading digit is required, so `0ff` not `ff`), single-character
   operators, `?` for the operator table, `--print-config` for the library
