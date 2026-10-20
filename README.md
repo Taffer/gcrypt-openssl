@@ -121,7 +121,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_BUILD_STATIC`       | `ON`    | Build the static library        |
 | `GCRYPT_OPENSSL_BUILD_TESTS`        | `ON`    | Build tests (top-level only)    |
 | `GCRYPT_OPENSSL_COVERAGE`           | `OFF`   | Instrument for code coverage and add the `coverage` target |
-| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build `libgcrypt.so.20`, `libgcrypt.pc` and `libgcrypt-config`; installs under `/opt/gcrypt-openssl/lib64` |
+| `GCRYPT_OPENSSL_DROP_IN`            | `OFF`   | Also build and install `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config` and the three utilities into the standard directories |
 | `GCRYPT_OPENSSL_FIPS`               | `OFF`   | Start the library in FIPS mode by default; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
@@ -226,10 +226,13 @@ the installed `gcrypt-openssl.pc`. The package config pulls in
 
 With `-DGCRYPT_OPENSSL_DROP_IN=ON` the install also contains
 `libgcrypt.so.20.8.9` (the reference library's current soname and
-version), `libgcrypt.pc` and a `libgcrypt-config` script. So that it never
-shadows the system libgcrypt, the drop-in build installs under
-`/opt/gcrypt-openssl` with the libraries in `lib64` on every platform,
-rather than under `/usr/local` and the platform's library directory:
+version), `libgcrypt.pc`, a `libgcrypt-config` script and the `dumpsexp`,
+`hmac256` and `mpicalc` utilities. They go into the standard directories
+of the install prefix, the same places the reference library's own
+packages use: the library into `CMAKE_INSTALL_LIBDIR` (`lib64` or `lib`
+as GNUInstallDirs picks for the platform), the pkg-config file into its
+`pkgconfig/` subdirectory, and the script and utilities into
+`CMAKE_INSTALL_BINDIR`:
 
 ```sh
 cmake -S . -B build-drop-in -DGCRYPT_OPENSSL_DROP_IN=ON
@@ -237,16 +240,21 @@ cmake --build build-drop-in
 sudo cmake --install build-drop-in
 ```
 
-Programs built against the reference library run unchanged when that
-library directory is on their library path, for example:
+The default prefix is CMake's usual `/usr/local`, so this installs
+`/usr/local/lib64/libgcrypt.so.20` (or `/usr/local/lib/...`) beside, not
+over, a distribution's `/usr/lib64/libgcrypt.so.20`. Which one a program
+loads then follows the dynamic loader's normal search order. To replace
+the system library outright, install with `-DCMAKE_INSTALL_PREFIX=/usr`
+and the distribution's `-DCMAKE_INSTALL_LIBDIR`; to try the drop-in
+without installing it, point the loader at the build tree:
 
 ```sh
-LD_LIBRARY_PATH=/opt/gcrypt-openssl/lib64 gpg --version
+LD_LIBRARY_PATH=build-drop-in/src gpg --version
 ```
 
-`-DCMAKE_INSTALL_PREFIX` and `-DCMAKE_INSTALL_LIBDIR` override the
-defaults; set them on the first configure of a build tree so the pkg-config
-file and the config script carry the right paths. The drop-in requires the
+Set `-DCMAKE_INSTALL_PREFIX` and `-DCMAKE_INSTALL_LIBDIR` on the first
+configure of a build tree so the pkg-config file, the config script and
+the utilities' rpath carry the right paths. The drop-in requires the
 shared library to be enabled.
 
 The `libgcrypt-config` script takes the same options as the reference
@@ -279,8 +287,8 @@ reference library ships, with the same options and output:
   configuration. Unlike the reference tool, `--` really decrements.
 
 The utilities link `libgcrypt.so.20` and carry an rpath to the install
-library directory, so they run from `/opt/gcrypt-openssl/bin` without
-`LD_LIBRARY_PATH`.
+library directory, so they load this library rather than a system
+libgcrypt even when the prefix is not on the loader's search path.
 
 ### FIPS mode
 
