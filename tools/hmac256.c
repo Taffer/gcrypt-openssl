@@ -258,5 +258,12 @@ main(int argc, char **argv)
             break;
         }
     }
+
+    /* stdout is buffered, so a failed write may only show up here. */
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "%s: error writing output: %s\n", pgm,
+                strerror(errno));
+        return 1;
+    }
     return 0;
 }

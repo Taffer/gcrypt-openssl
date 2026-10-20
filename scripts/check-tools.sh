@@ -36,6 +36,9 @@ out="$(printf '(a)' | "$dumpsexp")"
 [ "$out" = "$expected" ] || fail "dumpsexp dump: '$out'"
 out="$(printf '28 61 29' | "$dumpsexp" --assume-hex --decimal)"
 [ "$out" = "$expected" ] || fail "dumpsexp --assume-hex --decimal: '$out'"
+out="$(printf '28 6A 29' | "$dumpsexp" --assume-hex)"
+[ "$out" = 'j00000000  28 6a 29                                          |(j)|' ] \
+    || fail "dumpsexp --assume-hex upper case: '$out'"
 
 # --verbose reports parser events under a cursor.
 printf '(a)' | "$dumpsexp" --verbose | grep -q '^ *\^ open$' \
@@ -58,6 +61,66 @@ printf '(a' | "$dumpsexp" --advanced >/dev/null 2>&1 && fail "dumpsexp --advance
 "$dumpsexp" "$tmp/missing" >/dev/null 2>&1 && fail "dumpsexp missing file: expected exit 1"
 printf '(a)' > "$tmp/a.sexp"
 [ "$("$dumpsexp" "$tmp/a.sexp")" = "$expected" ] || fail "dumpsexp file argument"
+
+# Every syntax error the scanner knows is reported under a cursor.  Each
+# case feeds one construct and looks for its message.
+expect_error() {
+    out="$(printf '%s' "$1" | "$dumpsexp" 2>&1)"
+    printf '%s\n' "$out" | grep -q "Error: $2" \
+        || fail "dumpsexp '$1': missing 'Error: $2'"
+}
+expect_error '(a "x\q")' 'invalid escape sequence'
+expect_error '(#616#)' 'odd number of hex digits'
+expect_error '(#6g1#)' 'bad hex character'
+expect_error '([a [b] ]c)' 'nested display hint'
+expect_error '([a [b] ]c)' 'no open display hint'
+expect_error '([a)' 'unmatched display hint'
+expect_error '(a]' 'no open display hint'
+expect_error '({)' 'rescanning is not supported'
+expect_error '(&)' 'reserved punctuation detected'
+expect_error '(,)' 'bad character detected'
+expect_error '(1x)' 'invalid length specification'
+expect_error '(99999999999999999999999:)' 'overflow in data length'
+expect_error '([a (b))' 'unmatched display hint'
+
+# Well-formed constructs pass through without an error: quoted strings with
+# every escape form, hex and base64 strings, length-prefixed data, display
+# hints, and a length prefix in front of a quoted string.
+for good in '(a "x\n\t\101\x41\\\"" "a\
+b")' '(#6162# |YWI=| 3:abc [hint]x)' '(3"abc" 2#61#)' '("\1x\xZ")'; do
+    out="$(printf '%s' "$good" | "$dumpsexp" 2>&1)"
+    printf '%s\n' "$out" | grep -q 'Error:' \
+        && fail "dumpsexp '$good': unexpected error"
+done
+
+# --verbose names every parser event.
+out="$(printf '(#61#|YQ==|3:abc"s")' | "$dumpsexp" --verbose)"
+for event in open beginhex endhex beginbase64 endbase64 begindata enddata \
+             beginstring endstring close; do
+    printf '%s\n' "$out" | grep -q "\\^ $event\$" \
+        || fail "dumpsexp --verbose: no '$event' event"
+done
+
+# A line wraps every 16 bytes; tokens are echoed before the line.
+out="$(printf '(abcdefghijklmnopqrstuvwxyz)' | "$dumpsexp" --decimal)"
+expected='abcdefghijklmno00000000  28 61 62 63 64 65 66 67  68 69 6a 6b 6c 6d 6e 6f  |(abcdefghijklmno|
+pqrstuvwxyz00000016  70 71 72 73 74 75 76 77  78 79 7a 29              |pqrstuvwxyz)|'
+[ "$out" = "$expected" ] || fail "dumpsexp two-line dump differs"
+
+# Malformed hex input stops the dump with a message on stderr.
+for bad in '2x' '2' 'zz'; do
+    err="$(printf '%s' "$bad" | "$dumpsexp" --assume-hex 2>&1 >/dev/null)"
+    case "$err" in
+        dumpsexp:*hex*) ;;
+        *) fail "dumpsexp --assume-hex '$bad': '$err'" ;;
+    esac
+done
+
+# "--" ends option parsing; an unreadable input is a read error.
+[ "$(printf '(a)' | "$dumpsexp" --)" = "$(printf '(a)' | "$dumpsexp")" ] \
+    || fail "dumpsexp --: differs"
+"$dumpsexp" "$tmp" >/dev/null 2>&1 && fail "dumpsexp on a directory: expected exit 1"
+"$dumpsexp" --advanced "$tmp" >/dev/null 2>&1 && fail "dumpsexp --advanced on a directory: expected exit 1"
 
 # ----------------------------------------------------------------- hmac256
 # FIPS mode refuses HMAC keys shorter than 14 bytes, so the RFC 4231 "Jefe"
@@ -103,6 +166,24 @@ out="$(printf '' | "$hmac256" --stdkey)"
 
 "$hmac256" "$key" "$tmp/missing" >/dev/null 2>&1 && fail "hmac256 missing file: expected exit 1"
 
+# "--" ends option parsing; a directory is a read error; --binary writes
+# exactly 32 bytes.
+out="$(printf 'what do ya want for nothing?' | "$hmac256" -- "$key")"
+[ "$out" = "$mac" ] || fail "hmac256 -- key: '$out'"
+out="$("$hmac256" "$key" "$tmp" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] || fail "hmac256 on a directory: exit $rc"
+case "$out" in
+    *"error reading"*) ;;
+    *) fail "hmac256 on a directory: '$out'" ;;
+esac
+out="$("$hmac256" --binary --stdkey </dev/null | wc -c | tr -d ' ')"
+[ "$out" = 32 ] || fail "hmac256 --binary --stdkey: $out bytes"
+if [ -w /dev/full ]; then
+    "$hmac256" --binary --stdkey </dev/null >/dev/full 2>"$tmp/err" \
+        && fail "hmac256 write error: expected exit 1"
+    grep -q 'error writing output' "$tmp/err" || fail "hmac256 write error message"
+fi
+
 # ----------------------------------------------------------------- mpicalc
 out="$("$mpicalc" --version | head -1)"
 [ "$out" = "mpicalc 2.0" ] || fail "mpicalc --version: '$out'"
@@ -144,6 +225,40 @@ out="$(printf '+\n' | "$mpicalc" 2>&1)"
 [ "$out" = "stack underflow" ] || fail "mpicalc underflow: '$out'"
 out="$(printf 'z\n' | "$mpicalc" 2>&1)"
 [ "$out" = "invalid operator" ] || fail "mpicalc invalid operator: '$out'"
+
+check '5 3 - p' 02               # subtract
+check '3 4 5 m p' 02             # 3*4 mod 5
+check '-0a p' -0A                # negative hex number
+check '-5 -3 - p' -02            # '-' before a digit is a sign, else subtract
+[ "$(printf '1 p\n' | "$mpicalc" --)" = 01 ] || fail "mpicalc --"
+out="$(printf '%s\n' '-' | "$mpicalc" 2>&1)"
+[ "$out" = "stack underflow" ] || fail "mpicalc subtract underflow: '$out'"
+out="$(printf '1 2 m\n' | "$mpicalc" 2>&1)"
+[ "$out" = "stack underflow" ] || fail "mpicalc mulm underflow: '$out'"
+
+# --disable-hwf consumes its argument, with or without one.
+"$mpicalc" --disable-hwf bogus </dev/null >/dev/null 2>&1 \
+    || fail "mpicalc --disable-hwf NAME: expected exit 0"
+"$mpicalc" --disable-hwf </dev/null >/dev/null 2>&1 \
+    || fail "mpicalc --disable-hwf without argument: expected exit 0"
+
+# Non-ASCII bytes are skipped with one notice.
+out="$(printf '1 \303\251 \303\251 p\n' | "$mpicalc" 2>&1)"
+[ "$out" = "note: Non ASCII characters are ignored
+01" ] || fail "mpicalc non-ASCII: '$out'"
+
+# The stack holds 500 items; the 501st push and a dup beyond it overflow.
+pushes="$(i=0; while [ $i -lt 500 ]; do printf '1 '; i=$((i + 1)); done)"
+out="$(printf '%s 1\n' "$pushes" | "$mpicalc" 2>&1)"
+[ "$out" = "stack overflow" ] || fail "mpicalc push overflow: '$out'"
+out="$(printf '%s d\n' "$pushes" | "$mpicalc" 2>&1)"
+[ "$out" = "stack overflow" ] || fail "mpicalc dup overflow: '$out'"
+
+# A number longer than the input buffer is truncated with a notice.
+digits="$(i=0; while [ $i -lt 4100 ]; do printf '0'; i=$((i + 1)); done)"
+out="$(printf '1%s b p\n' "$digits" | "$mpicalc" 2>&1)"
+[ "$out" = "input too large - truncated
+3FF1" ] || fail "mpicalc truncation: '$out'"
 
 [ "$status" -eq 0 ] && echo "tools: all checks passed"
 exit "$status"
