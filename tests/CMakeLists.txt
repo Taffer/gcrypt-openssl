@@ -105,4 +105,11 @@ if(GCRYPT_OPENSSL_DROP_IN)
             "${PROJECT_BINARY_DIR}/libgcrypt-config"
             "${PROJECT_SOURCE_DIR}/src/include/gcrypt.h"
     )
+    set(check_libgcrypt_config_env "GPG_ERROR_LIBS=${GPG_ERROR_LIBS}"
+                                   "GPG_ERROR_CFLAGS=${GPG_ERROR_CFLAGS}"
+    )
+    set_tests_properties(
+        check_libgcrypt_config PROPERTIES ENVIRONMENT
+                                          "${check_libgcrypt_config_env}"
+    )
 endif()

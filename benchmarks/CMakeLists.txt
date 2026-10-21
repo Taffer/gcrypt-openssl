@@ -43,8 +43,11 @@ if(GCRYPT_OPENSSL_STOCK_GCRYPT)
     target_include_directories(
         bench_gcrypt_stock PRIVATE "${PROJECT_SOURCE_DIR}/src/include"
     )
+    # The header the stock library is compiled against includes
+    # <gpg-error.h>, as upstream's does, and the benchmarks call gpg_error().
     target_link_libraries(
         bench_gcrypt_stock PRIVATE "${GCRYPT_OPENSSL_STOCK_GCRYPT}"
+                                   GpgError::GpgError
     )
 
     # `cmake --build <dir> --target bench-compare` runs both and prints the

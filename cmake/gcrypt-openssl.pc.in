@@ -6,6 +6,7 @@ includedir=@PC_INCLUDEDIR@
 Name: gcrypt-openssl
 Description: The Libgcrypt API implemented on top of OpenSSL
 Version: @PROJECT_VERSION@
+Requires: gpg-error >= @GCRYPT_OPENSSL_GPG_ERROR_MIN_VERSION@
 Requires.private: libcrypto >= 4.0
 Cflags: -I${includedir}
 Libs: -L${libdir} -lgcrypt-openssl

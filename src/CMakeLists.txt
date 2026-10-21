@@ -50,7 +50,7 @@ function(gcrypt_openssl_configure_library target export_name)
 
     target_link_libraries(
         ${target}
-        PUBLIC OpenSSL::Crypto Threads::Threads
+        PUBLIC GpgError::GpgError OpenSSL::Crypto Threads::Threads
         PRIVATE $<BUILD_INTERFACE:gcrypt_openssl_warnings>
     )
 

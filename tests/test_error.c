@@ -49,10 +49,16 @@ TEST(errno_mapping)
 
 TEST(unknown_codes_and_sources)
 {
+    /* Every source libgpg-error 1.33 knows; TKD arrived in 1.47.  Sources
+     * above the known ones are reported as unknown, so the probe for one
+     * stays well clear of where new ones get added. */
     static const char *const sources[] = {
         "Unspecified source", "gcrypt", "GnuPG", "GpgSM", "GPG Agent",
         "Pinentry", "SCD", "GPGME", "Keybox", "KSBA", "Dirmngr", "GSTI",
-        "GPA", "Kleopatra", "G13", "Assuan", "TPM2d", "TLS", "TKD"
+        "GPA", "Kleopatra", "G13", "Assuan", "TPM2d", "TLS",
+#if GPG_ERROR_VERSION_NUMBER >= 0x012f00
+        "TKD",
+#endif
     };
     unsigned int i;
 
@@ -69,7 +75,7 @@ TEST(unknown_codes_and_sources)
     }
 
     ASSERT_STR_EQ("Unknown source",
-                  gcry_strsource(gcry_err_make((gcry_err_source_t)19, 1)));
+                  gcry_strsource(gcry_err_make((gcry_err_source_t)30, 1)));
     ASSERT_STR_EQ("Unknown source",
                   gcry_strsource(gcry_err_make((gcry_err_source_t)100, 1)));
     ASSERT_STR_EQ("Any source",
@@ -78,17 +84,34 @@ TEST(unknown_codes_and_sources)
                   gcry_strsource(gcry_err_make(GPG_ERR_SOURCE_USER_4, 1)));
 }
 
-TEST(gpg_error_compat_wrappers)
+/* The gcry_* helpers are thin wrappers over libgpg-error, so the two must
+ * agree on every value, and the types must be libgpg-error's own. */
+TEST(agrees_with_libgpg_error)
 {
-    ASSERT_STR_EQ("Invalid argument", gpg_strerror(gpg_error(GPG_ERR_INV_ARG)));
-    ASSERT_EQ(GPG_ERR_EINVAL, gpg_err_code_from_errno(EINVAL));
-    errno = ENOENT;
-    ASSERT_EQ(GPG_ERR_ENOENT, gpg_err_code_from_syserror());
-    errno = 0;
-    ASSERT_EQ(0, gpg_err_code_from_syserror());
-    ASSERT_STR_EQ("Success", gpg_strerror(0));
-    ASSERT_STR_EQ("gcrypt",
-                  gpg_strsource(gpg_err_make(GPG_ERR_SOURCE_GCRYPT, 1)));
+    static const gcry_err_code_t codes[] = {
+        GPG_ERR_NO_ERROR, GPG_ERR_GENERAL, GPG_ERR_INV_ARG, GPG_ERR_INV_SEXP,
+        GPG_ERR_WEAK_KEY, GPG_ERR_NO_KEY, GPG_ERR_ENOMEM, GPG_ERR_EOF,
+        GPG_ERR_UNKNOWN_ERRNO, (gcry_err_code_t)1234
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof codes / sizeof codes[0]; i++) {
+        gcry_error_t err = gcry_err_make(GPG_ERR_SOURCE_GCRYPT, codes[i]);
+
+        ASSERT_EQ(gpg_err_make(GPG_ERR_SOURCE_GCRYPT, codes[i]), err);
+        ASSERT_EQ(gpg_err_code(err), gcry_err_code(err));
+        ASSERT_EQ(gpg_err_source(err), gcry_err_source(err));
+        ASSERT_STR_EQ(gpg_strerror(err), gcry_strerror(err));
+        ASSERT_STR_EQ(gpg_strsource(err), gcry_strsource(err));
+    }
+
+    ASSERT_EQ(gpg_err_code_from_errno(EINVAL), gcry_err_code_from_errno(EINVAL));
+    ASSERT_EQ(gpg_err_code_to_errno(GPG_ERR_ENOMEM),
+              gcry_err_code_to_errno(GPG_ERR_ENOMEM));
+    ASSERT_EQ(gpg_err_make_from_errno(GPG_ERR_SOURCE_GPG, EIO),
+              gcry_err_make_from_errno(GPG_ERR_SOURCE_GPG, EIO));
+    ASSERT_EQ(sizeof(gpg_error_t), sizeof(gcry_error_t));
+    ASSERT_EQ(GPG_ERR_SOURCE_USER_1, GCRY_ERR_SOURCE_DEFAULT);
 }
 
 int
@@ -98,6 +121,6 @@ main(void)
     RUN_TEST(strings);
     RUN_TEST(errno_mapping);
     RUN_TEST(unknown_codes_and_sources);
-    RUN_TEST(gpg_error_compat_wrappers);
+    RUN_TEST(agrees_with_libgpg_error);
     return TEST_RESULT();
 }

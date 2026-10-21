@@ -108,6 +108,17 @@ message(
     STATUS "Using OpenSSL ${OPENSSL_VERSION} from ${OPENSSL_CRYPTO_LIBRARY}"
 )
 
+# libgpg-error supplies the error types and codes that <gcrypt.h> exposes,
+# as it does for the reference library. cmake/FindGpgError.cmake looks it
+# up through pkg-config or GPG_ERROR_ROOT_DIR. 1.33 is the first release
+# that installs gpg-error.pc; nothing newer is used.
+set(GCRYPT_OPENSSL_GPG_ERROR_MIN_VERSION 1.33)
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+find_package(GpgError ${GCRYPT_OPENSSL_GPG_ERROR_MIN_VERSION} REQUIRED)
+message(
+    STATUS "Using libgpg-error ${GPG_ERROR_VERSION} from ${GPG_ERROR_LIBRARY}"
+)
+
 # Needed before add_subdirectory(src) so CMAKE_INSTALL_INCLUDEDIR is defined
 # when the library's INSTALL_INTERFACE include path is set.
 include(GNUInstallDirs)
@@ -259,7 +270,9 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
-install(FILES "${PROJECT_BINARY_DIR}/gcrypt-openssl-config.cmake"
-              "${PROJECT_BINARY_DIR}/gcrypt-openssl-config-version.cmake"
-        DESTINATION "${GCRYPT_OPENSSL_CMAKE_INSTALL_DIR}"
+install(
+    FILES "${PROJECT_BINARY_DIR}/gcrypt-openssl-config.cmake"
+          "${PROJECT_BINARY_DIR}/gcrypt-openssl-config-version.cmake"
+          "${PROJECT_SOURCE_DIR}/cmake/FindGpgError.cmake"
+    DESTINATION "${GCRYPT_OPENSSL_CMAKE_INSTALL_DIR}"
 )

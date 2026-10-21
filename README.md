@@ -27,10 +27,10 @@ This project was extruded by Claude. Use at your own risk.
   prime generation, and the composition of modes OpenSSL has no single
   cipher for (CBC-CTS, CBC-MAC, the CBC-MAC half of CCM, and CTR, XTS, OCB
   and key wrap for ciphers OpenSSL offers only in ECB).
-- **No dependencies besides the C library, POSIX threads and OpenSSL 4.**
-  `gcrypt.h` embeds the subset of libgpg-error it needs (error types, every
-  `GPG_ERR_*` value, inline helpers); a real `<gpg-error.h>` included first
-  takes precedence.
+- **Dependencies: the C library, POSIX threads, libgpg-error and OpenSSL
+  4.** As in the reference library, `gcrypt.h` includes `<gpg-error.h>` and
+  the `gcry_*` error helpers wrap libgpg-error's, so error values and their
+  descriptions are the ones every other GnuPG component uses.
 - **Relationship to upstream.** The public header, constants and
   S-expression formats are reproduced because they are the API. The rest of
   the front-end code is not independent either: the S-expression module,
@@ -94,8 +94,10 @@ value instead of failing with `GPG_ERR_ENCODING_PROBLEM` as upstream does.
 
 ## Building
 
-Requires CMake 3.21 (3.25 to use the presets), a C99 compiler, and OpenSSL
-4.x development files.
+Requires CMake 3.21 (3.25 to use the presets), a C99 compiler, the
+libgpg-error development files (1.33 or newer: `libgpg-error-devel` on
+Fedora, `libgpg-error-dev` on Debian, Ubuntu, Alpine and Wolfi,
+`libgpg-error` on Homebrew), and OpenSSL 4.x development files.
 
 ```sh
 cmake --preset default
@@ -126,6 +128,7 @@ ctest --test-dir build
 | `GCRYPT_OPENSSL_FIPS_CHAINGUARD_STRICT` | `OFF` | Adapt the tests to Chainguard's strict FIPS provider; see [FIPS mode](#fips-mode) |
 | `GCRYPT_OPENSSL_STOCK_GCRYPT`       | found   | Path of the stock `libgcrypt.so.20` to benchmark against |
 | `GCRYPT_OPENSSL_WARNINGS_AS_ERRORS` | `ON`    | Pass `-Werror` (or `/WX`) to every target that compiles C: libraries, drop-in, tests, benchmarks |
+| `GPG_ERROR_ROOT_DIR`                | unset   | Install prefix of libgpg-error if it is not the system one (pkg-config finds the system one) |
 | `OPENSSL_ROOT_DIR`                  | unset   | Where to find OpenSSL 4 if it is not the system one |
 
 At least one of the two library options must stay on. Tests and benchmarks
@@ -219,8 +222,10 @@ cmake --build build-asan && ctest --test-dir build-asan
 Consumers can `find_package(gcrypt-openssl)` after `cmake --install` and
 link against `gcrypt-openssl::shared` or `gcrypt-openssl::static`, or use
 the installed `gcrypt-openssl.pc`. The package config pulls in
-`OpenSSL::Crypto` as a dependency. Both `libgcrypt-openssl.so` and
-`libgcrypt-openssl.a` are built by default.
+`GpgError::GpgError` (through the `FindGpgError.cmake` module installed
+beside it) and `OpenSSL::Crypto` as dependencies; the pkg-config file
+requires `gpg-error`. Both `libgcrypt-openssl.so` and `libgcrypt-openssl.a`
+are built by default.
 
 ### Drop-in replacement
 
@@ -264,8 +269,10 @@ library's and prints the same output in the same order, so
 `--api-version`, `--cflags`, `--libs`, `--host`, `--algorithms` and
 `--variable=NAME`. `--prefix=DIR` and `--exec-prefix=DIR` are accepted and
 ignored, and `--thread=MODEL` fails, as upstream. The values describe this
-implementation: `--libs` is `-L<libdir> -lgcrypt` with no libgpg-error,
-`--algorithms` lists only the algorithms provided here, and
+implementation: `--libs` is `-L<libdir> -lgcrypt` followed by the
+libgpg-error flags the build found (normally `-lgpg-error`), `--cflags`
+likewise ends with libgpg-error's, `--algorithms` lists only the algorithms
+provided here, and
 `--variable=NAME` additionally answers `includedir`, `libdir`, `version`,
 `kdfs`, `implementation`, `implementation_version` and `openssl_version`.
 

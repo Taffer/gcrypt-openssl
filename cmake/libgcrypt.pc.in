@@ -6,6 +6,6 @@ includedir=@PC_INCLUDEDIR@
 Name: libgcrypt
 Description: General purpose cryptographic library (gcrypt-openssl drop-in)
 Version: @GCRYPT_API_VERSION@
-Requires.private: libcrypto >= 4.0
+Requires.private: gpg-error libcrypto >= 4.0
 Cflags: -I${includedir}
 Libs: -L${libdir} -lgcrypt

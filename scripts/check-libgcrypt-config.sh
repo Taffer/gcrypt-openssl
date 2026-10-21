@@ -5,6 +5,10 @@
 #
 # Usage: scripts/check-libgcrypt-config.sh <path/to/libgcrypt-config> [gcrypt.h]
 #
+# GPG_ERROR_CFLAGS and GPG_ERROR_LIBS in the environment name the libgpg-error
+# flags the script is expected to append to --cflags and --libs (the build
+# sets them from what it found); unset, they default to none and -lgpg-error.
+#
 # Exit status is 0 when every check passes; otherwise each failure is printed.
 set -u
 
@@ -65,30 +69,48 @@ case "$out" in
     *) fail "--host: '$out' is not a triplet" ;;
 esac
 
-# --cflags: -I<includedir> unless that is a default search directory.
+# The script de-duplicates words, so build the expectation the same way.
+gpg_error_cflags="${GPG_ERROR_CFLAGS-}"
+gpg_error_libs="${GPG_ERROR_LIBS--lgpg-error}"
+join_unique() {
+    tmp=""
+    for i in "$@"; do
+        case " $tmp " in
+            *" $i "*) ;;
+            *) tmp="$tmp $i" ;;
+        esac
+    done
+    echo $tmp
+}
+
+# --cflags: -I<includedir> unless that is a default search directory, then
+# libgpg-error's flags.
 run --variable=includedir; includedir="$out"
 [ -n "$includedir" ] || fail "--variable=includedir: empty"
 run --cflags
 [ "$rc" -eq 0 ] || fail "--cflags: exit $rc"
 if [ "$includedir" != /usr/include ] && [ "$includedir" != /include ]; then
-    [ "$out" = "-I$includedir" ] || fail "--cflags: '$out', expected '-I$includedir'"
+    expected="$(join_unique "-I$includedir" $gpg_error_cflags)"
 else
-    [ -z "$out" ] || fail "--cflags: '$out', expected nothing"
+    expected="$(join_unique $gpg_error_cflags)"
 fi
+[ "$out" = "$expected" ] || fail "--cflags: '$out', expected '$expected'"
 
-# --libs: -L<libdir> unless default, then -lgcrypt and nothing else (no
-# libgpg-error in this implementation).
+# --libs: -L<libdir> unless default, then -lgcrypt and libgpg-error's flags,
+# as the reference script prints them.
 run --variable=libdir; libdir="$out"
 [ -n "$libdir" ] || fail "--variable=libdir: empty"
 run --libs
 [ "$rc" -eq 0 ] || fail "--libs: exit $rc"
 if [ "$libdir" != /usr/lib ] && [ "$libdir" != /lib ]; then
-    [ "$out" = "-L$libdir -lgcrypt" ] || fail "--libs: '$out', expected '-L$libdir -lgcrypt'"
+    expected="$(join_unique "-L$libdir" -lgcrypt $gpg_error_libs)"
 else
-    [ "$out" = "-lgcrypt" ] || fail "--libs: '$out', expected '-lgcrypt'"
+    expected="$(join_unique -lgcrypt $gpg_error_libs)"
 fi
+[ "$out" = "$expected" ] || fail "--libs: '$out', expected '$expected'"
 case "$out" in
-    *gpg-error*) fail "--libs: mentions gpg-error" ;;
+    *-lgpg-error*) ;;
+    *) fail "--libs: does not link libgpg-error" ;;
 esac
 
 # Combined options print in upstream's fixed order: prefix, exec-prefix,

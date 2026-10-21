@@ -5,9 +5,9 @@
 # the reference Libgcrypt (src/libgcrypt-config.in): the same options, the
 # same output, printed in the same order, so that AM_PATH_LIBGCRYPT and other
 # build systems that drive the script keep working.  The values describe
-# this implementation: it depends on OpenSSL rather than libgpg-error, so
-# --libs and --cflags carry no gpg-error flags, and --algorithms lists the
-# algorithms this library actually provides.
+# this implementation: --libs and --cflags carry the libgpg-error flags the
+# build found, as upstream's do, and --algorithms lists the algorithms this
+# library actually provides.
 #
 # This file is in the public domain.  Configured by CMake from
 # cmake/libgcrypt-config.in; do not edit the installed copy.
@@ -19,11 +19,9 @@ version="@GCRYPT_API_VERSION@"
 includedir="@PC_INCLUDEDIR@"
 libdir="@PC_LIBDIR@"
 
-# The reference script appends the flags libgpg-error needs.  gcrypt.h here
-# embeds the subset of libgpg-error that the API exposes, so nothing is
-# needed; the variables stay so that the structure matches upstream.
-gpg_error_libs=""
-gpg_error_cflags=""
+# The flags libgpg-error needs, as the reference script appends them.
+gpg_error_libs="@GPG_ERROR_LIBS@"
+gpg_error_cflags="@GPG_ERROR_CFLAGS@"
 
 # libgcrypt values.
 libs="-lgcrypt"
