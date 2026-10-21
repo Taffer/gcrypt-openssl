@@ -195,7 +195,8 @@ if generate "1:1.2.0"; then
     fi
     # A relative SYSROOT is ignored with a warning.
     if SYSROOT="relative" PATH="$work/prefix/bin:$work/nobin" run relsysroot; then
-        grep -q 'Ignoring \$SYSROOT' "$log" || fail "relsysroot: warning missing"
+        # shellcheck disable=SC2016  # the literal text configure prints
+        grep -q -F 'Ignoring $SYSROOT' "$log" || fail "relsysroot: warning missing"
         [ "$found" = yes ] || fail "relsysroot: not found via PATH"
     fi
 

@@ -734,6 +734,71 @@ rsa_pkcs1_decrypt(EVP_PKEY *key, gcry_mpi_t n, const unsigned char *in,
     return rc;
 }
 
+/* The PKCS#1 v1.5 decryption a provider that refuses the padding mode
+ * gets, done on its own: the ciphertext CT (CTLEN bytes, the size of the
+ * modulus of the RSA secret key KEYPARMS, and below the modulus)
+ * decrypted as a raw operation and the frame checked by
+ * pkcs1_type2_unpad().  The library reaches that path only through
+ * rsa_pkcs1_decrypt(); this entry point lets the tests compare it with
+ * OpenSSL's own check whatever provider is loaded. */
+gcry_err_code_t
+_gcry_rsa_pkcs1_decrypt_fallback(gcry_sexp_t keyparms, const unsigned char *ct,
+                                 size_t ctlen, unsigned char **r_value,
+                                 size_t *r_valuelen)
+{
+    gcry_err_code_t rc;
+    unsigned int nbits;
+    size_t k;
+    EVP_PKEY *key = NULL;
+    gcry_mpi_t n = NULL;
+    unsigned char *out;
+
+    if (!r_value || !r_valuelen) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    *r_value = NULL;
+    *r_valuelen = 0;
+    nbits = rsa_get_nbits(keyparms);
+
+    if (!nbits) {
+        return GPG_ERR_INV_OBJ;
+    }
+
+    k = (nbits + 7) / 8;
+
+    if (!ct || ctlen != k) {
+        return GPG_ERR_INV_ARG;
+    }
+
+    rc = rsa_evp_key(keyparms, 1, &key, &n);
+
+    if (rc) {
+        return rc;
+    }
+
+    out = _gcry_malloc_secure(k);
+
+    if (!out) {
+        rc = GPG_ERR_ENOMEM;
+    } else if (!frame_below_n(ct, k, n)) {
+        rc = GPG_ERR_INV_DATA;
+    } else {
+        rc = rsa_raw_op(key, n, 1, ct, out, k);
+
+        if (!rc) {
+            rc = pkcs1_type2_unpad(key, ct, out, k, r_value, r_valuelen);
+        }
+
+        _gcry_wipememory(out, k);
+    }
+
+    _gcry_free(out);
+    EVP_PKEY_free(key);
+    gcry_mpi_release(n);
+    return rc;
+}
+
 static gcry_err_code_t
 rsa_decrypt(gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
 {

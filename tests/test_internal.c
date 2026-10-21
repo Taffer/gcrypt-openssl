@@ -1,8 +1,10 @@
 /*
- * Internal helpers of global.c, misc.c, memory.c and error.c that the
- * public API does not reach directly: context objects, OpenSSL error
- * translation, errno capture, debug and FIPS flags, the low level log and
- * progress hooks, and the fatal paths (run in forked children).
+ * Internal helpers of global.c, misc.c, memory.c, error.c and pk-rsa.c
+ * that the public API does not reach directly: context objects, OpenSSL
+ * error translation, errno capture, debug and FIPS flags, the low level
+ * log and progress hooks, the fatal paths (run in forked children), and
+ * the PKCS#1 v1.5 frame check with implicit rejection that stands in for
+ * a provider's.
  */
 #include "../src/gcrypt-int.h"
 
@@ -11,6 +13,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -335,6 +338,244 @@ TEST(secmem_disable)
     ASSERT_EQ(0, run_child(child_disable_secmem));
 }
 
+/* ---- pk-rsa.c: PKCS#1 v1.5 decryption with implicit rejection ------- */
+
+#define RSA_K 256 /* 2048 bit test key. */
+
+/* The K byte ciphertext of the RSA encryption DATA under PKEY. */
+static int
+ciphertext_of(gcry_sexp_t data, gcry_sexp_t pkey, unsigned char ct[RSA_K])
+{
+    gcry_sexp_t ciph = NULL;
+    gcry_sexp_t l;
+    gcry_mpi_t a;
+    size_t n = 0;
+    int ok;
+
+    if (gcry_pk_encrypt(&ciph, data, pkey)) {
+        return 0;
+    }
+
+    l = gcry_sexp_find_token(ciph, "a", 0);
+    a = l ? gcry_sexp_nth_mpi(l, 1, GCRYMPI_FMT_USG) : NULL;
+    memset(ct, 0, RSA_K);
+    ok = a && !gcry_mpi_print(GCRYMPI_FMT_USG, NULL, 0, &n, a) && n <= RSA_K
+         && !gcry_mpi_print(GCRYMPI_FMT_USG, ct + (RSA_K - n), n, NULL, a);
+    gcry_mpi_release(a);
+    gcry_sexp_release(l);
+    gcry_sexp_release(ciph);
+    return ok;
+}
+
+/* The ciphertext of the K byte frame FRAME, a raw RSA encryption. */
+static int
+encrypt_frame(const unsigned char *frame, gcry_sexp_t pkey,
+              unsigned char ct[RSA_K])
+{
+    gcry_mpi_t m = NULL;
+    gcry_sexp_t data = NULL;
+    int ok;
+
+    ok = !gcry_mpi_scan(&m, GCRYMPI_FMT_USG, frame, RSA_K, NULL)
+         && !gcry_sexp_build(&data, NULL, "(data (flags raw) (value %m))", m)
+         && ciphertext_of(data, pkey, ct);
+    gcry_sexp_release(data);
+    gcry_mpi_release(m);
+    return ok;
+}
+
+/* OpenSSL's own PKCS#1 v1.5 decryption of CT through the public API; the
+ * message is copied into VALUE (RSA_K bytes), its length into *VALUELEN.
+ * Returns the error of gcry_pk_decrypt(). */
+static gcry_error_t
+openssl_decrypt(gcry_sexp_t skey, const unsigned char ct[RSA_K],
+                unsigned char *value, size_t *valuelen)
+{
+    gcry_sexp_t enc = NULL;
+    gcry_sexp_t plain = NULL;
+    gcry_sexp_t l;
+    const char *p;
+    size_t n = 0;
+    gcry_error_t err;
+
+    err = gcry_sexp_build(&enc, NULL, "(enc-val (flags pkcs1) (rsa (a %b)))",
+                          RSA_K, ct);
+
+    if (!err) {
+        err = gcry_pk_decrypt(&plain, enc, skey);
+    }
+
+    if (!err) {
+        l = gcry_sexp_find_token(plain, "value", 0);
+        p = l ? gcry_sexp_nth_data(l, 1, &n) : NULL;
+
+        if (!p || n > RSA_K) {
+            err = GPG_ERR_INTERNAL;
+        } else {
+            memcpy(value, p, n);
+            *valuelen = n;
+        }
+
+        gcry_sexp_release(l);
+    }
+
+    gcry_sexp_release(plain);
+    gcry_sexp_release(enc);
+    return err;
+}
+
+/* The fallback on CT must agree with OpenSSL's check byte for byte, and
+ * with itself: the synthetic message of a bad frame is a function of the
+ * key and the ciphertext alone.  When the loaded provider does not do
+ * PKCS#1 v1.5 decryption at all (a FIPS provider may not), only the
+ * determinism and the length bound are checked.  EXPECT, when not NULL,
+ * is the EXPECTLEN byte message a good frame must yield. */
+static void
+check_fallback(gcry_sexp_t skey, const unsigned char ct[RSA_K],
+               const unsigned char *expect, size_t expectlen)
+{
+    unsigned char *v1 = NULL;
+    unsigned char *v2 = NULL;
+    unsigned char ref[RSA_K];
+    size_t l1 = 0;
+    size_t l2 = 0;
+    size_t reflen = 0;
+    gcry_error_t err;
+
+    ASSERT_OK(_gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K, &v1, &l1));
+    ASSERT_OK(_gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K, &v2, &l2));
+    ASSERT_NOT_NULL(v1);
+    ASSERT_TRUE(gcry_is_secure(v1));
+    ASSERT_TRUE(l1 <= RSA_K - 11);
+    ASSERT_EQ(l1, l2);
+    ASSERT_MEM_EQ(v1, v2, l1);
+
+    if (expect) {
+        ASSERT_EQ(expectlen, l1);
+        ASSERT_MEM_EQ(expect, v1, expectlen);
+    }
+
+    err = openssl_decrypt(skey, ct, ref, &reflen);
+
+    if (!err) {
+        ASSERT_EQ(reflen, l1);
+        ASSERT_MEM_EQ(ref, v1, reflen);
+    } else {
+        ASSERT_TRUE(gcry_fips_mode_active());
+    }
+
+    gcry_free(v1);
+    gcry_free(v2);
+}
+
+TEST(rsa_pkcs1_fallback)
+{
+    gcry_sexp_t parms = NULL;
+    gcry_sexp_t keypair = NULL;
+    gcry_sexp_t skey;
+    gcry_sexp_t pkey;
+    gcry_sexp_t data = NULL;
+    unsigned char frame[RSA_K];
+    unsigned char ct[RSA_K];
+    unsigned char *value = NULL;
+    size_t valuelen = 0;
+    unsigned int i;
+
+    ASSERT_OK(gcry_sexp_build(&parms, NULL, "(genkey (rsa (nbits 4:2048)))"));
+    ASSERT_OK(gcry_pk_genkey(&keypair, parms));
+    skey = gcry_sexp_find_token(keypair, "private-key", 0);
+    pkey = gcry_sexp_find_token(keypair, "public-key", 0);
+    ASSERT_NOT_NULL(skey);
+    ASSERT_NOT_NULL(pkey);
+
+    /* A good frame from the library's own encryption. */
+    ASSERT_OK(gcry_sexp_build(&data, NULL, "(data (flags pkcs1) (value 5:hello))"));
+    ASSERT_TRUE(ciphertext_of(data, pkey, ct));
+    check_fallback(skey, ct, (const unsigned char *)"hello", 5);
+    gcry_sexp_release(data);
+
+    /* Hand-made frames: 00 02, padding, 00, message. */
+    memset(frame, 0xA5, sizeof frame);
+    frame[0] = 0;
+    frame[1] = 2;
+    /* The longest message, eight bytes of padding. */
+    frame[10] = 0;
+    memset(frame + 11, 0x42, RSA_K - 11);
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, frame + 11, RSA_K - 11);
+    /* The empty message. */
+    memset(frame + 2, 0xA5, RSA_K - 2);
+    frame[RSA_K - 1] = 0;
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, frame + RSA_K, 0);
+    /* Seven bytes of padding: too few, implicitly rejected. */
+    memset(frame + 2, 0xA5, RSA_K - 2);
+    frame[9] = 0;
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+    /* No separator at all. */
+    memset(frame + 2, 0xA5, RSA_K - 2);
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+    /* Wrong block type. */
+    frame[1] = 1;
+    frame[20] = 0;
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+    /* Not a frame: small numbers, which the raw operation short-cuts for
+     * 0 and 1, and the zero frame's all-zero decryption. */
+    memset(frame, 0, sizeof frame);
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+    frame[RSA_K - 1] = 1;
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+    frame[RSA_K - 1] = 57;
+    ASSERT_TRUE(encrypt_frame(frame, pkey, ct));
+    check_fallback(skey, ct, NULL, 0);
+
+    /* Random ciphertexts below the modulus. */
+    for (i = 0; i < 8; i++) {
+        gcry_randomize(ct, RSA_K, GCRY_WEAK_RANDOM);
+        ct[0] = 0;
+        check_fallback(skey, ct, NULL, 0);
+    }
+
+    /* Argument checks. */
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               _gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K - 1, &value,
+                                                &valuelen));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               _gcry_rsa_pkcs1_decrypt_fallback(skey, NULL, RSA_K, &value,
+                                                &valuelen));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               _gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K, NULL,
+                                                &valuelen));
+    ASSERT_ERR(GPG_ERR_INV_ARG,
+               _gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K, &value,
+                                                NULL));
+    ASSERT_NULL(value);
+    /* A ciphertext not below the modulus. */
+    memset(ct, 0xFF, RSA_K);
+    ASSERT_ERR(GPG_ERR_INV_DATA,
+               _gcry_rsa_pkcs1_decrypt_fallback(skey, ct, RSA_K, &value,
+                                                &valuelen));
+    ASSERT_NULL(value);
+    /* No secret key, no RSA key. */
+    ASSERT_TRUE(_gcry_rsa_pkcs1_decrypt_fallback(pkey, ct, RSA_K, &value,
+                                                 &valuelen) != 0);
+    ASSERT_NULL(value);
+    ASSERT_ERR(GPG_ERR_INV_OBJ,
+               _gcry_rsa_pkcs1_decrypt_fallback(parms, ct, RSA_K, &value,
+                                                &valuelen));
+    ASSERT_NULL(value);
+
+    gcry_sexp_release(pkey);
+    gcry_sexp_release(skey);
+    gcry_sexp_release(keypair);
+    gcry_sexp_release(parms);
+}
+
 int
 main(void)
 {
@@ -351,5 +592,6 @@ main(void)
     RUN_TEST(progress);
     RUN_TEST(fatal_paths);
     RUN_TEST(secmem_disable);
+    RUN_TEST(rsa_pkcs1_fallback);
     return TEST_RESULT();
 }

@@ -88,10 +88,10 @@ value instead of failing with `GPG_ERR_ENCODING_PROBLEM` as upstream does.
 | `cmake/`       | Package config, pkg-config and `libgcrypt-config` templates, `drop-in.cmake` |
 | `m4/`          | `libgcrypt.m4`, the `AM_PATH_LIBGCRYPT` Autoconf macro; installed with the drop-in |
 | `scripts/`     | `build-openssl.sh`, `check-exports.sh`, `check-libgcrypt-config.sh`, `check-libgcrypt-m4.sh`, `check-tools.sh`, `coverage.py` |
-| `tools/`       | `dumpsexp`, `hmac256` and `mpicalc`, the command-line utilities the reference library installs; built with the drop-in |
 | `src/`         | Library sources, one file per module; `libgcrypt.map` is the symbol version script |
 | `src/include/` | The public header `gcrypt.h`                                |
 | `tests/`       | One `test_*.c` program per module, `test_common.h` assertion helpers, `expected-exports.txt`, KEM vectors and the script that regenerates them |
+| `tools/`       | `dumpsexp`, `hmac256` and `mpicalc`, the command-line utilities the reference library installs; built with the drop-in |
 
 ## Building
 
@@ -164,9 +164,9 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | `check_exports` | | CTest entry only (no build target): `scripts/check-exports.sh` compares the shared library's dynamic symbols with `tests/expected-exports.txt` |
 | `check_libgcrypt_config` | | CTest entry only, with the drop-in: `scripts/check-libgcrypt-config.sh` checks the configured `libgcrypt-config` against the reference script's behaviour and `gcrypt.h` |
 | `check_libgcrypt_m4` | | CTest entry only, with the drop-in: `scripts/check-libgcrypt-m4.sh` generates configure scripts with `autoconf` and checks that `AM_PATH_LIBGCRYPT` finds the drop-in through `libgcrypt-config` and `gpgrt-config`; skipped when `autoconf` is not installed |
-| `dumpsexp`, `hmac256`, `mpicalc` | | With the drop-in: the reference library's command-line utilities, linked against `libgcrypt.so.20` |
 | `check_tools` | | CTest entry only, with the drop-in: `scripts/check-tools.sh` runs the three utilities against the reference programs' documented behaviour |
 | `coverage` | | Runs the tests and writes the coverage report; only with `GCRYPT_OPENSSL_COVERAGE=ON` |
+| `dumpsexp`, `hmac256`, `mpicalc` | | With the drop-in: the reference library's command-line utilities, linked against `libgcrypt.so.20` |
 | `gcrypt-openssl::gcrypt-openssl` | (alias only) | The shared library when built, else the static one; what the tests and benchmarks link |
 | `gcrypt_openssl_dropin` | `gcrypt-openssl::libgcrypt` | `libgcrypt.so.20.8.9` with soname `libgcrypt.so.20`; only with `GCRYPT_OPENSSL_DROP_IN=ON` |
 | `gcrypt_openssl_shared` | `gcrypt-openssl::shared` | `libgcrypt-openssl.so.0.1.0` with soname `libgcrypt-openssl.so.0`; exports exactly the `gcry_*` symbols plus `_gcry_mpi_get_const` via `src/libgcrypt.map` |
@@ -174,7 +174,7 @@ presets that inherit these in an untracked `CMakeUserPresets.json` (see
 | `gcrypt_openssl_warnings` | `gcrypt-openssl::warnings` | Interface target carrying the warning flags; not installed |
 | `install` | | Libraries, `gcrypt.h`, the CMake package (`gcrypt-openssl-config.cmake`, `-config-version.cmake`, `-targets.cmake`), `gcrypt-openssl.pc`, and with the drop-in `libgcrypt.so.20`, `libgcrypt.pc`, `libgcrypt-config`, `libgcrypt.m4`, `dumpsexp`, `hmac256` and `mpicalc` |
 | `memcheck` | | Runs every test program under Valgrind through `ctest -T memcheck`; only when Valgrind is found |
-| `test_curves`, `test_internal` | | Tests of internal helpers; link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
+| `test_curves`, `test_internal` | | Tests of internal helpers (curve tables; contexts, error translation, logging, the fatal paths and the PKCS#1 v1.5 fallback check of `pk-rsa.c`); link the static library, so they need `GCRYPT_OPENSSL_BUILD_STATIC` |
 | `test_version` ... `test_fips` (17 programs) | | One executable and CTest entry per public module; link the shared library |
 | `test_version_static` | | `test_version.c` linked against the static library, to prove both flavours link and run |
 
@@ -402,7 +402,8 @@ uses. The library copes with that environment as follows, in every build:
   decryption asks the provider first and, when it refuses the padding
   mode, decrypts raw and checks the frame itself with the same implicit
   rejection OpenSSL applies (a bad frame yields the synthetic plaintext
-  OpenSSL would compute).
+  OpenSSL would compute). `test_internal` runs that check in every build
+  and compares its result with OpenSSL's, frame by frame.
 - That provider fails to derive RFC 6979 nonces. An ECDSA signature
   requested with the `rfc6979` flag is then made with a random nonce,
   which every verifier accepts; the condition is logged once and later

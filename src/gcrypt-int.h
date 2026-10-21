@@ -393,6 +393,19 @@ gcry_err_code_t _gcry_pk_data_to_frame(struct pk_data *pd, unsigned int nbits,
                                        unsigned char **r_frame,
                                        size_t *r_framelen);
 
+/* ---- pk-rsa.c ---------------------------------------------------- */
+
+/* PKCS#1 v1.5 decryption of CT (CTLEN bytes, the modulus size) under the
+ * RSA secret key KEYPARMS by the raw operation plus this library's own
+ * frame check with implicit rejection, the path taken when the provider
+ * refuses the padding mode.  The message goes to a fresh secure buffer in
+ * *R_VALUE, *R_VALUELEN bytes.  For the tests. */
+gcry_err_code_t _gcry_rsa_pkcs1_decrypt_fallback(gcry_sexp_t keyparms,
+                                                 const unsigned char *ct,
+                                                 size_t ctlen,
+                                                 unsigned char **r_value,
+                                                 size_t *r_valuelen);
+
 /* ---- pk.c -------------------------------------------------------- */
 
 struct gcry_pk_spec {

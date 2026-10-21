@@ -3026,7 +3026,7 @@ do_evp_aead(gcry_cipher_hd_t h, int enc, unsigned char *out, size_t outsize,
 
     if (is_single_shot_mode(h->mode)) {
         int outl = 0;
-        unsigned char dummy[16];
+        unsigned char dummy[16] = { 0 };
 
         /* SIV verifies the tag while it decrypts, so either call may
          * report the mismatch.  Wrong tag: the reference discards the

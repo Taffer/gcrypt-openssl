@@ -485,11 +485,14 @@ check_digest_algo(int algo)
 
 /* CRC tables, built on first use.  CRC-32 (ISO 3309, reflected polynomial
  * 0xEDB88320) is computed eight bytes at a time with the "slicing by 8"
- * tables; CRC-24 (OpenPGP, RFC 4880, polynomial 0x1864CFB, MSB first) with
- * a single byte table.  Shared by GCRY_MD_CRC32 and the RFC 1510 variant,
- * which differ only in their initial value and final inversion. */
+ * tables; CRC-24 (OpenPGP, RFC 4880, polynomial 0x1864CFB, MSB first)
+ * likewise, computed as the 32-bit MSB-first CRC with the polynomial
+ * shifted up by eight (0x864CFB00) in a left-aligned register, which is
+ * the same arithmetic with the low byte always zero.  Shared by
+ * GCRY_MD_CRC32 and the RFC 1510 variant, which differ only in their
+ * initial value and final inversion. */
 static uint32_t crc32_table[8][256];
-static uint32_t crc24_table[256];
+static uint32_t crc24_table[8][256];
 static pthread_once_t crc_tables_once = PTHREAD_ONCE_INIT;
 
 static void
@@ -518,17 +521,22 @@ crc_tables_init(void)
     }
 
     for (i = 0; i < 256; i++) {
-        uint32_t c = (uint32_t)i << 16;
+        uint32_t c = (uint32_t)i << 24;
 
         for (k = 0; k < 8; k++) {
-            c <<= 1;
-
-            if (c & 0x1000000u) {
-                c ^= 0x1864cfbu;
-            }
+            c = (c << 1) ^ (0x864cfb00u & (0u - (c >> 31)));
         }
 
-        crc24_table[i] = c & 0xffffffu;
+        crc24_table[0][i] = c;
+    }
+
+    for (i = 0; i < 256; i++) {
+        uint32_t c = crc24_table[0][i];
+
+        for (k = 1; k < 8; k++) {
+            c = (c << 8) ^ crc24_table[0][c >> 24];
+            crc24_table[k][i] = c;
+        }
     }
 }
 
@@ -539,6 +547,14 @@ load_le32(const unsigned char *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
            | ((uint32_t)p[3] << 24);
+}
+
+/* The big-endian counterpart, for the MSB-first CRC. */
+static uint32_t
+load_be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+           | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 static uint32_t
@@ -582,13 +598,39 @@ crc32_update(uint32_t crc, const unsigned char *buf, size_t len)
 static uint32_t
 crc24_update(uint32_t crc, const unsigned char *buf, size_t len)
 {
+    /* The register holds the CRC in its top 24 bits throughout. */
+    uint32_t r = crc << 8;
+
     pthread_once(&crc_tables_once, crc_tables_init);
 
-    while (len--) {
-        crc = (crc << 8) ^ crc24_table[((crc >> 16) ^ *buf++) & 0xffu];
+    while (len && ((uintptr_t)buf & 7u)) {
+        r = (r << 8) ^ crc24_table[0][((r >> 24) ^ *buf++) & 0xffu];
+        len--;
     }
 
-    return crc & 0xffffffu;
+    /* Slicing-by-8, MSB first: the words are read big-endian so that the
+     * first byte of the stream meets the top of the register. */
+    while (len >= 8) {
+        uint32_t hi = load_be32(buf) ^ r;
+        uint32_t lo = load_be32(buf + 4);
+
+        r = crc24_table[7][hi >> 24]
+            ^ crc24_table[6][(hi >> 16) & 0xffu]
+            ^ crc24_table[5][(hi >> 8) & 0xffu]
+            ^ crc24_table[4][hi & 0xffu]
+            ^ crc24_table[3][lo >> 24]
+            ^ crc24_table[2][(lo >> 16) & 0xffu]
+            ^ crc24_table[1][(lo >> 8) & 0xffu]
+            ^ crc24_table[0][lo & 0xffu];
+        buf += 8;
+        len -= 8;
+    }
+
+    while (len--) {
+        r = (r << 8) ^ crc24_table[0][((r >> 24) ^ *buf++) & 0xffu];
+    }
+
+    return r >> 8;
 }
 
 /* ------------------------------------------------------------------ */
