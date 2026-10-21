@@ -55,8 +55,10 @@ option(GCRYPT_OPENSSL_BUILD_BENCHMARKS "Build the benchmarks"
 option(GCRYPT_OPENSSL_WARNINGS_AS_ERRORS
        "Treat compiler warnings as errors in every target that compiles C" ON
 )
-option(GCRYPT_OPENSSL_DROP_IN
-       "Also build libgcrypt.so.20 plus libgcrypt.pc and libgcrypt-config" OFF
+option(
+    GCRYPT_OPENSSL_DROP_IN
+    "Also build libgcrypt.so.20, libgcrypt.pc, libgcrypt-config, libgcrypt.m4"
+    OFF
 )
 option(GCRYPT_OPENSSL_COVERAGE
        "Instrument for code coverage (gcc/clang --coverage) and add the

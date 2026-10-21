@@ -2,6 +2,11 @@ prefix=@CMAKE_INSTALL_PREFIX@
 exec_prefix=${prefix}
 libdir=@PC_LIBDIR@
 includedir=@PC_INCLUDEDIR@
+host=@LIBGCRYPT_CONFIG_HOST@
+api_version=1
+symmetric_ciphers="@GCRYPT_CONFIG_CIPHERS@"
+asymmetric_ciphers="@GCRYPT_CONFIG_PUBKEYS@"
+digests="@GCRYPT_CONFIG_DIGESTS@"
 
 Name: libgcrypt
 Description: General purpose cryptographic library (gcrypt-openssl drop-in)

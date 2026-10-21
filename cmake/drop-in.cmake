@@ -5,8 +5,9 @@
 # installs a pkg-config file for libgcrypt-openssl.  With
 # GCRYPT_OPENSSL_DROP_IN enabled it additionally builds the same code as
 # libgcrypt.so.20 (the reference library's soname and version), and installs
-# libgcrypt.pc plus a libgcrypt-config script, so that existing programs and
-# build systems pick this library up unchanged.
+# libgcrypt.pc, a libgcrypt-config script and the libgcrypt.m4 Autoconf
+# macro, so that existing programs and build systems pick this library up
+# unchanged.
 # ---------------------------------------------------------------------------
 
 # Version string reported by gcry_check_version(); keep in sync with the
@@ -155,4 +156,9 @@ install(FILES "${PROJECT_BINARY_DIR}/libgcrypt.pc"
 )
 install(PROGRAMS "${PROJECT_BINARY_DIR}/libgcrypt-config"
         DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
+# AM_PATH_LIBGCRYPT for configure scripts, where aclocal looks for it.
+install(FILES "${PROJECT_SOURCE_DIR}/m4/libgcrypt.m4"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/aclocal"
 )

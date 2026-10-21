@@ -112,4 +112,13 @@ if(GCRYPT_OPENSSL_DROP_IN)
         check_libgcrypt_config PROPERTIES ENVIRONMENT
                                           "${check_libgcrypt_config_env}"
     )
+
+    # AM_PATH_LIBGCRYPT must find the drop-in through libgcrypt-config and
+    # through gpgrt-config.  The script skips (exit 77) without autoconf.
+    add_test(
+        NAME check_libgcrypt_m4
+        COMMAND sh "${PROJECT_SOURCE_DIR}/scripts/check-libgcrypt-m4.sh"
+                "${PROJECT_SOURCE_DIR}/m4/libgcrypt.m4" "${PROJECT_BINARY_DIR}"
+    )
+    set_tests_properties(check_libgcrypt_m4 PROPERTIES SKIP_RETURN_CODE 77)
 endif()
