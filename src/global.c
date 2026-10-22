@@ -26,6 +26,47 @@ static int quick_random; /* GCRYCTL_ENABLE_QUICK_RANDOM was used. */
 static unsigned int fips_reject_flags = GCRY_FIPS_FLAG_REJECT_DEFAULT;
 static OSSL_LIB_CTX *libctx;
 
+/* The cc and cpu-arch lines of gcry_get_config().  Chosen with macros at
+ * file scope: a preprocessor chain inside an expression defeats some
+ * source analysers' C parsers and costs the whole file their coverage. */
+#ifdef __GNUC__
+    #define CC_VERSION _GCRY_GCC_VERSION
+#else
+    #define CC_VERSION 0
+#endif
+#if defined(__clang__)
+    #define CC_NAME "clang:" __VERSION__
+#elif defined(__GNUC__)
+    #define CC_NAME "gcc:" __VERSION__
+#else
+    #define CC_NAME ":"
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    #define CPU_ARCH "x86:amd64"
+#elif defined(__i386__) || defined(_M_IX86)
+    #define CPU_ARCH "x86:i386"
+#elif defined(__aarch64__) || defined(__arm__)
+    #define CPU_ARCH "arm"
+#elif defined(__powerpc__)
+    #define CPU_ARCH "ppc"
+#elif defined(__s390x__)
+    #define CPU_ARCH "s390x"
+#elif defined(__riscv)
+    #define CPU_ARCH "riscv"
+#else
+    #define CPU_ARCH ""
+#endif
+
+/* va_arg() takes a type where C otherwise expects an expression, which
+ * the same parsers reject; gcry_control() fetches its arguments through
+ * these so the statements stay analysable. */
+#define ARG_INT(ap) va_arg(ap, int)
+#define ARG_UINT(ap) va_arg(ap, unsigned int)
+#define ARG_STR(ap) va_arg(ap, const char *)
+#define ARG_INT_PTR(ap) va_arg(ap, int *)
+#define ARG_FILE_PTR(ap) va_arg(ap, FILE *)
+#define ARG_BUFFER_PTR(ap) va_arg(ap, gcry_buffer_t *)
+
 /* Does the operating system ask for FIPS mode?  Mirrors the reference
  * implementation's checks of /proc/sys/crypto/fips_enabled and the
  * /etc/gcrypt/fips_enabled marker file.  A build with GCRYPT_OPENSSL_FIPS
@@ -516,20 +557,7 @@ print_config(const char *what, struct strbuf *sb)
     }
 
     if (!what || !strcmp(what, "cc")) {
-        strbuf_addf(sb, "cc:%d:%s:\n",
-#ifdef __GNUC__
-                    _GCRY_GCC_VERSION,
-#else
-                    0,
-#endif
-#if defined(__clang__)
-                    "clang:" __VERSION__
-#elif defined(__GNUC__)
-                    "gcc:" __VERSION__
-#else
-                    ":"
-#endif
-                   );
+        strbuf_addf(sb, "cc:%d:%s:\n", CC_VERSION, CC_NAME);
     }
 
     if (!what || !strcmp(what, "ciphers")) {
@@ -553,21 +581,7 @@ print_config(const char *what, struct strbuf *sb)
     }
 
     if (!what || !strcmp(what, "cpu-arch")) {
-        strbuf_addf(sb, "cpu-arch:"
-#if defined(__x86_64__) || defined(_M_X64)
-                    "x86:amd64"
-#elif defined(__i386__) || defined(_M_IX86)
-                    "x86:i386"
-#elif defined(__aarch64__) || defined(__arm__)
-                    "arm"
-#elif defined(__powerpc__)
-                    "ppc"
-#elif defined(__s390x__)
-                    "s390x"
-#elif defined(__riscv)
-                    "riscv"
-#endif
-                    ":\n");
+        strbuf_addf(sb, "cpu-arch:%s:\n", CPU_ARCH);
     }
 
     if (!what || !strcmp(what, "mpi-asm")) {
@@ -854,7 +868,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
 
     case GCRYCTL_INIT_SECMEM:
         _gcry_global_init();
-        _gcry_secmem_init(va_arg(arg_ptr, unsigned int));
+        _gcry_secmem_init(ARG_UINT(arg_ptr));
         break;
 
     case GCRYCTL_TERM_SECMEM:
@@ -882,7 +896,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_AUTO_EXPAND_SECMEM:
-        _gcry_secmem_set_auto_expand(va_arg(arg_ptr, unsigned int));
+        _gcry_secmem_set_auto_expand(ARG_UINT(arg_ptr));
         break;
 
     case GCRYCTL_USE_SECURE_RNDPOOL:
@@ -890,7 +904,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_SET_RANDOM_SEED_FILE:
-        if (!va_arg(arg_ptr, const char *)) {
+        if (!ARG_STR(arg_ptr)) {
             rc = GPG_ERR_INV_ARG;
         }
 
@@ -900,15 +914,15 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_SET_VERBOSITY:
-        _gcry_set_log_verbosity(va_arg(arg_ptr, int));
+        _gcry_set_log_verbosity(ARG_INT(arg_ptr));
         break;
 
     case GCRYCTL_SET_DEBUG_FLAGS:
-        debug_flags |= va_arg(arg_ptr, unsigned int);
+        debug_flags |= ARG_UINT(arg_ptr);
         break;
 
     case GCRYCTL_CLEAR_DEBUG_FLAGS:
-        debug_flags &= ~va_arg(arg_ptr, unsigned int);
+        debug_flags &= ~ARG_UINT(arg_ptr);
         break;
 
     case GCRYCTL_DISABLE_INTERNAL_LOCKING:
@@ -947,7 +961,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
 
     case GCRYCTL_SET_RNDEGD_SOCKET:
     case GCRYCTL_SET_RANDOM_DAEMON_SOCKET:
-        (void)va_arg(arg_ptr, const char *);
+        (void)ARG_STR(arg_ptr);
         rc = GPG_ERR_NOT_SUPPORTED;
         break;
 
@@ -959,7 +973,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_PRINT_CONFIG: {
-        FILE *fp = va_arg(arg_ptr, FILE *);
+        FILE *fp = ARG_FILE_PTR(arg_ptr);
         char *tmpstr = gcry_get_config(0, NULL);
 
         if (tmpstr) {
@@ -1027,46 +1041,46 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_FIPS_REJECT_NON_FIPS:
-        fips_reject_flags = va_arg(arg_ptr, unsigned int);
+        fips_reject_flags = ARG_UINT(arg_ptr);
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER: {
-        int algo = va_arg(arg_ptr, int);
-        int mode = va_arg(arg_ptr, int);
+        int algo = ARG_INT(arg_ptr);
+        int mode = ARG_INT(arg_ptr);
 
         rc = fips_indicator_cipher(algo, mode);
         break;
     }
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_MAC:
-        rc = fips_indicator_mac(va_arg(arg_ptr, int));
+        rc = fips_indicator_mac(ARG_INT(arg_ptr));
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_MD:
-        rc = fips_indicator_md(va_arg(arg_ptr, int));
+        rc = fips_indicator_md(ARG_INT(arg_ptr));
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_KDF:
-        rc = fips_indicator_kdf(va_arg(arg_ptr, int));
+        rc = fips_indicator_kdf(ARG_INT(arg_ptr));
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION:
-        rc = fips_indicator_function(va_arg(arg_ptr, const char *));
+        rc = fips_indicator_function(ARG_STR(arg_ptr));
         break;
 
     case GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS:
-        rc = fips_indicator_pk_flags(va_arg(arg_ptr, const char *));
+        rc = fips_indicator_pk_flags(ARG_STR(arg_ptr));
         break;
 
     case GCRYCTL_DISABLE_HWF:
-        (void)va_arg(arg_ptr, const char *);
+        (void)ARG_STR(arg_ptr);
         break;
 
     case GCRYCTL_SET_ENFORCED_FIPS_FLAG:
         break;
 
     case GCRYCTL_SET_PREFERRED_RNG_TYPE: {
-        int i = va_arg(arg_ptr, int);
+        int i = ARG_INT(arg_ptr);
 
         /* Only honoured before the library is initialised; afterwards
          * the reference silently keeps the type in use. */
@@ -1078,7 +1092,7 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
     }
 
     case GCRYCTL_GET_CURRENT_RNG_TYPE: {
-        int *ip = va_arg(arg_ptr, int *);
+        int *ip = ARG_INT_PTR(arg_ptr);
 
         if (!ip) {
             rc = GPG_ERR_INV_ARG;
@@ -1095,9 +1109,9 @@ vcontrol(enum gcry_ctl_cmds cmd, va_list arg_ptr)
         break;
 
     case GCRYCTL_DRBG_REINIT:
-        (void)va_arg(arg_ptr, const char *);
-        (void)va_arg(arg_ptr, gcry_buffer_t *);
-        (void)va_arg(arg_ptr, int);
+        (void)ARG_STR(arg_ptr);
+        (void)ARG_BUFFER_PTR(arg_ptr);
+        (void)ARG_INT(arg_ptr);
         /* The generator is OpenSSL's; the reference answers the same
          * when its own DRBG is not the active generator. */
         rc = GPG_ERR_NOT_SUPPORTED;
