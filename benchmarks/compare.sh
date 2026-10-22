@@ -102,6 +102,10 @@ FNR == 1 { file++ }
         sub(/^# library: */, "")
         if (file == 1) ours_ver = $0; else stock_ver = $0
     }
+    if ($0 ~ /^# fips-mode:/) {
+        sub(/^# fips-mode: */, "")
+        if (file == 1) ours_fips = $0; else stock_fips = $0
+    }
     next
 }
 $1 == "group" { next }
@@ -119,8 +123,8 @@ file == 1 {
     if (!(key in group)) { order[++n] = key; group[key] = $1; name[key] = $2 }
 }
 END {
-    printf "# this library : libgcrypt %s (gcrypt-openssl)\n", ours_ver
-    printf "# stock library: libgcrypt %s\n\n", stock_ver
+    printf "# this library : libgcrypt %s (gcrypt-openssl), fips-mode:%s\n", ours_ver, ours_fips
+    printf "# stock library: libgcrypt %s, fips-mode:%s\n\n", stock_ver, stock_fips
     header()
     for (i = 1; i <= n; i++) {
         key = order[i]

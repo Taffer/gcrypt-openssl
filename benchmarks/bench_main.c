@@ -9,7 +9,8 @@
  *   --csv
  *     group,name,bytes,iterations,seconds,ops_per_sec,mib_per_sec,status
  *
- * Both begin with "# library: <version>" so compare.sh can label columns.
+ * Both begin with "# library: <version>" so compare.sh can label columns,
+ * followed by "# fips-mode: y|n".
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,7 @@ usage(const char *prog)
            "  -b, --size BYTES    buffer size for bulk operations "
            "(default 16384)\n"
            "  -c, --csv           machine-readable output\n"
+           "  -f, --fips          force FIPS mode before initialisation\n"
            "  -l, --list          list case names and exit\n"
            "  -h, --help          this text\n",
            prog);
@@ -186,6 +188,7 @@ main(int argc, char **argv)
     int i;
     size_t n;
     unsigned int seed = 0x9e3779b9u;
+    int fips = 0;
 
     memset(&opts, 0, sizeof opts);
     opts.seconds = 0.5;
@@ -208,6 +211,8 @@ main(int argc, char **argv)
             opts.csv = 1;
         } else if (!strcmp(a, "-l") || !strcmp(a, "--list")) {
             opts.list = 1;
+        } else if (!strcmp(a, "-f") || !strcmp(a, "--fips")) {
+            fips = 1;
         } else if ((!strcmp(a, "-s") || !strcmp(a, "--seconds"))
                    && i + 1 < argc) {
             opts.seconds = atof(argv[++i]);
@@ -250,8 +255,20 @@ main(int argc, char **argv)
         bench_input_buf[n] = (unsigned char)(seed >> 16);
     }
 
+    /* Must precede initialisation; the library then refuses algorithms
+     * that are not approved, which the cases report as unsupported. */
+    if (fips) {
+        gcry_control(GCRYCTL_FORCE_FIPS_MODE, 0);
+    }
+
     if (!gcry_check_version(NULL)) {
         fprintf(stderr, "gcry_check_version failed\n");
+        return 1;
+    }
+
+    if (fips && !gcry_fips_mode_active()) {
+        fprintf(stderr, "%s: --fips requested but FIPS mode is not active\n",
+                argv[0]);
         return 1;
     }
 
@@ -260,6 +277,7 @@ main(int argc, char **argv)
 
     if (!opts.list) {
         printf("# library: %s\n", gcry_check_version(NULL));
+        printf("# fips-mode: %s\n", gcry_fips_mode_active() ? "y" : "n");
         printf("# seconds-per-case: %.3f\n", opts.seconds);
         printf("# buffer-size: %zu\n", opts.size);
 
